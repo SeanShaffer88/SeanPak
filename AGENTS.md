@@ -5,8 +5,9 @@
 - **Project:** SeanPak — the single custom TesselGUI installer for all of SEAN's projects (formerly RustPak, then CrucibleKit).
 - **Tier:** t2 (CLI/library-class tool; the installer stub it emits is t1b-class).
 - **Stack:** Rust, `windows-sys` 0.59 only (no other runtime dependencies), static CRT (`+crt-static`), native Win32 UI — no web runtimes, no telemetry, fully offline.
-- **Design standard:** TesselGUI 1.4.0, dark theme only (GitHub Dark High Contrast values; the tokens live in `src/theme.rs`, the single palette every window consumes); installer wizard follows the approved Design E (Rail) layout and the Builder studio the approved Design H (IDE) layout (both picked 2026-11-13, shipped in 4.5.0; Designs C/D superseded).
+- **Design standard:** TesselGUI 1.4.0, dark theme only (GitHub Dark High Contrast values; the tokens live in `src/theme.rs`, the single palette every window consumes); installer wizard follows the approved Design E (Rail) layout; the Builder studio's Design H (IDE) layout was replaced in 5.0.0 by the approved guided page flow (mockups approved by SEAN 2026-11-13), themed directly on VS Code GitHub Dark High Contrast per SEAN's ruling for the redesign — the same values the shared tokens carry. (Designs C/D superseded; Design H superseded by the v5 flow.)
 - **Release shape:** exactly `SeanPak-v{VERSION}-x64-Setup.exe` + `SeanPak-v{VERSION}-x64-Portable.zip` + `SHA256SUMS.txt`.
+- **Per-user mandate (with SEAN's 2026-11-13 exception):** installs are per-user by default and nothing ever *requires* administrator rights; the embedded manifest stays `asInvoker`. The single exception (v4.8.0, SEAN's hybrid pick): at a location the writability verdict finds unwritable, the surfaces offer **Restart as administrator** — only on the user's explicit click (wizard / uninstall confirmation) or the explicit CLI `--elevate` flag, never silently, never as the default, and never re-offered to a relaunched instance (the `--elevated-relaunch` marker is the loop guard).
 - **Repository:** https://github.com/SeanShaffer88/SeanPak
 
 ---

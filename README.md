@@ -32,7 +32,7 @@ SeanPak is built to be driven by a local AI: packaging is the primary workflow, 
 - `answers-template` prints an answer file filled with a package's own defaults
 
 **Installing**
-- Per-user installs only: no administrator rights and no elevation prompt, ever. A pre-flight writability check refuses an unwritable destination *before* anything changes and suggests the per-user folder instead — the wizard offers that folder in one click
+- Per-user installs by default: no administrator rights are ever *required*, and nothing elevates on its own. A pre-flight writability check refuses an unwritable destination *before* anything changes and suggests the per-user folder instead — the wizard offers that folder in one click. The one user-invoked exception (4.8.0): when a chosen folder cannot be written by this account, the wizard also offers **Restart as administrator** beside the per-user remedy, saying plainly that the install would then run as the administrator account; declining the Windows prompt leaves the wizard open with the per-user offer intact
 - A TesselGUI Rail wizard (Review → Options → Installing → Done) over the same install operation the CLI runs; cancelling mid-install rolls everything back
 - Desktop and Start Menu shortcuts, file associations (the previous default handler is captured and restored by uninstall), and a PATH entry — all journaled
 - Launch after install, offered and checked per the manifest; headless installs launch only with an explicit `--launch`
@@ -48,10 +48,11 @@ SeanPak is built to be driven by a local AI: packaging is the primary workflow, 
 - The uninstaller asks before deleting the app's data folders (opt-in checkbox, off by default); silent uninstalls delete data only with an explicit `--purge-data`
 
 **Builder studio**
-- An IDE-layout window over the same operations as the CLI: folder tree, files table with real packed-size estimates, and a manifest panel, all labeled in plain English with a plain tooltip on every main control
+- A guided page flow over the same operations as the CLI (redesigned in 5.0.0): Home with recent projects, a three-step New Project flow, an editor with Files and Folders / Installer Options / Program Requirements tabs, then Build Settings, Building, and Build Finished pages — all labeled in plain English with a plain tooltip on every main control
+- Recent projects are remembered in the Builder's own settings file beside the exe (no registry writes); clicking one reopens it in the editor, and the Projects and Settings pages manage the list
 - One way in: **Program Folder…** picks the folder your built program is in and fills the table, listing, and totals from it; files a manifest lists beyond the folder still show (marked missing) and can be removed with **Remove selected**
-- Edits the real `manifest.json` — identity, install location, associations, shortcut and PATH toggles, launch/login offers with their defaults, data folders, and the Advanced options (components, hooks, writes, shortcuts) as JSON
-- Build Setup / Check details / Verify package (with **Also test-install** for the sandbox run) run on a worker thread with results in the output panel — and every long operation can be stopped with the **Cancel** button; a stopped build removes its unfinished files and never touches outputs that existed before it
+- Edits the real `manifest.json` — identity, install location, associations, shortcut and PATH toggles, launch/login offers with their defaults, data folders, and the Advanced options (components, hooks, writes, shortcuts) as JSON on the Installer Options page
+- Build Setup / Check details / Verify package (with **Also test-install** for the sandbox run) run on a worker thread — and every long operation can be stopped with the **Cancel** button; a stopped build removes its unfinished files and never touches outputs that existed before it. Building shows a progress bar and a timestamped log; Build Finished names the outputs and offers **Open the Installer** and **Open Folder**
 - **Open output folder** opens Explorer at the built files (selecting the Setup file), and **Preview installer** launches the built Setup file so you see the exact installer your users will see
 - Window geometry and last-used paths persist between runs
 
@@ -74,7 +75,7 @@ Prebuilt binaries are on the **[latest GitHub Release](https://github.com/SeanSh
 - **Safe extraction:** The overlay reader validates every stored path before writing — absolute paths and `..` traversal are rejected, so a crafted installer cannot write outside the chosen destination.
 - **Windows Restart Manager API (`rstrtmgr.dll`):** The library wraps Restart Manager sessions (loaded dynamically, graceful fallback when unavailable) so hosts can detect processes locking files, query how many are affected, and shut them down / restart them around a file mutation. The packager itself never force-closes your apps.
 - **Transactional rollback journaling:** Native builds snapshot an existing output file before overwriting; on failure the snapshot is restored (LIFO transaction log covering created/modified files and created directories, plus registry-key deletion on Windows).
-- **Privilege separation (UAC):** Embedded manifest execution level is `asInvoker`. Installs are per-user (shortcuts, associations, and PATH all land under HKCU / the user profile), so neither the packager nor a built installer asks for administrator rights.
+- **Privilege separation (UAC):** Embedded manifest execution level is `asInvoker`. Installs are per-user (shortcuts, associations, and PATH all land under HKCU / the user profile), so neither the packager nor a built installer asks for administrator rights. Elevation exists only as the user's explicit choice at an unwritable folder (the wizard's / confirmation's Restart as administrator button, or the CLI's `--elevate` flag) — a runtime relaunch, never a manifest demand, never the default; headless refusals report it as `"elevationOffered"` in JSON.
 - **x64 Windows:** Release builds target `x86_64-pc-windows-msvc` only. Pure-logic modules (overlay, scanner, rollback file journal, and script backends) are platform-independent and unit-tested on any host OS.
 
 ## Installer engines
@@ -119,7 +120,7 @@ seanpak/
     ├── restart_manager.rs # Dynamic rstrtmgr.dll binding with RAII session lifecycle
     ├── rollback.rs        # Transactional filesystem/registry rollback log
     ├── scanner.rs         # Recursive directory scanner + COFF PE architecture inspector
-    ├── studio.rs          # Builder studio GUI (Design H IDE layout) over the same pack/verify operations
+    ├── studio.rs          # Builder studio GUI (guided page flow since 5.0.0) over the same pack/verify operations
     ├── sysinstall.rs      # Shortcuts, associations, PATH, Run entry (COM + HKCU, journaled)
     ├── theme.rs           # TesselGUI 1.4.0 dark palette + shared control painters (4.7.1)
     ├── uninstall.rs       # Shared uninstall operation (receipt-driven, data-purge opt-in)
@@ -139,8 +140,8 @@ cargo build --release --target x86_64-pc-windows-msvc
 ## Usage
 ```powershell
 # GUI — the Builder studio (optionally with a starting folder):
-# a files table + manifest panel over the same pack/validate/verify
-# operations the CLI exposes (see below)
+# Home / Projects / editor / Build pages over the same
+# pack/validate/verify operations the CLI exposes (see below)
 .\seanpak.exe [C:\AppBuild]
 
 # Headless packaging (CI/CD friendly, prints a JSON status line)
@@ -209,7 +210,10 @@ back and confirmed.
 # report carries reason "location_not_writable" and a suggested
 # per-user location (%LOCALAPPDATA%\Programs\<App>), and --dry-run
 # plans include the same verdict as locationWritable /
-# suggestedLocation.
+# suggestedLocation. The refusal and the dry-run plan also carry
+# "elevationOffered" when the folder could be reached by restarting
+# as administrator; adding --elevate performs that restart (Windows
+# shows its prompt), waits, and returns the elevated run's exit code.
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --json
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --repair --json
 # --launch starts the app afterwards (an explicit opt-in; headless
@@ -267,7 +271,7 @@ Options page, and `--install` takes `--components <id,id>` /
 button), **answer files** (`--install --answers`, `answers-template`,
 the wizard's Review-page offer), **`inspect` / `diff`** for packages,
 **`seanpak init`** scaffolding, and the Builder studio's **Power
-blocks** JSON editor in the manifest pane.
+blocks** JSON editor on its Installer Options page.
 
 **Packaging other projects in CI.** SeanPak is the standing packaging
 route for all of SEAN's Windows programs: a project's release workflow
@@ -283,7 +287,7 @@ manifest/overlay · `4` I/O failure (including a refused overwrite) ·
 `6` differences found (`diff` only).
 
 ## Known limitations (honest list)
-- The Builder studio (Design H, IDE layout) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. The studio has run on a real Windows desktop (the v4.7.0 build, 2026-11-13, and the v4.7.1 build the same day): the 4.7.1 TesselGUI 1.4.0 re-theme's owner-drawn buttons and checkboxes and the PACKAGE-cluster layout fix field-verified there, but its list headers still rendered white — the owner-draw messages never reach the window (see the 4.7.2 changelog for the diagnosis) — and some text was clipped. The 4.7.2 pass (subclass-painted headers, the Program Folder consolidation, cancellable operations, Open output folder, Preview installer, the plain-English label/tooltip pass, and the cutoff fixes) is **Unverified** until the next on-machine field pass, and current screenshots of both layouts are owed from that pass.
+- The Builder studio is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. Since 5.0.0 it is a guided page flow (Home, Projects, a three-step New Project flow, an editor with Files and Folders / Installer Options / Program Requirements tabs, Build Settings, Building, Build Finished) replacing the 4.x IDE window; recent projects persist in its settings file beside the exe. The 4.x studio ran on a real Windows desktop (the v4.7.0 and v4.7.1 builds, 2026-11-13; the 4.7.1 header defect and its 4.7.2 subclass-paint fix are in the changelogs). The 5.0.0 page flow — layouts, owner-drawn nav/tabs, the step rail, the include-checkbox listing, the progress and Finished pages — is **Unverified** until the next on-machine field pass, and current screenshots of the new pages are owed from that pass rather than faked.
 - Payloads are compressed per file (Windows Compression API on Windows; a built-in LZ codec elsewhere) and stored uncompressed when compression would not shrink them. Packages written by older SeanPak/CrucibleKit/RustPak versions remain readable and installable.
 - Windows GUI behavior is compile-verified in CI on all three targets; interactive on-machine testing is still recommended before shipping an installer to users. `docs/PARITY.md` tracks exactly what is shipped and what remains.
 
