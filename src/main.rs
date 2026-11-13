@@ -2227,6 +2227,9 @@ fn run_pack(args: &[String]) -> i32 {
         }
         Err(PackError::BadFiles(m)) => fail(args, "pack", EXIT_BAD_MANIFEST, &m),
         Err(PackError::RefuseOverwrite(m)) => fail(args, "pack", EXIT_IO, &m),
+        // The CLI never passes a cancel flag, so this cannot occur;
+        // the arm exists for exhaustiveness.
+        Err(PackError::Cancelled) => fail(args, "pack", EXIT_IO, "Packaging cancelled"),
         Err(PackError::Io(e)) => fail(args, "pack", EXIT_IO, &format!("Packaging failed: {e}")),
     }
 }

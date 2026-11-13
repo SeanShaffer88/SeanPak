@@ -4,6 +4,22 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The error a cancellable scan returns when its cancel flag is set:
+/// `ErrorKind::Interrupted`, with the cancellation in the message —
+/// the same convention the extraction path uses.
+pub fn cancelled_error(what: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, format!("{what} cancelled"))
+}
+
+/// True when a caller-supplied cancel flag (the codebase-wide
+/// `Option<&AtomicBool>` shape) has been set.
+pub fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeArchitecture {
@@ -46,11 +62,22 @@ pub struct ScannedFolder {
 impl ScannedFolder {
     /// Recursively scans target directory using Win32 API semantics and extended length paths.
     pub fn scan<P: AsRef<Path>>(root: P) -> std::io::Result<Self> {
+        Self::scan_with(root, None)
+    }
+
+    /// Like [`ScannedFolder::scan`], with cooperative cancellation:
+    /// when `cancel` is set the walk stops at the next entry and
+    /// returns the [`cancelled_error`]. Callers that cannot be
+    /// cancelled pass `None` (the CLI always does).
+    pub fn scan_with<P: AsRef<Path>>(
+        root: P,
+        cancel: Option<&AtomicBool>,
+    ) -> std::io::Result<Self> {
         let root_path = root.as_ref().to_path_buf();
         let mut files = Vec::with_capacity(128);
         let mut total_bytes: u64 = 0;
 
-        scan_recursive(&root_path, &root_path, &mut files, &mut total_bytes)?;
+        scan_recursive(&root_path, &root_path, &mut files, &mut total_bytes, cancel)?;
 
         let mut primary_exe = None;
         let root_stem = root_path
@@ -91,14 +118,18 @@ fn scan_recursive(
     root_dir: &Path,
     results: &mut Vec<ScannedFileEntry>,
     total_bytes: &mut u64,
+    cancel: Option<&AtomicBool>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(current_dir)? {
+        if is_cancelled(cancel) {
+            return Err(cancelled_error("scan"));
+        }
         let entry = entry?;
         let path = entry.path();
         let metadata = entry.metadata()?;
 
         if metadata.is_dir() {
-            scan_recursive(&path, root_dir, results, total_bytes)?;
+            scan_recursive(&path, root_dir, results, total_bytes, cancel)?;
         } else if metadata.is_file() {
             let file_size = metadata.len();
             *total_bytes += file_size;
@@ -260,6 +291,25 @@ mod tests {
             .expect("exe recorded");
         assert_eq!(exe.architecture, Some(PeArchitecture::X64));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_with_set_cancel_flag_stops_immediately() {
+        let root = unique_temp("cancel");
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("b.txt"), b"b").unwrap();
+        let cancel = AtomicBool::new(true);
+        let err = ScannedFolder::scan_with(&root, Some(&cancel)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        // The unset flag scans normally.
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            ScannedFolder::scan_with(&root, Some(&cancel))
+                .unwrap()
+                .total_files,
+            2
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

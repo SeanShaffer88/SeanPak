@@ -127,6 +127,7 @@ mod win {
     use windows_sys::Win32::Foundation::*;
     use windows_sys::Win32::Graphics::Gdi::*;
     use windows_sys::Win32::UI::Controls::*;
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     use super::*;
@@ -137,7 +138,7 @@ mod win {
     const BM_GETCHECK_MSG: u32 = 0x00F0;
     const BST_CHECKED_STATE: usize = 1;
     const LVM_GETHEADER_MSG: u32 = 0x101F;
-    const LVM_GETCOLUMNW_MSG: u32 = 0x105F;
+    const WM_PRINTCLIENT_MSG: u32 = 0x0318;
     const NM_CUSTOMDRAW_CODE: i32 = -12;
     const CDDS_PREPAINT: u32 = 0x0000_0001;
     const CDDS_ITEM: u32 = 0x0001_0000;
@@ -365,99 +366,175 @@ mod win {
         }
     }
 
-    /// Switches a list view's header to owner-drawn cells (themed
-    /// headers cannot be recolored through messages; the native
-    /// header stayed white under the dark theme). Call once, after
-    /// the columns exist.
+    /// Paints a list view's header control in theme colors by
+    /// subclassing the header and painting it in its own WM_PAINT.
+    ///
+    /// Why not owner-draw (the 4.7.1 route, which never painted on a
+    /// real desktop): `HDF_OWNERDRAW` WAS set on every item — both
+    /// windows insert their columns before calling the helper — but
+    /// `WM_DRAWITEM` for header items is delivered to the header's
+    /// parent window, and the header's parent is the list view
+    /// itself, which does not forward the message to the top-level
+    /// window. The windows' `ODT_HEADER_CTL` draw-item arms were
+    /// therefore dead code, and the header kept its native light
+    /// rendering in SEAN's 4.7.1 field captures. A subclass proc on
+    /// the header receives the header's own messages directly, so
+    /// painting there cannot be routed away. Call once per list view,
+    /// after the control exists (columns may come before or after).
     ///
     /// # Safety
     /// `list` must be a live SysListView32 window handle.
-    pub unsafe fn make_header_owner_draw(list: HWND) {
+    pub unsafe fn subclass_list_header(list: HWND) {
         let header = SendMessageW(list, LVM_GETHEADER_MSG, 0, 0) as HWND;
         if header.is_null() {
             return;
         }
-        let count = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0);
+        SetWindowSubclass(header, Some(header_subclass_proc), HEADER_SUBCLASS_ID, 0);
+    }
+
+    /// Subclass id + the one header item currently pressed (mouse
+    /// down on it), process-wide: only one header can be pressed at
+    /// a time, and only the UI thread touches this.
+    const HEADER_SUBCLASS_ID: usize = 0x5E41;
+    static mut HEADER_PRESSED: (usize, i32) = (0, -1);
+
+    unsafe fn header_pressed_item(hwnd: HWND) -> i32 {
+        let slot = std::ptr::addr_of!(HEADER_PRESSED);
+        if (*slot).0 == hwnd as usize {
+            (*slot).1
+        } else {
+            -1
+        }
+    }
+
+    unsafe fn set_header_pressed(hwnd: HWND, item: i32) {
+        let slot = std::ptr::addr_of_mut!(HEADER_PRESSED);
+        *slot = (hwnd as usize, item);
+    }
+
+    /// The header subclass proc: paints in WM_PAINT (see
+    /// [`subclass_list_header`] for why this route), swallows
+    /// background erasure so the native fill never flashes through,
+    /// tracks the pressed item for its fill, and otherwise defers to
+    /// the header's own proc — clicks, notifications, and keyboard
+    /// behavior are unchanged.
+    unsafe extern "system" fn header_subclass_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _uid_subclass: usize,
+        _ref_data: usize,
+    ) -> LRESULT {
+        match msg {
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if !hdc.is_null() {
+                    paint_header_dc(hwnd, hdc);
+                    EndPaint(hwnd, &ps);
+                }
+                0
+            }
+            WM_PRINTCLIENT_MSG => {
+                paint_header_dc(hwnd, wparam as HDC);
+                0
+            }
+            WM_ERASEBKGND => 1,
+            WM_LBUTTONDOWN => {
+                let mut hit: HDHITTESTINFO = std::mem::zeroed();
+                hit.iItem = -1;
+                hit.pt = POINT {
+                    x: (lparam & 0xFFFF) as i16 as i32,
+                    y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+                };
+                SendMessageW(hwnd, HDM_HITTEST, 0, &mut hit as *mut _ as LPARAM);
+                set_header_pressed(hwnd, hit.iItem);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+            WM_LBUTTONUP | WM_CANCELMODE => {
+                if header_pressed_item(hwnd) >= 0 {
+                    set_header_pressed(hwnd, -1);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+            WM_NCDESTROY => {
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                RemoveWindowSubclass(hwnd, Some(header_subclass_proc), HEADER_SUBCLASS_ID);
+                result
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// The themed header paint itself: the whole client area takes
+    /// the surface fill (so the space past the last column matches),
+    /// each item draws its column text — read from the header item
+    /// itself, so it can never drift from the column definition — in
+    /// muted, a pressed item takes the pressed fill, and edge-token
+    /// dividers run down each item's right side and along the
+    /// header's bottom.
+    unsafe fn paint_header_dc(hwnd: HWND, hdc: HDC) {
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut client);
+        FillRect(hdc, &client, brush(SURFACE));
+        let old_font = select_control_font(hdc, hwnd);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, MUTED);
+        let pen = CreatePen(PS_SOLID, 1, EDGE);
+        let old_pen = SelectObject(hdc, pen as HGDIOBJ);
+        let mut pt: POINT = std::mem::zeroed();
+        let count = SendMessageW(hwnd, HDM_GETITEMCOUNT, 0, 0) as i32;
         for i in 0..count {
-            let mut item: HDITEMW = std::mem::zeroed();
-            item.mask = HDI_FORMAT;
+            let mut rc: RECT = std::mem::zeroed();
             if SendMessageW(
-                header,
-                HDM_GETITEMW,
+                hwnd,
+                HDM_GETITEMRECT,
                 i as WPARAM,
-                &mut item as *mut _ as LPARAM,
+                &mut rc as *mut _ as LPARAM,
             ) == 0
             {
                 continue;
             }
-            item.fmt |= HDF_OWNERDRAW;
-            SendMessageW(
-                header,
-                HDM_SETITEMW,
+            if header_pressed_item(hwnd) == i {
+                FillRect(hdc, &rc, brush(PRESSED_FILL));
+            }
+            let mut text: Vec<u16> = vec![0; 128];
+            let mut item: HDITEMW = std::mem::zeroed();
+            item.mask = HDI_TEXT;
+            item.pszText = text.as_mut_ptr();
+            item.cchTextMax = text.len() as i32;
+            if SendMessageW(
+                hwnd,
+                HDM_GETITEMW,
                 i as WPARAM,
-                &item as *const _ as LPARAM,
-            );
+                &mut item as *mut _ as LPARAM,
+            ) != 0
+            {
+                let len = text.iter().position(|c| *c == 0).unwrap_or(0);
+                let mut text_rc = rc;
+                text_rc.left += 6;
+                text_rc.right -= 2;
+                DrawTextW(
+                    hdc,
+                    text.as_ptr(),
+                    len as i32,
+                    &mut text_rc,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
+            MoveToEx(hdc, rc.right - 1, rc.top, &mut pt);
+            LineTo(hdc, rc.right - 1, rc.bottom);
         }
-    }
-
-    /// One owner-drawn header cell: surface fill, muted label text,
-    /// edge dividers (right and bottom). The label is read back from
-    /// the owning list view's column so it can never drift from the
-    /// column definition.
-    ///
-    /// # Safety
-    /// Same draw-item contract as [`draw_push_button`]; the item's
-    /// control must be a list view header.
-    pub unsafe fn draw_list_header(dis: &DRAWITEMSTRUCT) {
-        let pressed = dis.itemState & ODS_SELECTED != 0;
-        FillRect(
-            dis.hDC,
-            &dis.rcItem,
-            brush(if pressed { PRESSED_FILL } else { SURFACE }),
-        );
-        // Column text via the parent list view.
-        let mut text: Vec<u16> = vec![0; 128];
-        let list = GetParent(dis.hwndItem);
-        if !list.is_null() {
-            let mut col: LVCOLUMNW = std::mem::zeroed();
-            col.mask = LVCF_TEXT;
-            col.pszText = text.as_mut_ptr();
-            col.cchTextMax = text.len() as i32;
-            SendMessageW(
-                list,
-                LVM_GETCOLUMNW_MSG,
-                dis.itemID as WPARAM,
-                &mut col as *mut _ as LPARAM,
-            );
-        }
-        let old_font = select_control_font(dis.hDC, dis.hwndItem);
-        SetBkMode(dis.hDC, TRANSPARENT as i32);
-        SetTextColor(dis.hDC, MUTED);
-        let mut rc = dis.rcItem;
-        rc.left += 6;
-        rc.right -= 2;
-        let len = text.iter().position(|c| *c == 0).unwrap_or(0);
-        DrawTextW(
-            dis.hDC,
-            text.as_ptr(),
-            len as i32,
-            &mut rc,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-        if !old_font.is_null() {
-            SelectObject(dis.hDC, old_font);
-        }
-        // Edge dividers: right edge of the cell, and the header's
-        // bottom edge (the last cell's right line is the header's end).
-        let pen = CreatePen(PS_SOLID, 1, EDGE);
-        let old_pen = SelectObject(dis.hDC, pen as HGDIOBJ);
-        let mut pt: POINT = std::mem::zeroed();
-        MoveToEx(dis.hDC, dis.rcItem.right - 1, dis.rcItem.top, &mut pt);
-        LineTo(dis.hDC, dis.rcItem.right - 1, dis.rcItem.bottom);
-        MoveToEx(dis.hDC, dis.rcItem.left, dis.rcItem.bottom - 1, &mut pt);
-        LineTo(dis.hDC, dis.rcItem.right, dis.rcItem.bottom - 1);
-        SelectObject(dis.hDC, old_pen);
+        MoveToEx(hdc, client.left, client.bottom - 1, &mut pt);
+        LineTo(hdc, client.right, client.bottom - 1);
+        SelectObject(hdc, old_pen);
         DeleteObject(pen as HGDIOBJ);
+        if !old_font.is_null() {
+            SelectObject(hdc, old_font);
+        }
     }
 
     /// NM_CUSTOMDRAW handler for the dark list views: selected rows
@@ -529,7 +606,4 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{
-    brush, draw_checkbox, draw_list_header, draw_push_button, listview_custom_draw,
-    make_header_owner_draw,
-};
+pub use win::{brush, draw_checkbox, draw_push_button, listview_custom_draw, subclass_list_header};

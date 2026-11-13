@@ -500,12 +500,11 @@ mod imp {
     const PBM_SETBKCOLOR_MSG: u32 = 0x2001;
     // Owner-draw button style (all buttons and checkboxes draw via
     // the theme painters), the click notification the owner-drawn
-    // checkboxes toggle on, the header draw-item type, and the
-    // dialog message that keeps Enter activating the primary button
-    // now that it no longer carries the default-pushbutton style.
+    // checkboxes toggle on, and the dialog message that keeps Enter
+    // activating the primary button now that it no longer carries
+    // the default-pushbutton style.
     const BS_OWNERDRAW: u32 = 0x000B;
     const BN_CLICKED_CODE: usize = 0;
-    const ODT_HEADER_CTL: u32 = 100;
     const DM_SETDEFID_MSG: u32 = 0x0400 + 1; // WM_USER + 1
 
     // Static-control styles (windows-sys keeps these behind the
@@ -1770,9 +1769,10 @@ mod imp {
                 };
                 SendMessageW(list, LVM_INSERTCOLUMNW, idx, &col as *const _ as LPARAM);
             }
-            // The header renders owner-drawn in theme colors (the
-            // native header cannot be recolored and stayed white).
-            theme::make_header_owner_draw(list);
+            // The header is painted by a subclass on the header
+            // control itself, in theme colors (owner-draw never
+            // painted — see theme::subclass_list_header).
+            theme::subclass_list_header(list);
             if let Ok(mut g) = COLUMNS_DONE.lock() {
                 *g = true;
             }
@@ -2006,10 +2006,8 @@ mod imp {
                     return DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
                 let dis = &*dis;
-                if dis.CtlType == ODT_HEADER_CTL {
-                    theme::draw_list_header(dis);
-                    return 1;
-                }
+                // No header arm: the review list's header is painted
+                // by its subclass (theme::subclass_list_header).
                 match dis.CtlID as usize {
                     ID_BTN_INSTALL => theme::draw_push_button(dis, true),
                     ID_BTN_BACK

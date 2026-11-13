@@ -3,22 +3,25 @@
 //! CLI exposes.
 //!
 //! Layout (approved mockup `h-studio-ide`): a slim toolbar strip along
-//! the top (Open / Save / Save As / Add files / Validate, with the
+//! the top (Open / Save / Save As / Check details, with the
 //! app name · version at its right), a files-directory listing pane
 //! on the left, the dominant files detail table in the center, the
 //! app-manifest editor on the right, and an output strip along the
-//! bottom, in the TesselGUI rev2 GitHub Dark palette. Every action
-//! calls a shared operation — pack is `pack::pack`, validate is
-//! `manifest::AppManifest::from_json`, verify is `pack::verify_package`
-//! / `pack::sandbox_verify`, and the file listing is
-//! `scanner::ScannedFolder::scan` — so the studio can do nothing the
-//! CLI cannot (see `docs/PARITY.md`).
+//! bottom, in the shared TesselGUI 1.4.0 palette. Every action
+//! calls a shared operation — pack is `pack::pack_with_hooks`, validate is
+//! `manifest::AppManifest::from_json`, verify is `pack::verify_package_with`
+//! / `pack::sandbox_verify_with`, and the file listing is
+//! `scanner::ScannedFolder::scan_with` — so the studio can do nothing the
+//! CLI cannot (see `docs/PARITY.md`). The worker operations take
+//! the studio's cancel flag and progress sink; the CLI passes
+//! neither, so its behavior is unchanged.
 //!
 //! This module's first half is the platform-independent document and
 //! settings model (unit-tested on any host); the Win32 window itself is
 //! Windows-only, like the wizard.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use crate::manifest::{jobj, jstr, write_json_string, AppManifest, JsonValue};
 use crate::scanner::ScannedFolder;
@@ -65,10 +68,24 @@ pub struct ScanOutcome {
 /// Scans `files_dir` and pre-computes a row (with packed-size estimate)
 /// for every file in it.
 pub fn scan_package(files_dir: &Path) -> std::io::Result<ScanOutcome> {
-    let scanned = ScannedFolder::scan(files_dir)?;
+    scan_package_with(files_dir, None)
+}
+
+/// Like [`scan_package`], with cooperative cancellation: the flag is
+/// checked between files (the size estimate is the slow part), and a
+/// set flag returns the shared `Interrupted` "scan cancelled" error
+/// so the studio can keep showing the previous folder contents.
+pub fn scan_package_with(
+    files_dir: &Path,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<ScanOutcome> {
+    let scanned = ScannedFolder::scan_with(files_dir, cancel)?;
     let mut all_files: Vec<String> = Vec::with_capacity(scanned.files.len());
     let mut rows_by_rel: Vec<FileRow> = Vec::with_capacity(scanned.files.len());
     for f in &scanned.files {
+        if crate::scanner::is_cancelled(cancel) {
+            return Err(crate::scanner::cancelled_error("scan"));
+        }
         let rel = f.relative_path.replace('\\', "/");
         all_files.push(rel.clone());
         rows_by_rel.push(FileRow {
@@ -462,48 +479,6 @@ impl StudioSettings {
     }
 }
 
-/// Copies one file into `dest_dir` (Add files…). Refuses to overwrite
-/// an existing file — the caller reports the skip in plain language.
-pub fn copy_file_into(src: &Path, dest_dir: &Path) -> std::io::Result<PathBuf> {
-    let name = src
-        .file_name()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
-    let dest = dest_dir.join(name);
-    if dest.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} already exists in the package folder", dest.display()),
-        ));
-    }
-    std::fs::copy(src, &dest)?;
-    Ok(dest)
-}
-
-/// Copies a folder tree into `dest_dir/<folder name>` (Add folder…),
-/// returning the package-relative paths of the files copied.
-/// Existing files are skipped, never overwritten.
-pub fn copy_folder_into(src_dir: &Path, dest_dir: &Path) -> std::io::Result<Vec<String>> {
-    let name = src_dir
-        .file_name()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no folder name"))?;
-    let target_root = dest_dir.join(name);
-    let scanned = ScannedFolder::scan(src_dir)?;
-    let mut copied: Vec<String> = Vec::new();
-    for f in &scanned.files {
-        let rel = f.relative_path.replace('\\', "/");
-        let dest = target_root.join(&rel);
-        if dest.exists() {
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(&f.absolute_path, &dest)?;
-        copied.push(format!("{}/{rel}", name.to_string_lossy()));
-    }
-    Ok(copied)
-}
-
 // ---------------------------------------------------------------------------
 // The window itself.
 
@@ -790,28 +765,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_helpers_never_overwrite() {
-        let root = unique_temp("copy");
-        let src_dir = root.join("src");
-        std::fs::create_dir_all(src_dir.join("sub")).unwrap();
-        std::fs::write(src_dir.join("sub/f.txt"), b"x").unwrap();
-        let lone = root.join("lone.txt");
-        std::fs::write(&lone, b"y").unwrap();
-        let dest = root.join("dest");
-        std::fs::create_dir_all(&dest).unwrap();
-
-        let copied = copy_file_into(&lone, &dest).unwrap();
-        assert!(copied.is_file());
-        assert!(copy_file_into(&lone, &dest).is_err(), "second copy refuses");
-
-        let copied = copy_folder_into(&src_dir, &dest).unwrap();
-        assert_eq!(copied, vec!["src/sub/f.txt".to_string()]);
-        assert!(dest.join("src/sub/f.txt").is_file());
-        let again = copy_folder_into(&src_dir, &dest).unwrap();
-        assert!(
-            again.is_empty(),
-            "existing files are skipped, not overwritten"
-        );
+    fn scan_package_with_cancel_flag_stops() {
+        let root = unique_temp("scancel");
+        std::fs::write(root.join("a.txt"), b"aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let cancel = AtomicBool::new(true);
+        let err = scan_package_with(&root, Some(&cancel)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        let cancel = AtomicBool::new(false);
+        assert!(scan_package_with(&root, Some(&cancel)).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -819,6 +780,7 @@ mod tests {
 #[cfg(windows)]
 mod imp {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use windows_sys::Win32::Foundation::*;
@@ -830,9 +792,8 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     use super::{
-        build_rows, copy_file_into, copy_folder_into, data_dirs_text, parse_data_dirs,
-        parse_power_blocks, power_blocks_text, scan_package, tree_entries, FileRow, ScanOutcome,
-        StudioDocument, StudioSettings,
+        build_rows, data_dirs_text, parse_data_dirs, parse_power_blocks, power_blocks_text,
+        scan_package_with, tree_entries, FileRow, ScanOutcome, StudioDocument, StudioSettings,
     };
     use crate::manifest::{jstr, AppManifest, JsonValue, MANIFEST_SCHEMA_JSON};
     use crate::pack::{PackError, PackOutcome};
@@ -844,9 +805,11 @@ mod imp {
 
     // Controls.
     const ID_LIST: usize = 100;
-    const ID_BTN_ADD_FILES: usize = 101;
-    const ID_BTN_ADD_FOLDER: usize = 102;
+    const ID_BTN_PROGRAM_FOLDER: usize = 101;
     const ID_BTN_REMOVE: usize = 103;
+    const ID_BTN_CANCEL: usize = 104;
+    const ID_BTN_OPEN_OUTPUT: usize = 105;
+    const ID_BTN_PREVIEW: usize = 106;
     const ID_EDT_NAME: usize = 110;
     const ID_EDT_VERSION: usize = 111;
     const ID_EDT_PUBLISHER: usize = 112;
@@ -879,7 +842,6 @@ mod imp {
     const ID_BTN_TB_OPEN: usize = 180;
     const ID_BTN_TB_SAVE: usize = 181;
     const ID_BTN_TB_SAVEAS: usize = 182;
-    const ID_BTN_TB_ADDFILES: usize = 183;
     const ID_BTN_TB_VALIDATE: usize = 184;
     const ID_LBL_APPVER: usize = 185;
     const ID_LBL_FILES_PANE_HDR: usize = 186;
@@ -921,6 +883,7 @@ mod imp {
     const IDM_BUILD_PACK: usize = 9022;
     const IDM_BUILD_VERIFY: usize = 9023;
     const IDM_BUILD_TEST: usize = 9024;
+    const IDM_BUILD_PREVIEW: usize = 9025;
     const IDM_TOOLS_SCHEMA: usize = 9031;
     const IDM_TOOLS_LOG: usize = 9032;
     const IDM_HELP_ABOUT: usize = 9041;
@@ -928,20 +891,20 @@ mod imp {
     // Messages / styles windows-sys keeps behind features this crate
     // does not enable; defined locally like the wizard does.
     const WM_APP_JOB: u32 = 0x8000 + 21;
+    const WM_APP_PROGRESS: u32 = 0x8000 + 22;
     const WM_DPICHANGED_MSG: u32 = 0x02E0;
     const EM_SETSEL_MSG: u32 = 0x00B1;
     const EM_REPLACESEL_MSG: u32 = 0x00C2;
     const EM_SCROLLCARET_MSG: u32 = 0x00B7;
     const TTM_ADDTOOLW_MSG: u32 = 0x0400 + 50;
+    const TTM_UPDATETIPTEXTW_MSG: u32 = 0x0400 + 57;
     const TTM_RELAYEVENT_MSG: u32 = 0x0407;
     const TTS_ALWAYSTIP_STYLE: u32 = 0x01;
     const TTF_IDISHWND_FLAG: u32 = 0x0001;
     const TTF_SUBCLASS_FLAG: u32 = 0x0010;
     const BS_OWNERDRAW: u32 = 0x000B;
-    // BN_CLICKED (the notification owner-drawn checkboxes toggle on)
-    // and ODT_HEADER (the DRAWITEMSTRUCT CtlType of header cells).
+    // BN_CLICKED (the notification owner-drawn checkboxes toggle on).
     const BN_CLICKED_CODE: usize = 0;
-    const ODT_HEADER_CTL: u32 = 100;
     const ES_AUTOHSCROLL: u32 = 0x0080;
     const ES_MULTILINE: u32 = 0x0004;
     const ES_READONLY: u32 = 0x0800;
@@ -977,6 +940,41 @@ mod imp {
         Error,
     }
 
+    /// Which worker operation is running (or ran last): drives the
+    /// status line's wording and the cancelled-job report.
+    #[derive(Clone, Copy, PartialEq)]
+    enum JobKind {
+        Scan,
+        Pack,
+        Verify,
+        TestInstall,
+    }
+
+    impl JobKind {
+        /// The status line while the job runs (progress counts are
+        /// appended by `progress_text` when the operation has them).
+        fn start_text(self) -> &'static str {
+            match self {
+                JobKind::Scan => "Scanning the program folder… (Cancel stops it)",
+                JobKind::Pack => "Building Setup… (Cancel stops it)",
+                JobKind::Verify => "Verifying package… (Cancel stops it)",
+                JobKind::TestInstall => "Test-installing… (Cancel stops it)",
+            }
+        }
+
+        fn progress_text(self, done: usize, total: usize) -> String {
+            match self {
+                JobKind::Pack => {
+                    format!("Building Setup… — file {done} of {total} (Cancel stops it)")
+                }
+                JobKind::Verify => {
+                    format!("Verifying package… — file {done} of {total} (Cancel stops it)")
+                }
+                _ => self.start_text().to_string(),
+            }
+        }
+    }
+
     enum JobResult {
         Scan(Result<ScanOutcome, String>),
         Pack(Result<PackOutcome, PackFail>),
@@ -986,6 +984,9 @@ mod imp {
             ok: bool,
             lines: Vec<String>,
         },
+        /// The user cancelled the job via the shared cancel flag;
+        /// the operation has already undone its partial outputs.
+        Cancelled(JobKind),
     }
 
     struct PackFail {
@@ -999,11 +1000,16 @@ mod imp {
         /// document's entry list belongs to.
         scan: Option<ScanOutcome>,
         entries_dir: Option<PathBuf>,
-        /// Files copied in by Add, to be added to the entries when the
-        /// follow-up scan lands.
-        pending_adds: Vec<String>,
         busy: bool,
         job: Arc<Mutex<Option<JobResult>>>,
+        /// The running job's cancel flag (a fresh one per job; the
+        /// Cancel button sets it, the operations poll it).
+        cancel: Arc<AtomicBool>,
+        /// The running job's latest progress as (files done, total),
+        /// written by the worker and read on WM_APP_PROGRESS.
+        progress: Arc<Mutex<Option<(usize, usize)>>>,
+        /// The kind of job currently running (status wording).
+        job_kind: JobKind,
         last_setup: Option<PathBuf>,
         dpi: u32,
         suppress_dirty: bool,
@@ -1014,6 +1020,10 @@ mod imp {
         /// Left-pane listing rows → package-relative file path
         /// (`None` for directory rows), mirroring the tree control.
         tree_rels: Vec<Option<String>>,
+        /// The widest left-pane row in pixels, so the listing's one
+        /// column is at least that wide and long names can be
+        /// scrolled to in full.
+        tree_col_w: i32,
         /// The file the totals line describes (selected in either the
         /// center table or the left listing).
         selected_rel: Option<String>,
@@ -1080,9 +1090,11 @@ mod imp {
                 doc,
                 scan: None,
                 entries_dir,
-                pending_adds: Vec::new(),
                 busy: false,
                 job: Arc::new(Mutex::new(None)),
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: Arc::new(Mutex::new(None)),
+                job_kind: JobKind::Scan,
                 last_setup: None,
                 dpi: 96,
                 suppress_dirty: true,
@@ -1090,6 +1102,7 @@ mod imp {
                 tooltip: 0,
                 tip_texts: Vec::new(),
                 tree_rels: Vec::new(),
+                tree_col_w: 0,
                 selected_rel: None,
                 power_error_reported: None,
             });
@@ -1344,7 +1357,7 @@ mod imp {
             bar,
             "Project",
             submenu(&[
-                ("Files Folder…", IDM_PROJ_FILES),
+                ("Choose Program Folder…", IDM_PROJ_FILES),
                 ("Output Folder…", IDM_PROJ_OUT),
             ]),
         );
@@ -1352,10 +1365,11 @@ mod imp {
             bar,
             "Build",
             submenu(&[
-                ("Validate Manifest", IDM_BUILD_VALIDATE),
-                ("Build Setup (Pack)", IDM_BUILD_PACK),
-                ("Verify Setup.exe", IDM_BUILD_VERIFY),
-                ("Test Install (Sandbox Verify)", IDM_BUILD_TEST),
+                ("Check Details", IDM_BUILD_VALIDATE),
+                ("Build Setup", IDM_BUILD_PACK),
+                ("Verify Package", IDM_BUILD_VERIFY),
+                ("Test Install", IDM_BUILD_TEST),
+                ("Preview Installer", IDM_BUILD_PREVIEW),
             ]),
         );
         top(
@@ -1423,13 +1437,7 @@ mod imp {
         );
         mk(
             &button_class,
-            "Add files…",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_TB_ADDFILES,
-        );
-        mk(
-            &button_class,
-            "Validate",
+            "Check details",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TB_VALIDATE,
         );
@@ -1438,7 +1446,7 @@ mod imp {
         // Left pane: the files directory listing (directories and
         // files, indented). Selecting a file here selects it in the
         // center table too.
-        mk(&static_class, "FILES", 0, ID_LBL_FILES_PANE_HDR);
+        mk(&static_class, "PROGRAM FOLDER", 0, ID_LBL_FILES_PANE_HDR);
         let tree = mk(
             &list_class,
             "",
@@ -1521,24 +1529,23 @@ mod imp {
             };
             SendMessageW(list, LVM_INSERTCOLUMNW, idx, &col as *const _ as LPARAM);
         }
-        // The header renders owner-drawn in theme colors (the native
-        // header cannot be recolored and stayed white).
-        theme::make_header_owner_draw(list);
+        // The header is painted by a subclass on the header control
+        // itself, in theme colors (owner-draw never painted — see
+        // theme::subclass_list_header for the diagnosis).
+        theme::subclass_list_header(list);
+        // One door into the package: choose the folder the built
+        // program lives in. (The old Add files / Add folder buttons
+        // copied files into that folder and dead-ended with an error
+        // until a folder was chosen — removed in 4.7.2.)
         mk(
             &button_class,
-            "Add files…",
+            "Program Folder…",
             WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_ADD_FILES,
+            ID_BTN_PROGRAM_FOLDER,
         );
         mk(
             &button_class,
-            "Add folder…",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_ADD_FOLDER,
-        );
-        mk(
-            &button_class,
-            "Remove",
+            "Remove selected",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_REMOVE,
         );
@@ -1546,12 +1553,12 @@ mod imp {
         mk(&static_class, "", 0, ID_LBL_TOTALS);
 
         // Manifest panel.
-        mk(&static_class, "APP MANIFEST", 0, ID_LBL_MANIFEST_HDR);
+        mk(&static_class, "PROGRAM DETAILS", 0, ID_LBL_MANIFEST_HDR);
         let fields: [(&str, usize); 7] = [
             ("Name", ID_EDT_NAME),
             ("Version", ID_EDT_VERSION),
             ("Publisher", ID_EDT_PUBLISHER),
-            ("Primary exe", ID_EDT_PRIMARY),
+            ("Main program file", ID_EDT_PRIMARY),
             ("Install location", ID_EDT_INSTALL_LOC),
             ("Start Menu folder", ID_EDT_SM_FOLDER),
             ("File associations", ID_EDT_ASSOC),
@@ -1620,7 +1627,7 @@ mod imp {
         );
         // The v6 power blocks as one JSON editor (see
         // power_blocks_text for why one editor, not five grids).
-        mk(&static_class, "Power blocks", 0, ID_LBL_POWER);
+        mk(&static_class, "Advanced options (JSON)", 0, ID_LBL_POWER);
         mk(
             &edit_class,
             "",
@@ -1628,7 +1635,7 @@ mod imp {
             ID_EDT_POWER,
         );
         mk(&static_class, "PACKAGE", 0, ID_LBL_PACKAGE_HDR);
-        mk(&static_class, "Files folder", 0, PANEL_LABELS[7]);
+        mk(&static_class, "Program folder", 0, PANEL_LABELS[7]);
         mk(
             &edit_class,
             "",
@@ -1637,7 +1644,7 @@ mod imp {
         );
         mk(
             &button_class,
-            "…",
+            "Browse…",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_FILES_DIR,
         );
@@ -1650,7 +1657,7 @@ mod imp {
         );
         mk(
             &button_class,
-            "…",
+            "Browse…",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_OUT_DIR,
         );
@@ -1659,19 +1666,19 @@ mod imp {
         mk(&static_class, "OUTPUT", 0, ID_LBL_OUTPUT_HDR);
         mk(
             &button_class,
-            "Validate",
+            "Check details",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_VALIDATE,
         );
         mk(
             &button_class,
-            "Verify",
+            "Verify package",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_VERIFY,
         );
         mk(
             &button_class,
-            "Sandbox",
+            "Also test-install",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_SANDBOX,
         );
@@ -1688,6 +1695,18 @@ mod imp {
         mk(&static_class, "Ready", 0, ID_LBL_STATUS);
         mk(
             &button_class,
+            "Open output folder",
+            WS_TABSTOP | BS_OWNERDRAW,
+            ID_BTN_OPEN_OUTPUT,
+        );
+        mk(
+            &button_class,
+            "Preview installer",
+            WS_TABSTOP | BS_OWNERDRAW,
+            ID_BTN_PREVIEW,
+        );
+        mk(
+            &button_class,
             "Test install",
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TEST,
@@ -1698,25 +1717,60 @@ mod imp {
             WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_BUILD,
         );
+        // Cancel is enabled only while a job runs (set_busy owns its
+        // state from here on).
+        let cancel_btn = mk(
+            &button_class,
+            "Cancel",
+            WS_TABSTOP | BS_OWNERDRAW,
+            ID_BTN_CANCEL,
+        );
+        EnableWindow(cancel_btn, 0);
 
         create_tooltips(parent, instance);
     }
 
     unsafe fn create_tooltips(parent: HWND, instance: HINSTANCE) {
-        let tips: [(usize, &str); 13] = [
-            (ID_LIST, "Files that will be packed. Ctrl+K jumps here; type to find a file."),
-            (ID_TREE, "Everything in the files folder, folders included. Selecting a file selects it in the table too."),
-            (ID_BTN_TB_OPEN, "Open a manifest.json — the same file `seanpak pack` reads"),
-            (ID_BTN_ADD_FILES, "Copy files into the package folder and add them to the package"),
-            (ID_BTN_ADD_FOLDER, "Copy a folder (with everything in it) into the package"),
-            (ID_BTN_REMOVE, "Remove the selected files from the package list — the files stay in the folder"),
-            (ID_EDT_ASSOC, "Comma-separated extensions to associate with the app (.txt, .md)"),
-            (ID_EDT_DATA_DIRS, "The app's data folders, semicolon-separated token paths (%APPDATA%/My App). Uninstall asks before deleting them; the box starts unticked"),
-            (ID_EDT_POWER, "The package's power blocks as one JSON object: components, hooks, registryWrites, envWrites, shortcuts — the same shape as the manifest file. Invalid JSON is reported in the output strip and the previous value is kept"),
-            (ID_BTN_VALIDATE, "Check the manifest with the same rules `seanpak validate` uses"),
-            (ID_BTN_VERIFY, "Prove the built Setup.exe (overlay, manifest, payloads)"),
-            (ID_CHK_SANDBOX, "Verify by test-installing into a temp folder and checking for residue"),
-            (ID_BTN_BUILD, "Pack Setup.exe + Portable.zip + SHA256SUMS.txt — the same operation as `seanpak pack`"),
+        // One short plain-English line per main control — what it
+        // does, in the words a first-time user would use. ("Program",
+        // not "payload"; "Setup file", not "artifact".)
+        let tips: [(usize, &str); 36] = [
+            (ID_LIST, "The files that will be packed into the Setup file. Select files and click Remove selected to leave them out"),
+            (ID_TREE, "Everything in the program folder, folders included. Selecting a file here selects it in the table too"),
+            (ID_BTN_TB_OPEN, "Open a manifest file — the file that describes your program"),
+            (ID_BTN_TB_SAVE, "Save the manifest file"),
+            (ID_BTN_TB_SAVEAS, "Save the manifest file under a new name"),
+            (ID_BTN_TB_VALIDATE, "Check the program details for mistakes before building"),
+            (ID_BTN_PROGRAM_FOLDER, "Choose the folder your built program is in — everything in it becomes the package"),
+            (ID_BTN_REMOVE, "Remove the selected files from the package — the files themselves stay in the folder"),
+            (ID_EDT_NAME, "Your program's name — shown in the installer and used in the Setup file name"),
+            (ID_EDT_VERSION, "Your program's version, like 1.2.0 — used in the Setup file name"),
+            (ID_EDT_PUBLISHER, "Your name or your company — shown in the installer"),
+            (ID_EDT_PRIMARY, "The main .exe file in the program folder — the one shortcuts point to and the installer can launch"),
+            (ID_EDT_INSTALL_LOC, "Where the program installs on a user's computer — leave empty for the usual per-user folder"),
+            (ID_EDT_SM_FOLDER, "The Start Menu folder the shortcuts go in — leave empty to use the program name"),
+            (ID_EDT_ASSOC, "File types this program opens, comma-separated, like .txt, .md — Windows will offer your program for them"),
+            (ID_CHK_DESKTOP, "Put a shortcut on the user's desktop"),
+            (ID_CHK_STARTMENU, "Put a shortcut in the Start Menu"),
+            (ID_CHK_PATH, "Add the install folder to the user's PATH, so the program can be run from any command line"),
+            (ID_CHK_LAUNCH_OFFER, "Offer: show a 'Launch the program' tick box on the installer's last page"),
+            (ID_CHK_LAUNCH_DEFAULT, "On by default: that 'Launch the program' box starts out ticked"),
+            (ID_CHK_LOGIN_OFFER, "Offer: show a 'Start the program when Windows starts' tick box in the installer"),
+            (ID_CHK_LOGIN_DEFAULT, "On by default: that 'Start at login' box starts out ticked"),
+            (ID_EDT_DATA_DIRS, "The program's own data folders, semicolon-separated, like %APPDATA%/My App. Uninstall asks before deleting them, and the box starts unticked"),
+            (ID_EDT_POWER, "Advanced extras as one JSON block: optional components, install hooks (commands run during install), registry and environment values the installer writes and later restores, and extra shortcuts. Leave it as {} if you don't need any of them"),
+            (ID_EDT_FILES_DIR, "The folder your built program is in — everything in it is packed into the Setup file"),
+            (ID_BTN_FILES_DIR, "Browse for the program folder"),
+            (ID_EDT_OUT_DIR, "The folder the finished Setup file, portable .zip, and SHA256SUMS.txt are written to"),
+            (ID_BTN_OUT_DIR, "Browse for the output folder"),
+            (ID_BTN_VALIDATE, "Check the program details for mistakes — the same check the build runs first"),
+            (ID_BTN_VERIFY, "Check a built Setup file: read it back and prove every file inside is intact"),
+            (ID_CHK_SANDBOX, "Also test-install: verifying first installs into a temp folder, checks every file, then uninstalls and checks nothing is left behind"),
+            (ID_BTN_TEST, "Install the built Setup file into a temp folder, check every file, then uninstall and check nothing is left"),
+            (ID_BTN_BUILD, "Build the Setup file, the portable .zip, and SHA256SUMS.txt into the output folder"),
+            (ID_BTN_OPEN_OUTPUT, "Open the folder where the Setup file is built"),
+            (ID_BTN_PREVIEW, "Open the Setup file you built, to see the installer your users will see"),
+            (ID_BTN_CANCEL, "Stop the running operation. A stopped build removes its unfinished files"),
         ];
         let tooltip = CreateWindowExW(
             WS_EX_TOPMOST,
@@ -1764,6 +1818,68 @@ mod imp {
         }
     }
 
+    /// Replaces one control's tooltip text (the text buffer is kept
+    /// alive in state like the initial tips).
+    unsafe fn set_tip_text(hwnd: HWND, id: usize, text: &str) {
+        let (tooltip, ctrl) = match with_state(|s| s.tooltip) {
+            Some(t) if t != 0 => (t as HWND, GetDlgItem(hwnd, id as i32)),
+            _ => return,
+        };
+        if ctrl.is_null() {
+            return;
+        }
+        let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let ti = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND_FLAG,
+            hwnd,
+            uId: ctrl as usize,
+            rect: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            hinst: std::ptr::null_mut(),
+            lpszText: wide.as_mut_ptr(),
+            lParam: 0,
+            lpReserved: std::ptr::null_mut(),
+        };
+        SendMessageW(
+            tooltip,
+            TTM_UPDATETIPTEXTW_MSG,
+            0,
+            &ti as *const _ as LPARAM,
+        );
+        with_state(|s| s.tip_texts.push(wide));
+    }
+
+    /// The two path fields are single-line and clip long paths: their
+    /// tooltips carry the FULL current path instead, so a clipped
+    /// path is always readable. With no path set, the tooltip is the
+    /// field's plain explanation. Refreshed wherever the fields are
+    /// filled or harvested.
+    unsafe fn update_path_tips(hwnd: HWND) {
+        for (id, base) in [
+            (
+                ID_EDT_FILES_DIR,
+                "The folder your built program is in — everything in it is packed into the Setup file",
+            ),
+            (
+                ID_EDT_OUT_DIR,
+                "The folder the finished Setup file, portable .zip, and SHA256SUMS.txt are written to",
+            ),
+        ] {
+            let path = get_text(hwnd, id);
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                set_tip_text(hwnd, id, base);
+            } else {
+                set_tip_text(hwnd, id, trimmed);
+            }
+        }
+    }
+
     unsafe fn apply_fonts(hwnd: HWND) {
         let header_ids = [
             ID_LBL_FILES_HDR,
@@ -1784,13 +1900,11 @@ mod imp {
             ID_BTN_TB_OPEN,
             ID_BTN_TB_SAVE,
             ID_BTN_TB_SAVEAS,
-            ID_BTN_TB_ADDFILES,
             ID_BTN_TB_VALIDATE,
             ID_LBL_APPVER,
             ID_LBL_FILES_PANE_HDR,
             ID_LBL_TOTALS,
-            ID_BTN_ADD_FILES,
-            ID_BTN_ADD_FOLDER,
+            ID_BTN_PROGRAM_FOLDER,
             ID_BTN_REMOVE,
             ID_EDT_NAME,
             ID_EDT_VERSION,
@@ -1823,6 +1937,9 @@ mod imp {
             ID_LBL_STATUS,
             ID_BTN_TEST,
             ID_BTN_BUILD,
+            ID_BTN_OPEN_OUTPUT,
+            ID_BTN_PREVIEW,
+            ID_BTN_CANCEL,
             ID_LBL_FACTS,
             PANEL_LABELS[0],
             PANEL_LABELS[1],
@@ -1887,8 +2004,7 @@ mod imp {
         mv(hwnd, ID_BTN_TB_OPEN, m, tb_y, s(84), s(28));
         mv(hwnd, ID_BTN_TB_SAVE, m + s(92), tb_y, s(72), s(28));
         mv(hwnd, ID_BTN_TB_SAVEAS, m + s(172), tb_y, s(92), s(28));
-        mv(hwnd, ID_BTN_TB_ADDFILES, m + s(272), tb_y, s(104), s(28));
-        mv(hwnd, ID_BTN_TB_VALIDATE, m + s(384), tb_y, s(92), s(28));
+        mv(hwnd, ID_BTN_TB_VALIDATE, m + s(272), tb_y, s(116), s(28));
         mv(
             hwnd,
             ID_LBL_APPVER,
@@ -1903,13 +2019,25 @@ mod imp {
         mv(hwnd, ID_TREE, m, main_top + s(26), left_w, main_h - s(26));
         let tree = GetDlgItem(hwnd, ID_TREE as i32);
         if !tree.is_null() {
-            SendMessageW(tree, LVM_SETCOLUMNWIDTH, 0, left_w.max(s(120)) as LPARAM);
+            // The column is at least as wide as the widest row
+            // (measured when the listing was filled), so long names
+            // can be scrolled to in full instead of ending under the
+            // pane's edge.
+            let content_w = with_state(|s| s.tree_col_w).unwrap_or(0);
+            SendMessageW(
+                tree,
+                LVM_SETCOLUMNWIDTH,
+                0,
+                (left_w.max(content_w)).max(s(120)) as LPARAM,
+            );
         }
 
         // Center: files table + its buttons + the totals line.
         let cx = m + left_w + s(12);
         let center_w = (w - m - panel_w - s(12) - cx).max(s(200));
-        let totals_h = s(38);
+        // Two full lines of body text: at s(38) the second line (the
+        // stub / selected-file line) was clipped by the output strip.
+        let totals_h = s(48);
         mv(hwnd, ID_LBL_FILES_HDR, cx, main_top, center_w, s(20));
         mv(
             hwnd,
@@ -1920,42 +2048,37 @@ mod imp {
             main_h - s(26) - btn_row_h - s(8) - totals_h,
         );
         let btn_y = main_top + main_h - totals_h - btn_row_h;
-        mv(hwnd, ID_BTN_ADD_FILES, cx, btn_y, s(130), btn_row_h);
-        mv(
-            hwnd,
-            ID_BTN_ADD_FOLDER,
-            cx + s(138),
-            btn_y,
-            s(130),
-            btn_row_h,
-        );
-        mv(hwnd, ID_BTN_REMOVE, cx + s(276), btn_y, s(110), btn_row_h);
+        mv(hwnd, ID_BTN_PROGRAM_FOLDER, cx, btn_y, s(160), btn_row_h);
+        mv(hwnd, ID_BTN_REMOVE, cx + s(168), btn_y, s(150), btn_row_h);
         mv(
             hwnd,
             ID_LBL_TOTALS,
             cx,
-            btn_y + btn_row_h + s(6),
+            btn_y + btn_row_h + s(4),
             center_w,
-            s(32),
+            s(42),
         );
-        // Column widths: path column absorbs the slack.
+        // Column widths: the path column absorbs the slack, and the
+        // fixed columns are sized so every header label fits whole
+        // at the default window size, with the vertical scrollbar's
+        // width reserved so the last column is not clipped by it.
         let list = GetDlgItem(hwnd, ID_LIST as i32);
         if !list.is_null() {
-            let fixed = s(180) + s(110) + s(120);
+            let fixed = s(150) + s(95) + s(115);
             SendMessageW(
                 list,
                 LVM_SETCOLUMNWIDTH,
                 0,
-                (center_w - fixed - s(20)).max(s(120)) as LPARAM,
+                (center_w - fixed - s(20)).max(s(100)) as LPARAM,
             );
-            SendMessageW(list, LVM_SETCOLUMNWIDTH, 1, s(180) as LPARAM);
-            SendMessageW(list, LVM_SETCOLUMNWIDTH, 2, s(110) as LPARAM);
-            SendMessageW(list, LVM_SETCOLUMNWIDTH, 3, s(120) as LPARAM);
+            SendMessageW(list, LVM_SETCOLUMNWIDTH, 1, s(150) as LPARAM);
+            SendMessageW(list, LVM_SETCOLUMNWIDTH, 2, s(95) as LPARAM);
+            SendMessageW(list, LVM_SETCOLUMNWIDTH, 3, s(115) as LPARAM);
         }
 
         // Right pane: the manifest editor.
         let px = w - m - panel_w;
-        let label_w = s(124);
+        let label_w = s(140);
         let edit_x = px + label_w + s(8);
         let edit_w = panel_w - label_w - s(8);
         mv(hwnd, ID_LBL_MANIFEST_HDR, px, main_top, panel_w, s(20));
@@ -2024,11 +2147,23 @@ mod imp {
         let pane_bottom = footer_top - s(8);
         let cluster_h = s(23) + s(29) + s(29);
         let cluster_top = pane_bottom - cluster_h;
-        let power_h = (cluster_top - s(6) - row_y).clamp(s(36), s(120));
-        mv(hwnd, ID_LBL_POWER, px, row_y + s(2), label_w, s(20));
-        mv(hwnd, ID_EDT_POWER, edit_x, row_y, edit_w, power_h);
+        // "Advanced options (JSON)" is too long for the label column,
+        // so its label takes the pane's full width and the editor
+        // sits below it, still in the edit column.
+        let power_h = (cluster_top - s(6) - row_y).clamp(s(58), s(142));
+        mv(hwnd, ID_LBL_POWER, px, row_y, panel_w, s(20));
+        mv(
+            hwnd,
+            ID_EDT_POWER,
+            edit_x,
+            row_y + s(22),
+            edit_w,
+            power_h - s(22),
+        );
         mv(hwnd, ID_LBL_PACKAGE_HDR, px, cluster_top, panel_w, s(20));
-        // Files folder row (+ browse button).
+        // Program folder row (+ Browse… button, wide enough to carry
+        // its word — a bare "…" was neither plain English nor a
+        // usable accessible name).
         let files_y = cluster_top + s(23);
         mv(hwnd, PANEL_LABELS[7], px, files_y + s(2), label_w, s(20));
         mv(
@@ -2036,27 +2171,27 @@ mod imp {
             ID_EDT_FILES_DIR,
             edit_x,
             files_y,
-            edit_w - s(36),
+            edit_w - s(70),
             s(25),
         );
         mv(
             hwnd,
             ID_BTN_FILES_DIR,
-            edit_x + edit_w - s(30),
+            edit_x + edit_w - s(64),
             files_y,
-            s(30),
+            s(64),
             s(25),
         );
         // Output folder row (+ browse button).
         let out_y = files_y + s(29);
         mv(hwnd, PANEL_LABELS[8], px, out_y + s(2), label_w, s(20));
-        mv(hwnd, ID_EDT_OUT_DIR, edit_x, out_y, edit_w - s(36), s(25));
+        mv(hwnd, ID_EDT_OUT_DIR, edit_x, out_y, edit_w - s(70), s(25));
         mv(
             hwnd,
             ID_BTN_OUT_DIR,
-            edit_x + edit_w - s(30),
+            edit_x + edit_w - s(64),
             out_y,
-            s(30),
+            s(64),
             s(25),
         );
 
@@ -2069,25 +2204,25 @@ mod imp {
         mv(
             hwnd,
             ID_CHK_SANDBOX,
-            strip_right - s(292),
+            strip_right - s(394),
             strip_y,
-            s(92),
+            s(148),
             s(24),
         );
         mv(
             hwnd,
             ID_BTN_VERIFY,
-            strip_right - s(192),
+            strip_right - s(238),
             strip_y,
-            s(92),
+            s(130),
             s(26),
         );
         mv(
             hwnd,
             ID_BTN_VALIDATE,
-            strip_right - s(96),
+            strip_right - s(100),
             strip_y,
-            s(96),
+            s(100),
             s(26),
         );
         mv(
@@ -2107,31 +2242,30 @@ mod imp {
             s(38),
         );
 
-        // Footer.
+        // Footer: the status line, then the action row — Cancel,
+        // Open output folder, Preview installer, Test install, and
+        // the one primary action, Build Setup.
         mv(hwnd, ID_FOOTER_SEP, 0, footer_top - s(2), w, s(1));
+        let btn_y2 = footer_top + s(10);
+        mv(hwnd, ID_BTN_BUILD, w - m - s(160), btn_y2, s(160), s(32));
+        mv(hwnd, ID_BTN_TEST, w - m - s(308), btn_y2, s(140), s(32));
+        mv(hwnd, ID_BTN_PREVIEW, w - m - s(456), btn_y2, s(140), s(32));
+        mv(
+            hwnd,
+            ID_BTN_OPEN_OUTPUT,
+            w - m - s(614),
+            btn_y2,
+            s(150),
+            s(32),
+        );
+        mv(hwnd, ID_BTN_CANCEL, w - m - s(718), btn_y2, s(96), s(32));
         mv(
             hwnd,
             ID_LBL_STATUS,
             m,
             footer_top + s(16),
-            w - s(420),
+            (w - m - s(718) - s(8) - m).max(s(80)),
             s(22),
-        );
-        mv(
-            hwnd,
-            ID_BTN_TEST,
-            w - m - s(308),
-            footer_top + s(10),
-            s(140),
-            s(32),
-        );
-        mv(
-            hwnd,
-            ID_BTN_BUILD,
-            w - m - s(160),
-            footer_top + s(10),
-            s(160),
-            s(32),
         );
     }
 
@@ -2308,6 +2442,7 @@ mod imp {
         );
         set_text(hwnd, ID_EDT_OUT_DIR, &out_dir.display().to_string());
         with_state(|s| s.suppress_dirty = false);
+        update_path_tips(hwnd);
         refresh_appver(hwnd);
     }
 
@@ -2420,6 +2555,7 @@ mod imp {
                 s.doc.out_dir = PathBuf::from(od);
             }
         });
+        update_path_tips(hwnd);
         refresh_appver(hwnd);
     }
 
@@ -2508,6 +2644,11 @@ mod imp {
         .unwrap_or_default();
         SendMessageW(tree, LVM_DELETEALLITEMS, 0, 0);
         let mut rels: Vec<Option<String>> = Vec::with_capacity(entries.len());
+        // Measure the widest row (text + indent) so the listing's
+        // one column can be made wide enough for every name to be
+        // scrolled to in full.
+        let dpi = with_state(|s| s.dpi).unwrap_or(96);
+        let mut widest: i32 = 0;
         for (idx, entry) in entries.iter().enumerate() {
             rels.push(entry.rel.clone());
             let mut wide: Vec<u16> = entry
@@ -2515,6 +2656,9 @@ mod imp {
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
+            let text_w = SendMessageW(tree, LVM_GETSTRINGWIDTHW, 0, wide.as_mut_ptr() as LPARAM);
+            let row_w = text_w as i32 + scale(20, dpi) * entry.depth as i32 + scale(16, dpi);
+            widest = widest.max(row_w);
             let item = LVITEMW {
                 mask: LVIF_TEXT | LVIF_INDENT,
                 iItem: idx as i32,
@@ -2534,7 +2678,21 @@ mod imp {
             };
             SendMessageW(tree, LVM_INSERTITEMW, 0, &item as *const _ as LPARAM);
         }
-        with_state(|s| s.tree_rels = rels);
+        with_state(|s| {
+            s.tree_rels = rels;
+            s.tree_col_w = widest;
+        });
+        // Apply the measured width right away (layout does the same
+        // on the next resize): the column is never narrower than the
+        // pane, and wider when a name needs it.
+        let mut tree_rect: RECT = std::mem::zeroed();
+        GetClientRect(tree, &mut tree_rect);
+        SendMessageW(
+            tree,
+            LVM_SETCOLUMNWIDTH,
+            0,
+            (tree_rect.right.max(widest)) as LPARAM,
+        );
     }
 
     /// The two-line readout under the center table: package totals,
@@ -2652,28 +2810,134 @@ mod imp {
         update_totals(hwnd);
     }
 
+    /// Buttons that start work or change the job's inputs: all
+    /// disabled while a job runs (its inputs are snapshotted when it
+    /// starts; a second operation must not begin). Cancel is the
+    /// mirror image — enabled only while a job runs.
+    const ACTION_IDS: [usize; 12] = [
+        ID_BTN_PROGRAM_FOLDER,
+        ID_BTN_REMOVE,
+        ID_BTN_TB_OPEN,
+        ID_BTN_TB_SAVE,
+        ID_BTN_TB_SAVEAS,
+        ID_BTN_TB_VALIDATE,
+        ID_BTN_VALIDATE,
+        ID_BTN_VERIFY,
+        ID_BTN_TEST,
+        ID_BTN_BUILD,
+        ID_BTN_OPEN_OUTPUT,
+        ID_BTN_PREVIEW,
+    ];
+
     fn set_busy(hwnd: HWND, busy: bool) {
         with_state(|s| s.busy = busy);
-        for id in [
-            ID_BTN_BUILD,
-            ID_BTN_TEST,
-            ID_BTN_VALIDATE,
-            ID_BTN_VERIFY,
-            ID_BTN_ADD_FILES,
-            ID_BTN_ADD_FOLDER,
-            ID_BTN_REMOVE,
-            ID_BTN_TB_OPEN,
-            ID_BTN_TB_SAVE,
-            ID_BTN_TB_SAVEAS,
-            ID_BTN_TB_ADDFILES,
-            ID_BTN_TB_VALIDATE,
-        ] {
+        for id in ACTION_IDS {
             unsafe { set_enabled(hwnd, id, !busy) };
         }
+        unsafe { set_enabled(hwnd, ID_BTN_CANCEL, busy) };
     }
 
     fn is_busy() -> bool {
         with_state(|s| s.busy).unwrap_or(false)
+    }
+
+    /// What a job starter needs: the result slot plus this job's
+    /// fresh cancel flag and progress slot.
+    struct JobHooks {
+        job: Arc<Mutex<Option<JobResult>>>,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<Mutex<Option<(usize, usize)>>>,
+    }
+
+    /// Starts a job: fresh cancel flag + progress slot in state,
+    /// action buttons off, Cancel on, and the status line naming the
+    /// operation (so the user always knows what Cancel would stop).
+    fn begin_job(hwnd: HWND, kind: JobKind) -> Option<JobHooks> {
+        let hooks = with_state(|s| {
+            s.cancel = Arc::new(AtomicBool::new(false));
+            s.progress = Arc::new(Mutex::new(None));
+            s.job_kind = kind;
+            JobHooks {
+                job: s.job.clone(),
+                cancel: s.cancel.clone(),
+                progress: s.progress.clone(),
+            }
+        })?;
+        set_busy(hwnd, true);
+        set_status(hwnd, StatusKind::Neutral, kind.start_text());
+        Some(hooks)
+    }
+
+    /// The Cancel button: set the running job's flag and say so; the
+    /// job's own completion handler restores the controls.
+    fn on_cancel_job(hwnd: HWND) {
+        with_state(|s| s.cancel.store(true, Ordering::Relaxed));
+        unsafe { set_enabled(hwnd, ID_BTN_CANCEL, false) };
+        set_status(hwnd, StatusKind::Neutral, "Cancelling…");
+    }
+
+    /// Records a progress count in the slot and posts the progress
+    /// message (the UI thread reads the slot) — throttled by the
+    /// callers to the first, every tenth, and the last file, which
+    /// is plenty for a status line.
+    fn report_progress(
+        hwnd_value: usize,
+        slot: &Arc<Mutex<Option<(usize, usize)>>>,
+        done: usize,
+        total: usize,
+    ) {
+        if let Ok(mut g) = slot.lock() {
+            *g = Some((done, total));
+        }
+        unsafe {
+            PostMessageW(hwnd_value as HWND, WM_APP_PROGRESS, 0, 0);
+        }
+    }
+
+    fn on_progress_message(hwnd: HWND) {
+        let snapshot = with_state(|s| (s.job_kind, s.progress.lock().ok().and_then(|g| *g)));
+        if let Some((kind, Some((done, total)))) = snapshot {
+            if is_busy() {
+                set_status(hwnd, StatusKind::Neutral, &kind.progress_text(done, total));
+            }
+        }
+    }
+
+    /// A cancelled job lands here: controls restored, and the report
+    /// in plain words. A cancelled scan keeps the previous folder
+    /// contents on screen; a cancelled build has already removed the
+    /// files it placed (see pack_with_hooks).
+    fn on_cancelled(hwnd: HWND, kind: JobKind) {
+        set_busy(hwnd, false);
+        match kind {
+            JobKind::Scan => {
+                append_output(
+                    hwnd,
+                    "Scan cancelled — the table still shows the previous folder contents.",
+                );
+                set_status(
+                    hwnd,
+                    StatusKind::Neutral,
+                    "Scan cancelled — previous contents kept",
+                );
+            }
+            JobKind::Pack => {
+                append_output(hwnd, "Build cancelled — the unfinished files were removed.");
+                set_status(
+                    hwnd,
+                    StatusKind::Neutral,
+                    "Build cancelled — the unfinished files were removed",
+                );
+            }
+            JobKind::Verify => {
+                append_output(hwnd, "Verify cancelled.");
+                set_status(hwnd, StatusKind::Neutral, "Verify cancelled");
+            }
+            JobKind::TestInstall => {
+                append_output(hwnd, "Test install cancelled.");
+                set_status(hwnd, StatusKind::Neutral, "Test install cancelled");
+            }
+        }
     }
 
     /// Hands a finished job to the UI thread: stash the result, then
@@ -2693,26 +2957,30 @@ mod imp {
         if is_busy() {
             return;
         }
-        let Some((files_dir, job)) = with_state(|s| (s.doc.files_dir.clone(), s.job.clone()))
-        else {
-            return;
-        };
+        let files_dir = with_state(|s| s.doc.files_dir.clone()).flatten();
         let Some(dir) = files_dir else {
             set_facts(hwnd, &default_facts());
             set_status(
                 hwnd,
                 StatusKind::Neutral,
-                "Choose a files folder to see the package contents",
+                "Click Program Folder… and pick the folder your built program is in — its files will appear here.",
             );
             return;
         };
-        set_busy(hwnd, true);
-        set_status(hwnd, StatusKind::Neutral, "Scanning package folder…");
+        let Some(hooks) = begin_job(hwnd, JobKind::Scan) else {
+            return;
+        };
         let hwnd_value = hwnd as usize;
+        let JobHooks { job, cancel, .. } = hooks;
         std::thread::spawn(move || {
-            let result =
-                scan_package(&dir).map_err(|e| format!("Cannot scan {}: {e}", dir.display()));
-            post_job(hwnd_value, &job, JobResult::Scan(result));
+            let result = scan_package_with(&dir, Some(&cancel))
+                .map_err(|e| format!("Cannot scan {}: {e}", dir.display()));
+            let result = if cancel.load(Ordering::Relaxed) {
+                JobResult::Cancelled(JobKind::Scan)
+            } else {
+                JobResult::Scan(result)
+            };
+            post_job(hwnd_value, &job, result);
         });
     }
 
@@ -2725,14 +2993,6 @@ mod imp {
                     if s.doc.entries.is_empty() || dir_changed {
                         s.doc.entries = scan.all_files.clone();
                         s.entries_dir = s.doc.files_dir.clone();
-                    }
-                    if !s.pending_adds.is_empty() {
-                        for add in s.pending_adds.drain(..) {
-                            if !s.doc.entries.contains(&add) {
-                                s.doc.entries.push(add);
-                            }
-                        }
-                        s.doc.entries.sort();
                     }
                     s.doc.sync_files_field(&scan.all_files);
                     let rows = build_rows(&s.doc.entries, Some(&scan));
@@ -2758,7 +3018,7 @@ mod imp {
                     append_output(
                         hwnd,
                         &format!(
-                            "Warning: {missing} file(s) in the manifest list are not in the files folder — pack will refuse until they are removed from the list or restored."
+                            "Warning: {missing} file(s) in the manifest list are not in the program folder — pack will refuse until they are removed from the list or restored."
                         ),
                     );
                     set_status(
@@ -2919,97 +3179,6 @@ mod imp {
         harvest_fields(hwnd);
     }
 
-    unsafe fn on_add_files(hwnd: HWND) {
-        if is_busy() {
-            return;
-        }
-        harvest_fields(hwnd);
-        let files_dir = with_state(|s| s.doc.files_dir.clone()).flatten();
-        let Some(files_dir) = files_dir else {
-            append_output(hwnd, "Error: choose a files folder first (Project → Files Folder…), then add files to it.");
-            set_status(hwnd, StatusKind::Error, "No files folder chosen yet");
-            return;
-        };
-        let picks = crate::native_dialog::pick_open_files(
-            "Add files to the package",
-            "All files (*.*)",
-            "*.*",
-        );
-        if picks.is_empty() {
-            return;
-        }
-        let mut adds: Vec<String> = Vec::new();
-        for src in &picks {
-            if let Ok(rel) = src.strip_prefix(&files_dir) {
-                adds.push(rel.to_string_lossy().replace('\\', "/"));
-                continue;
-            }
-            match copy_file_into(src, &files_dir) {
-                Ok(dest) => {
-                    if let Some(name) = dest.file_name() {
-                        adds.push(name.to_string_lossy().into_owned());
-                    }
-                }
-                Err(e) => append_output(hwnd, &format!("Skipped {}: {e}", src.display())),
-            }
-        }
-        if adds.is_empty() {
-            set_status(hwnd, StatusKind::Neutral, "Nothing added");
-            return;
-        }
-        with_state(|s| s.pending_adds = adds);
-        mark_dirty(hwnd);
-        start_scan(hwnd);
-    }
-
-    unsafe fn on_add_folder(hwnd: HWND) {
-        if is_busy() {
-            return;
-        }
-        harvest_fields(hwnd);
-        let files_dir = with_state(|s| s.doc.files_dir.clone()).flatten();
-        let Some(files_dir) = files_dir else {
-            append_output(hwnd, "Error: choose a files folder first (Project → Files Folder…), then add a folder to it.");
-            set_status(hwnd, StatusKind::Error, "No files folder chosen yet");
-            return;
-        };
-        let Some(folder) = crate::native_dialog::pick_folder() else {
-            return;
-        };
-        if folder.starts_with(&files_dir) || files_dir.starts_with(&folder) {
-            append_output(hwnd, "Error: that folder overlaps the package folder — copying it into itself would never finish. Pick a folder outside the package folder.");
-            set_status(
-                hwnd,
-                StatusKind::Error,
-                "Folder overlaps the package folder",
-            );
-            return;
-        }
-        match copy_folder_into(&folder, &files_dir) {
-            Ok(copied) => {
-                append_output(
-                    hwnd,
-                    &format!(
-                        "Copied {} file(s) from {} into the package folder.",
-                        copied.len(),
-                        folder.display()
-                    ),
-                );
-                with_state(|s| s.pending_adds = copied);
-                mark_dirty(hwnd);
-                start_scan(hwnd);
-            }
-            Err(e) => {
-                append_output(hwnd, &format!("Error: cannot copy that folder in: {e}"));
-                set_status(
-                    hwnd,
-                    StatusKind::Error,
-                    "Add folder failed — see the output above",
-                );
-            }
-        }
-    }
-
     unsafe fn on_remove_selected(hwnd: HWND) {
         if is_busy() {
             return;
@@ -3092,7 +3261,7 @@ mod imp {
         }
     }
 
-    /// When the files folder was typed rather than picked, it can
+    /// When the program folder was typed rather than picked, it can
     /// differ from the folder the table was scanned from. Rescan
     /// first and report — packing a stale listing would silently
     /// package the wrong folder's contents. Returns true when a
@@ -3105,7 +3274,7 @@ mod imp {
         if stale {
             append_output(
                 hwnd,
-                "Files folder changed — rescanning so the table shows the new folder. Run the action again.",
+                "Program folder changed — rescanning so the table shows the new folder. Run the action again.",
             );
             start_scan(hwnd);
         }
@@ -3144,21 +3313,21 @@ mod imp {
         let Some(manifest) = validated_manifest(hwnd) else {
             return;
         };
-        let Some((files_dir, out_dir, job)) = with_state(|s| {
-            (
-                s.doc.files_dir.clone(),
-                s.doc.out_dir.clone(),
-                s.job.clone(),
-            )
-        }) else {
+        let Some((files_dir, out_dir)) =
+            with_state(|s| (s.doc.files_dir.clone(), s.doc.out_dir.clone()))
+        else {
             return;
         };
         let Some(files_dir) = files_dir else {
             append_output(
                 hwnd,
-                "Error: choose a files folder first (Project → Files Folder…).",
+                "No program folder chosen yet. Click Program Folder… and pick the folder your built program is in — then click Build Setup again.",
             );
-            set_status(hwnd, StatusKind::Error, "No files folder chosen yet");
+            set_status(
+                hwnd,
+                StatusKind::Error,
+                "Click Program Folder… and pick the folder your built program is in",
+            );
             return;
         };
         let stub = match std::env::current_exe() {
@@ -3168,12 +3337,9 @@ mod imp {
                 return;
             }
         };
-        set_busy(hwnd, true);
-        set_status(
-            hwnd,
-            StatusKind::Neutral,
-            &format!("Packing {} {}…", manifest.app_name, manifest.version),
-        );
+        let Some(hooks) = begin_job(hwnd, JobKind::Pack) else {
+            return;
+        };
         append_output(
             hwnd,
             &format!(
@@ -3184,15 +3350,36 @@ mod imp {
             ),
         );
         let hwnd_value = hwnd as usize;
+        let JobHooks {
+            job,
+            cancel,
+            progress,
+        } = hooks;
         std::thread::spawn(move || {
-            let result =
-                crate::pack::pack(&manifest, &files_dir, &out_dir, &stub, force).map_err(|e| {
-                    PackFail {
-                        refused_overwrite: matches!(e, PackError::RefuseOverwrite(_)),
-                        message: e.to_string(),
-                    }
-                });
-            post_job(hwnd_value, &job, JobResult::Pack(result));
+            let mut on_progress = |p: &crate::pack::PackProgress| {
+                let done = p.file_index + 1;
+                if done == 1 || done == p.file_count || done.is_multiple_of(10) {
+                    report_progress(hwnd_value, &progress, done, p.file_count);
+                }
+            };
+            let result = crate::pack::pack_with_hooks(
+                &manifest,
+                &files_dir,
+                &out_dir,
+                &stub,
+                force,
+                Some(&mut on_progress),
+                Some(&cancel),
+            );
+            let result = match result {
+                Ok(outcome) => JobResult::Pack(Ok(outcome)),
+                Err(PackError::Cancelled) => JobResult::Cancelled(JobKind::Pack),
+                Err(e) => JobResult::Pack(Err(PackFail {
+                    refused_overwrite: matches!(e, PackError::RefuseOverwrite(_)),
+                    message: e.to_string(),
+                })),
+            };
+            post_job(hwnd_value, &job, result);
         });
     }
 
@@ -3244,10 +3431,19 @@ mod imp {
                     ),
                 );
                 with_state(|s| s.last_setup = Some(outcome.setup.path.clone()));
+                // Name what was built and where — no guessing.
+                let out_folder = outcome
+                    .sums_path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the output folder".to_string());
                 set_status(
                     hwnd,
                     StatusKind::Ok,
-                    "Pack complete — Setup.exe is ready to verify",
+                    &format!(
+                        "Built: {}, the portable .zip, and SHA256SUMS.txt in {}",
+                        outcome.setup.name, out_folder
+                    ),
                 );
             }
             Err(fail) => {
@@ -3295,18 +3491,14 @@ mod imp {
                 None => return,
             },
         };
-        let job = with_state(|s| s.job.clone());
-        let Some(job) = job else { return };
-        set_busy(hwnd, true);
-        set_status(
-            hwnd,
-            StatusKind::Neutral,
-            if sandbox {
-                "Test-installing into a temp folder…"
-            } else {
-                "Verifying the package…"
-            },
-        );
+        let kind = if sandbox {
+            JobKind::TestInstall
+        } else {
+            JobKind::Verify
+        };
+        let Some(hooks) = begin_job(hwnd, kind) else {
+            return;
+        };
         append_output(
             hwnd,
             &format!(
@@ -3320,9 +3512,17 @@ mod imp {
             ),
         );
         let hwnd_value = hwnd as usize;
+        let JobHooks {
+            job,
+            cancel,
+            progress,
+        } = hooks;
         std::thread::spawn(move || {
-            let (ok, lines) = if sandbox {
-                match crate::pack::sandbox_verify(&path) {
+            if sandbox {
+                match crate::pack::sandbox_verify_with(&path, Some(&cancel)) {
+                    Ok(report) if report.cancelled => {
+                        post_job(hwnd_value, &job, JobResult::Cancelled(JobKind::TestInstall));
+                    }
                     Ok(report) => {
                         let mut lines: Vec<String> = report
                             .checks
@@ -3344,12 +3544,37 @@ mod imp {
                             "Sandbox verify: {}",
                             if report.ok { "PASS" } else { "FAIL" }
                         ));
-                        (report.ok, lines)
+                        post_job(
+                            hwnd_value,
+                            &job,
+                            JobResult::Verify {
+                                sandbox,
+                                path,
+                                ok: report.ok,
+                                lines,
+                            },
+                        );
                     }
-                    Err(e) => (false, vec![format!("Error: cannot sandbox-verify: {e}")]),
+                    Err(e) => post_job(
+                        hwnd_value,
+                        &job,
+                        JobResult::Verify {
+                            sandbox,
+                            path,
+                            ok: false,
+                            lines: vec![format!("Error: cannot sandbox-verify: {e}")],
+                        },
+                    ),
                 }
             } else {
-                match crate::pack::verify_package(&path) {
+                let mut on_progress = |p: &crate::pack::PackProgress| {
+                    let done = p.file_index + 1;
+                    if done == 1 || done == p.file_count || done.is_multiple_of(10) {
+                        report_progress(hwnd_value, &progress, done, p.file_count);
+                    }
+                };
+                match crate::pack::verify_package_with(&path, Some(&mut on_progress), Some(&cancel))
+                {
                     Ok(report) => {
                         let mut lines: Vec<String> = Vec::new();
                         if !report.app_name.is_empty() {
@@ -3368,21 +3593,32 @@ mod imp {
                             "Verify: {}",
                             if report.ok { "PASS" } else { "FAIL" }
                         ));
-                        (report.ok, lines)
+                        post_job(
+                            hwnd_value,
+                            &job,
+                            JobResult::Verify {
+                                sandbox,
+                                path,
+                                ok: report.ok,
+                                lines,
+                            },
+                        );
                     }
-                    Err(e) => (false, vec![format!("Error: cannot verify: {e}")]),
+                    Err(_) if cancel.load(Ordering::Relaxed) => {
+                        post_job(hwnd_value, &job, JobResult::Cancelled(JobKind::Verify));
+                    }
+                    Err(e) => post_job(
+                        hwnd_value,
+                        &job,
+                        JobResult::Verify {
+                            sandbox,
+                            path,
+                            ok: false,
+                            lines: vec![format!("Error: cannot verify: {e}")],
+                        },
+                    ),
                 }
-            };
-            post_job(
-                hwnd_value,
-                &job,
-                JobResult::Verify {
-                    sandbox,
-                    path,
-                    ok,
-                    lines,
-                },
-            );
+            }
         });
     }
 
@@ -3424,6 +3660,118 @@ mod imp {
         }
     }
 
+    /// The document's output folder as an absolute path (a relative
+    /// value resolves against the program folder, else the process
+    /// working folder) — what Open output folder and Preview
+    /// installer act on.
+    fn resolved_out_dir(doc: &StudioDocument) -> PathBuf {
+        if doc.out_dir.is_absolute() {
+            return doc.out_dir.clone();
+        }
+        if let Some(files_dir) = &doc.files_dir {
+            return files_dir.join(&doc.out_dir);
+        }
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&doc.out_dir))
+            .unwrap_or_else(|_| doc.out_dir.clone())
+    }
+
+    /// The Setup file this project builds into its output folder —
+    /// the exact name the pack operation produces.
+    fn expected_setup_path(doc: &StudioDocument) -> PathBuf {
+        resolved_out_dir(doc).join(doc.manifest.setup_file_name())
+    }
+
+    /// ShellExecuteW "open", the same launch mechanism as the log
+    /// viewer: a file path, or a program plus parameters.
+    unsafe fn shell_open(hwnd: HWND, file: &str, params: Option<&str>) {
+        let verb: Vec<u16> = "open\0".encode_utf16().collect();
+        let file_w: Vec<u16> = file.encode_utf16().chain(std::iter::once(0)).collect();
+        let params_w: Vec<u16> = params
+            .unwrap_or("")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            hwnd,
+            verb.as_ptr(),
+            file_w.as_ptr(),
+            if params.is_some() {
+                params_w.as_ptr()
+            } else {
+                std::ptr::null()
+            },
+            std::ptr::null(),
+            SW_SHOWDEFAULT,
+        );
+    }
+
+    /// Opens Windows Explorer at the output folder, selecting the
+    /// built Setup file when it is there.
+    unsafe fn on_open_output_folder(hwnd: HWND) {
+        if is_busy() {
+            return;
+        }
+        harvest_fields(hwnd);
+        let Some((out_dir, setup, last_setup)) = with_state(|s| {
+            (
+                resolved_out_dir(&s.doc),
+                expected_setup_path(&s.doc),
+                s.last_setup.clone(),
+            )
+        }) else {
+            return;
+        };
+        if !out_dir.is_dir() {
+            append_output(hwnd, "The output folder does not exist yet — it is created when you build. If the path looks wrong, fix it in the Output folder field under PACKAGE.");
+            set_status(
+                hwnd,
+                StatusKind::Error,
+                "The output folder does not exist yet — it is created when you build",
+            );
+            return;
+        }
+        let select = if setup.is_file() {
+            Some(setup)
+        } else {
+            last_setup.filter(|p| p.is_file() && p.parent() == Some(out_dir.as_path()))
+        };
+        match select {
+            Some(path) => {
+                let params = format!("/select,\"{}\"", path.display());
+                shell_open(hwnd, "explorer.exe", Some(&params));
+            }
+            None => shell_open(hwnd, &out_dir.display().to_string(), None),
+        }
+        set_status(
+            hwnd,
+            StatusKind::Neutral,
+            "Output folder opened in Explorer",
+        );
+    }
+
+    /// Launches the project's built Setup file, so the real
+    /// installer wizard opens — the answer to "how do I see the
+    /// other view?": the same program IS the installer when it
+    /// carries a package, and this runs the built file to prove it.
+    unsafe fn on_preview_installer(hwnd: HWND) {
+        if is_busy() {
+            return;
+        }
+        harvest_fields(hwnd);
+        let Some(setup) = with_state(|s| expected_setup_path(&s.doc)) else {
+            return;
+        };
+        if setup.is_file() {
+            shell_open(hwnd, &setup.display().to_string(), None);
+            append_output(hwnd, "Opened the installer preview — this is what people see when they run your Setup file. Nothing is installed unless they click Install.");
+            set_status(hwnd, StatusKind::Neutral, "Opened the installer preview — this is what people see when they run your Setup file. Nothing is installed unless they click Install.");
+        } else {
+            append_output(hwnd, "No Setup file yet. Click Build Setup first, then Preview installer to see what people will see.");
+            set_status(hwnd, StatusKind::Neutral, "No Setup file yet. Click Build Setup first, then Preview installer to see what people will see.");
+        }
+    }
+
     unsafe fn on_job_message(hwnd: HWND) {
         let taken = with_state(|s| s.job.lock().ok().and_then(|mut slot| slot.take())).flatten();
         match taken {
@@ -3435,6 +3783,7 @@ mod imp {
                 ok,
                 lines,
             }) => on_verify_done(hwnd, sandbox, path, ok, lines),
+            Some(JobResult::Cancelled(kind)) => on_cancelled(hwnd, kind),
             None => {}
         }
     }
@@ -3625,16 +3974,25 @@ mod imp {
                     return DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
                 let dis = &*dis;
-                if dis.CtlType == ODT_HEADER_CTL {
-                    theme::draw_list_header(dis);
-                    return 1;
-                }
+                // No header arm: the list headers are painted by
+                // their subclass (theme::subclass_list_header) —
+                // header draw-item messages never reach this window.
                 match dis.CtlID as usize {
                     ID_BTN_BUILD => theme::draw_push_button(dis, true),
-                    ID_BTN_TB_OPEN | ID_BTN_TB_SAVE | ID_BTN_TB_SAVEAS | ID_BTN_TB_ADDFILES
-                    | ID_BTN_TB_VALIDATE | ID_BTN_ADD_FILES | ID_BTN_ADD_FOLDER | ID_BTN_REMOVE
-                    | ID_BTN_FILES_DIR | ID_BTN_OUT_DIR | ID_BTN_VALIDATE | ID_BTN_VERIFY
-                    | ID_BTN_TEST => theme::draw_push_button(dis, false),
+                    ID_BTN_TB_OPEN
+                    | ID_BTN_TB_SAVE
+                    | ID_BTN_TB_SAVEAS
+                    | ID_BTN_TB_VALIDATE
+                    | ID_BTN_PROGRAM_FOLDER
+                    | ID_BTN_REMOVE
+                    | ID_BTN_FILES_DIR
+                    | ID_BTN_OUT_DIR
+                    | ID_BTN_VALIDATE
+                    | ID_BTN_VERIFY
+                    | ID_BTN_TEST
+                    | ID_BTN_OPEN_OUTPUT
+                    | ID_BTN_PREVIEW
+                    | ID_BTN_CANCEL => theme::draw_push_button(dis, false),
                     id if CHECKBOX_IDS.contains(&id) => theme::draw_checkbox(dis),
                     _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
@@ -3667,17 +4025,23 @@ mod imp {
                         on_verify(hwnd, sandbox);
                     }
                     IDM_BUILD_TEST => on_verify(hwnd, true),
+                    IDM_BUILD_PREVIEW => on_preview_installer(hwnd),
                     IDM_TOOLS_SCHEMA => on_schema(hwnd),
                     IDM_TOOLS_LOG => on_open_log(hwnd),
                     IDM_HELP_ABOUT => on_about(hwnd),
                     ID_BTN_TB_OPEN => on_open_manifest(hwnd),
                     ID_BTN_TB_SAVE => on_save(hwnd, false),
                     ID_BTN_TB_SAVEAS => on_save(hwnd, true),
-                    ID_BTN_TB_ADDFILES => on_add_files(hwnd),
                     ID_BTN_TB_VALIDATE => on_validate(hwnd),
-                    ID_BTN_ADD_FILES => on_add_files(hwnd),
-                    ID_BTN_ADD_FOLDER => on_add_folder(hwnd),
+                    ID_BTN_PROGRAM_FOLDER => on_choose_files_dir(hwnd),
                     ID_BTN_REMOVE => on_remove_selected(hwnd),
+                    ID_BTN_CANCEL => on_cancel_job(hwnd),
+                    ID_BTN_OPEN_OUTPUT => on_open_output_folder(hwnd),
+                    ID_BTN_PREVIEW => on_preview_installer(hwnd),
+                    // Esc (delivered as IDCANCEL by the dialog-message
+                    // handling) cancels a running job, like the
+                    // wizard's progress page.
+                    2 if is_busy() => on_cancel_job(hwnd),
                     ID_BTN_FILES_DIR => on_choose_files_dir(hwnd),
                     ID_BTN_OUT_DIR => on_choose_out_dir(hwnd),
                     ID_BTN_VERIFY => {
@@ -3737,6 +4101,10 @@ mod imp {
             }
             m if m == WM_APP_JOB => {
                 on_job_message(hwnd);
+                0
+            }
+            m if m == WM_APP_PROGRESS => {
+                on_progress_message(hwnd);
                 0
             }
             WM_SIZE => {

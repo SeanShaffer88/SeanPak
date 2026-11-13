@@ -16,10 +16,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use crate::hash::{crc32, sha256_file_hex};
 use crate::manifest::AppManifest;
-use crate::overlay::{OverlayReader, OverlayWriter};
+use crate::overlay::{BuildControl, OverlayReader, OverlayWriter};
 use crate::scanner::ScannedFolder;
 
 #[derive(Debug)]
@@ -28,6 +29,11 @@ pub enum PackError {
     BadFiles(String),
     /// An existing output differs and `force` was not given.
     RefuseOverwrite(String),
+    /// The caller cancelled via the cancel flag passed to
+    /// [`pack_with_hooks`]. Any outputs the cancelled run placed that
+    /// did not exist before the run have already been removed; files
+    /// that existed before the run are never touched.
+    Cancelled,
     Io(std::io::Error),
 }
 
@@ -36,6 +42,7 @@ impl std::fmt::Display for PackError {
         match self {
             PackError::BadFiles(m) => write!(f, "{m}"),
             PackError::RefuseOverwrite(m) => write!(f, "{m}"),
+            PackError::Cancelled => write!(f, "pack cancelled by user"),
             PackError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -79,6 +86,16 @@ pub struct PackOutcome {
     pub components: Vec<ComponentInfo>,
 }
 
+/// One per-file progress update from [`pack_with_hooks`] and
+/// [`verify_package_with`] — the same shape as the install
+/// operation's `ProgressEvent`.
+#[derive(Debug, Clone)]
+pub struct PackProgress {
+    pub file_index: usize,
+    pub file_count: usize,
+    pub rel_path: String,
+}
+
 /// One release packaging run. See the module docs for the contract.
 pub fn pack(
     manifest: &AppManifest,
@@ -87,7 +104,41 @@ pub fn pack(
     stub_path: &Path,
     force: bool,
 ) -> Result<PackOutcome, PackError> {
-    let scanned = ScannedFolder::scan(files_dir)?;
+    pack_with_hooks(manifest, files_dir, out_dir, stub_path, force, None, None)
+}
+
+/// Like [`pack`], with opt-in per-file progress and cooperative
+/// cancellation — the hooks the Builder studio's worker threads use.
+/// Cancellation is checked between files (scan, overlay build,
+/// portable zip) and between the placement steps; a cancelled run
+/// returns [`PackError::Cancelled`] and removes any of the three
+/// release files it placed that did not exist before the run (files
+/// that existed before the run are never deleted). Callers that pass
+/// no hooks — the CLI always does — get exactly [`pack`]'s behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_with_hooks(
+    manifest: &AppManifest,
+    files_dir: &Path,
+    out_dir: &Path,
+    stub_path: &Path,
+    force: bool,
+    mut progress: Option<&mut dyn FnMut(&PackProgress)>,
+    cancel: Option<&AtomicBool>,
+) -> Result<PackOutcome, PackError> {
+    let cancelled = || crate::scanner::is_cancelled(cancel);
+    // One local sink both build phases report through (passing the
+    // raw `Option<&mut dyn FnMut>` parameter to two callees tangles
+    // the trait-object lifetimes; a closure reborrow does not).
+    let mut report_progress = |event: &PackProgress| {
+        if let Some(sink) = progress.as_deref_mut() {
+            sink(event);
+        }
+    };
+    let scanned = match ScannedFolder::scan_with(files_dir, cancel) {
+        Ok(scanned) => scanned,
+        Err(_) if cancelled() => return Err(PackError::Cancelled),
+        Err(e) => return Err(PackError::Io(e)),
+    };
     if scanned.files.is_empty() {
         return Err(PackError::BadFiles(format!(
             "no files found in {}",
@@ -209,25 +260,63 @@ pub fn pack(
     let temp_setup = temp_dir.join(&setup_name);
     let temp_portable = temp_dir.join(&portable_name);
 
+    // Which of the three release files already exist in the output
+    // folder. A cancelled run removes only outputs it placed itself;
+    // anything that was there before the run is never deleted.
+    let setup_dest = out_dir.join(&setup_name);
+    let portable_dest = out_dir.join(&portable_name);
+    let sums_dest = out_dir.join("SHA256SUMS.txt");
+    let existed_before = [
+        setup_dest.is_file(),
+        portable_dest.is_file(),
+        sums_dest.is_file(),
+    ];
+
     let options = manifest.to_install_options();
     let mut packed_power: Option<crate::overlay::PowerSpec> = None;
-    let build_result = OverlayWriter::build_overlay_with_power(
-        stub_path,
-        &temp_setup,
-        files_dir,
-        &files_arg,
-        &manifest.app_name,
-        &manifest.version,
-        &manifest.publisher,
-        &options,
-        &power,
-    )
-    .and_then(|(_, computed)| {
-        packed_power = Some(computed);
-        write_portable_zip(&files_arg, &temp_portable)
-    });
+    let build_result = {
+        let mut build_progress = |idx: usize, total: usize, rel: &str| {
+            report_progress(&PackProgress {
+                file_index: idx,
+                file_count: total,
+                rel_path: rel.to_string(),
+            });
+        };
+        let mut control = BuildControl {
+            on_file: Some(&mut build_progress),
+            cancel,
+        };
+        OverlayWriter::build_overlay_with_power_ctl(
+            stub_path,
+            &temp_setup,
+            files_dir,
+            &files_arg,
+            &manifest.app_name,
+            &manifest.version,
+            &manifest.publisher,
+            &options,
+            &power,
+            &mut control,
+        )
+        .map(|(_, computed)| computed)
+    };
+    let build_result = match build_result {
+        Ok(computed) => {
+            packed_power = Some(computed);
+            write_portable_zip_ctl(
+                &files_arg,
+                &temp_portable,
+                cancel,
+                Some(&mut report_progress),
+            )
+        }
+        Err(e) => Err(e),
+    };
     if let Err(e) = build_result {
         cleanup(&temp_dir);
+        if cancelled() {
+            return Err(PackError::Cancelled);
+        }
         return Err(PackError::Io(e));
     }
     let packed_power = packed_power.unwrap_or(power);
@@ -302,6 +391,20 @@ pub fn pack(
         })
     };
 
+    // Outputs this run has placed that did not exist before it: a
+    // cancellation from here on removes exactly these, so a cancelled
+    // build never leaves a partial release set behind.
+    let mut placed_fresh: Vec<PathBuf> = Vec::new();
+    let remove_fresh = |placed: &[PathBuf]| {
+        for path in placed {
+            let _ = std::fs::remove_file(path);
+        }
+    };
+
+    if cancelled() {
+        cleanup(&temp_dir);
+        return Err(PackError::Cancelled);
+    }
     let setup_info = match place(&temp_setup, &setup_name) {
         Ok(info) => info,
         Err(e) => {
@@ -309,6 +412,14 @@ pub fn pack(
             return Err(e);
         }
     };
+    if !existed_before[0] {
+        placed_fresh.push(setup_dest.clone());
+    }
+    if cancelled() {
+        remove_fresh(&placed_fresh);
+        cleanup(&temp_dir);
+        return Err(PackError::Cancelled);
+    }
     let portable_info = match place(&temp_portable, &portable_name) {
         Ok(info) => info,
         Err(e) => {
@@ -316,6 +427,14 @@ pub fn pack(
             return Err(e);
         }
     };
+    if !existed_before[1] {
+        placed_fresh.push(portable_dest.clone());
+    }
+    if cancelled() {
+        remove_fresh(&placed_fresh);
+        cleanup(&temp_dir);
+        return Err(PackError::Cancelled);
+    }
 
     let sums_path = out_dir.join("SHA256SUMS.txt");
     let sums = format!(
@@ -343,6 +462,17 @@ pub fn write_portable_zip(
     files: &[(PathBuf, String, bool)],
     out_path: &Path,
 ) -> std::io::Result<()> {
+    write_portable_zip_ctl(files, out_path, None, None)
+}
+
+/// Like [`write_portable_zip`], with opt-in per-file progress +
+/// cancellation (checked between entries; see [`pack_with_hooks`]).
+pub fn write_portable_zip_ctl(
+    files: &[(PathBuf, String, bool)],
+    out_path: &Path,
+    cancel: Option<&AtomicBool>,
+    mut progress: Option<&mut dyn FnMut(&PackProgress)>,
+) -> std::io::Result<()> {
     let mut entries: Vec<&(PathBuf, String, bool)> = files.iter().collect();
     entries.sort_by_key(|entry| entry.1.replace('\\', "/"));
 
@@ -353,8 +483,18 @@ pub fn write_portable_zip(
     const DOS_TIME: u16 = 0;
     const DOS_DATE: u16 = 0x21; // 1980-01-01
 
-    for (abs, rel, _) in &entries {
+    for (idx, (abs, rel, _)) in entries.iter().enumerate() {
+        if crate::scanner::is_cancelled(cancel) {
+            return Err(crate::scanner::cancelled_error("pack"));
+        }
         let name = rel.replace('\\', "/");
+        if let Some(sink) = progress.as_deref_mut() {
+            sink(&PackProgress {
+                file_index: idx,
+                file_count: entries.len(),
+                rel_path: name.clone(),
+            });
+        }
         let data = std::fs::read(abs)?;
         let crc = crc32(&data);
         let size = data.len() as u64;
@@ -439,6 +579,19 @@ pub struct VerifyReport {
 /// Verifies a built Setup.exe: overlay readable, embedded manifest sane,
 /// and the recorded file list matching the payloads actually present.
 pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
+    verify_package_with(path, None, None)
+}
+
+/// Like [`verify_package`], with opt-in per-file progress +
+/// cancellation. Cancellation is checked between payload decodes (the
+/// expensive phase) and returns the shared `Interrupted`
+/// "verify cancelled" error; callers that pass no hooks — the CLI
+/// always does — get exactly [`verify_package`]'s behavior.
+pub fn verify_package_with(
+    path: &Path,
+    mut progress: Option<&mut dyn FnMut(&PackProgress)>,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<VerifyReport> {
     let mut report = VerifyReport {
         ok: false,
         app_name: String::new(),
@@ -567,6 +720,16 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
         // and the compression (if any) is sound.
         let mut file = std::fs::File::open(path)?;
         for idx in 0..records.len() {
+            if crate::scanner::is_cancelled(cancel) {
+                return Err(crate::scanner::cancelled_error("verify"));
+            }
+            if let Some(sink) = progress.as_deref_mut() {
+                sink(&PackProgress {
+                    file_index: idx,
+                    file_count: records.len(),
+                    rel_path: records[idx].relative_path(),
+                });
+            }
             match OverlayReader::read_payload(&mut file, &records, idx, file_len) {
                 Ok(bytes) if bytes.len() as u64 == records[idx].file_size => {}
                 Ok(_) => {
@@ -608,6 +771,10 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
 #[derive(Debug)]
 pub struct SandboxReport {
     pub ok: bool,
+    /// The caller cancelled via the flag passed to
+    /// [`sandbox_verify_with`]; the sandbox folder was removed and the
+    /// remaining phases never ran.
+    pub cancelled: bool,
     pub install_dir: PathBuf,
     /// (check name, passed, detail) in the order the checks ran.
     pub checks: Vec<(String, bool, String)>,
@@ -624,6 +791,19 @@ pub struct SandboxReport {
 /// (on Windows CI it exercises the real Windows build; a foreign PE on
 /// the wrong OS fails the first check honestly instead of pretending).
 pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
+    sandbox_verify_with(setup_path, None)
+}
+
+/// Like [`sandbox_verify`], with opt-in cooperative cancellation. The
+/// flag is checked between phases and between compared files — a
+/// subprocess already running (the install or uninstall under test)
+/// runs to completion, since killing it would leave the sandbox in an
+/// unknown state. A cancelled run reports `cancelled: true`, removes
+/// the sandbox folder, and never runs the remaining phases.
+pub fn sandbox_verify_with(
+    setup_path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<SandboxReport> {
     use crate::hash::sha256_file_hex;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -635,6 +815,7 @@ pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
     let install_dir = root.join("app");
     let mut report = SandboxReport {
         ok: false,
+        cancelled: false,
         install_dir: install_dir.clone(),
         checks: Vec::new(),
         leftovers: Vec::new(),
@@ -642,6 +823,20 @@ pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
     let finish = |report: SandboxReport| -> std::io::Result<SandboxReport> {
         let _ = std::fs::remove_dir_all(&root);
         Ok(report)
+    };
+    // A cancelled run ends at the next check point: one honest check
+    // line, the sandbox folder removed by `finish`, no further phases.
+    let note_cancelled = |report: &mut SandboxReport, when: &str| -> bool {
+        if !crate::scanner::is_cancelled(cancel) {
+            return false;
+        }
+        report.cancelled = true;
+        report.checks.push((
+            "cancelled".to_string(),
+            false,
+            format!("cancelled by user {when}"),
+        ));
+        true
     };
 
     let staged = root.join("SetupUnderTest.exe");
@@ -675,6 +870,9 @@ pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
         }
     }
     let install_arg_refs: Vec<&str> = install_args.iter().map(|s| s.as_str()).collect();
+    if note_cancelled(&mut report, "before the test install ran") {
+        return finish(report);
+    }
     let (installed_ok, install_output) = match run(&staged, &install_arg_refs) {
         Ok(result) => result,
         Err(e) => {
@@ -715,6 +913,12 @@ pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
     match OverlayReader::extract_file(setup_path, &payload_dir) {
         Ok(written) => {
             for payload_file in &written {
+                if crate::scanner::is_cancelled(cancel) {
+                    files_ok = false;
+                    files_detail = "cancelled by user during the comparison".to_string();
+                    report.cancelled = true;
+                    break;
+                }
                 let rel = payload_file
                     .strip_prefix(&payload_dir)
                     .unwrap()
@@ -747,6 +951,17 @@ pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
         files_ok,
         files_detail,
     ));
+    if report.cancelled {
+        report.checks.push((
+            "cancelled".to_string(),
+            false,
+            "cancelled by user during the comparison; the sandbox folder was removed".to_string(),
+        ));
+        return finish(report);
+    }
+    if note_cancelled(&mut report, "before the test uninstall ran") {
+        return finish(report);
+    }
 
     // 3. Silent uninstall via the installed Uninstall.exe.
     let uninstaller = install_dir.join("Uninstall.exe");
@@ -934,6 +1149,143 @@ mod tests {
         let forced = pack(&manifest, &files, &out_dir, &stub, true).unwrap();
         assert_ne!(forced.setup.sha256, outcome.setup.sha256);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pack_cancelled_before_start_leaves_no_outputs() {
+        let root = unique_temp("cancel0");
+        let (files, stub) = sample_app(&root);
+        let out_dir = root.join("dist");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("keep.txt"), b"not ours").unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let result = pack_with_hooks(
+            &sample_manifest(),
+            &files,
+            &out_dir,
+            &stub,
+            false,
+            None,
+            Some(&cancel),
+        );
+        assert!(matches!(result, Err(PackError::Cancelled)), "{result:?}");
+        // No partial release set, and the unrelated file is untouched.
+        assert!(!out_dir.join("TestApp-v1.2.0-x64-Setup.exe").exists());
+        assert!(!out_dir.join("TestApp-v1.2.0-x64-Portable.zip").exists());
+        assert!(!out_dir.join("SHA256SUMS.txt").exists());
+        assert_eq!(
+            std::fs::read(out_dir.join("keep.txt")).unwrap(),
+            b"not ours"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pack_cancelled_mid_build_keeps_preexisting_outputs() {
+        let root = unique_temp("cancel1");
+        let (files, stub) = sample_app(&root);
+        let out_dir = root.join("dist");
+        let manifest = sample_manifest();
+
+        // A completed pack first: its outputs are pre-existing files
+        // for the cancelled run and must survive it untouched.
+        let first = pack(&manifest, &files, &out_dir, &stub, false).unwrap();
+        std::fs::write(files.join("app.exe"), b"changed-pe").unwrap();
+
+        // The progress hook trips the cancel flag on the first file —
+        // the same flag the studio's Cancel button sets.
+        let cancel = AtomicBool::new(false);
+        let mut progress = |p: &PackProgress| {
+            if p.file_index == 0 {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let result = pack_with_hooks(
+            &manifest,
+            &files,
+            &out_dir,
+            &stub,
+            true,
+            Some(&mut progress),
+            Some(&cancel),
+        );
+        assert!(matches!(result, Err(PackError::Cancelled)), "{result:?}");
+        assert_eq!(
+            sha256_file_hex(&first.setup.path).unwrap(),
+            first.setup.sha256,
+            "the pre-existing Setup.exe must be byte-identical after a cancelled re-pack"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pack_cancelled_at_placement_leaves_no_partial_set() {
+        let root = unique_temp("cancel2");
+        let (files, stub) = sample_app(&root);
+        let out_dir = root.join("dist");
+
+        // Trip the flag on the very last progress event (the portable
+        // zip's final file): the build completes, and the cancellation
+        // lands in the placement phase, before any output is placed.
+        let cancel = AtomicBool::new(false);
+        let events = std::sync::atomic::AtomicUsize::new(0);
+        let mut progress = |_: &PackProgress| {
+            // 2 files -> 2 build events + 2 zip events; fire on the 4th.
+            if events.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 3 {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let result = pack_with_hooks(
+            &sample_manifest(),
+            &files,
+            &out_dir,
+            &stub,
+            false,
+            Some(&mut progress),
+            Some(&cancel),
+        );
+        assert!(matches!(result, Err(PackError::Cancelled)), "{result:?}");
+        assert!(!out_dir.join("TestApp-v1.2.0-x64-Setup.exe").exists());
+        assert!(!out_dir.join("TestApp-v1.2.0-x64-Portable.zip").exists());
+        assert!(!out_dir.join("SHA256SUMS.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_cancelled_stops_with_interrupted() {
+        let root = unique_temp("cancel3");
+        let (files, stub) = sample_app(&root);
+        let out_dir = root.join("dist");
+        let outcome = pack(&sample_manifest(), &files, &out_dir, &stub, false).unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let err = verify_package_with(&outcome.setup.path, None, Some(&cancel)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        // The unset flag verifies normally.
+        let cancel = AtomicBool::new(false);
+        assert!(
+            verify_package_with(&outcome.setup.path, None, Some(&cancel))
+                .unwrap()
+                .ok
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sandbox_cancelled_before_install_reports_cancelled() {
+        let root = unique_temp("cancel4");
+        let (files, stub) = sample_app(&root);
+        let out_dir = root.join("dist");
+        let outcome = pack(&sample_manifest(), &files, &out_dir, &stub, false).unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let report = sandbox_verify_with(&outcome.setup.path, Some(&cancel)).unwrap();
+        assert!(report.cancelled);
+        assert!(!report.ok);
+        // The sandbox folder is gone.
+        assert!(!report.install_dir.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

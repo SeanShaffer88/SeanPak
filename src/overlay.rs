@@ -942,6 +942,23 @@ impl PowerSpec {
 
 pub struct OverlayWriter;
 
+/// Per-file progress callback for packing: `(index, total, path)`,
+/// with the same shape as extraction's [`OnExtractFile`].
+pub type OnBuildFile<'a> = dyn FnMut(usize, usize, &str) + 'a;
+
+/// Progress + cancellation hooks for
+/// [`OverlayWriter::build_overlay_with_power_ctl`] — the writer-side
+/// mirror of [`ExtractControl`].
+#[derive(Default)]
+pub struct BuildControl<'a> {
+    /// Called as `(index, total, relative_path)` before each file is
+    /// packed.
+    pub on_file: Option<&'a mut OnBuildFile<'a>>,
+    /// When this flag is set, packing aborts between files with an
+    /// `Interrupted` error.
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
 impl OverlayWriter {
     /// Scans `source_dir`, then packs every file found into a sector-aligned
     /// overlay appended to a copy of `stub_binary_path` at `output_exe_path`.
@@ -1041,6 +1058,38 @@ impl OverlayWriter {
     pub fn build_overlay_with_power(
         stub_binary_path: &Path,
         output_exe_path: &Path,
+        source_dir: &Path,
+        files: &[(PathBuf, String, bool)], // (absolute_path, relative_path, is_primary)
+        app_name: &str,
+        version: &str,
+        publisher: &str,
+        options: &InstallOptions,
+        power: &PowerSpec,
+    ) -> std::io::Result<(u64, PowerSpec)> {
+        Self::build_overlay_with_power_ctl(
+            stub_binary_path,
+            output_exe_path,
+            source_dir,
+            files,
+            app_name,
+            version,
+            publisher,
+            options,
+            power,
+            &mut BuildControl::default(),
+        )
+    }
+
+    /// Like [`OverlayWriter::build_overlay_with_power`], with
+    /// per-file progress + cancellation hooks ([`BuildControl`]).
+    /// Cancellation aborts between files with an `Interrupted` error;
+    /// the partially written output executable is the caller's to
+    /// remove (the pack operation builds into a temp directory and
+    /// deletes it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_overlay_with_power_ctl(
+        stub_binary_path: &Path,
+        output_exe_path: &Path,
         _source_dir: &Path,
         files: &[(PathBuf, String, bool)], // (absolute_path, relative_path, is_primary)
         app_name: &str,
@@ -1048,6 +1097,7 @@ impl OverlayWriter {
         publisher: &str,
         options: &InstallOptions,
         power: &PowerSpec,
+        control: &mut BuildControl<'_>,
     ) -> std::io::Result<(u64, PowerSpec)> {
         // Copy host stub executable to target output path
         std::fs::copy(stub_binary_path, output_exe_path)?;
@@ -1098,6 +1148,17 @@ impl OverlayWriter {
         let mut stored_payloads: Vec<Vec<u8>> = Vec::with_capacity(files.len());
 
         for (idx, (abs_path, rel_path, is_primary)) in files.iter().enumerate() {
+            if let Some(cancel) = control.cancel {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "pack cancelled",
+                    ));
+                }
+            }
+            if let Some(on_file) = control.on_file.as_deref_mut() {
+                on_file(idx, files.len(), rel_path);
+            }
             let raw = std::fs::read(abs_path)?;
             let file_size = raw.len() as u64;
             total_bytes += file_size;
