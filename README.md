@@ -48,9 +48,11 @@ SeanPak is built to be driven by a local AI: packaging is the primary workflow, 
 - The uninstaller asks before deleting the app's data folders (opt-in checkbox, off by default); silent uninstalls delete data only with an explicit `--purge-data`
 
 **Builder studio**
-- An IDE-layout window over the same operations as the CLI: folder tree, files table with real packed-size estimates, and a manifest panel
-- Edits the real `manifest.json` — identity, install location, associations, shortcut and PATH toggles, launch/login offers with their defaults, data folders, and the Power blocks (components, hooks, writes, shortcuts) as JSON
-- Build Setup / Validate / Verify (including the sandbox test install) run on a worker thread with results in the output panel
+- An IDE-layout window over the same operations as the CLI: folder tree, files table with real packed-size estimates, and a manifest panel, all labeled in plain English with a plain tooltip on every main control
+- One way in: **Program Folder…** picks the folder your built program is in and fills the table, listing, and totals from it; files a manifest lists beyond the folder still show (marked missing) and can be removed with **Remove selected**
+- Edits the real `manifest.json` — identity, install location, associations, shortcut and PATH toggles, launch/login offers with their defaults, data folders, and the Advanced options (components, hooks, writes, shortcuts) as JSON
+- Build Setup / Check details / Verify package (with **Also test-install** for the sandbox run) run on a worker thread with results in the output panel — and every long operation can be stopped with the **Cancel** button; a stopped build removes its unfinished files and never touches outputs that existed before it
+- **Open output folder** opens Explorer at the built files (selecting the Setup file), and **Preview installer** launches the built Setup file so you see the exact installer your users will see
 - Window geometry and last-used paths persist between runs
 
 **Engineering**
@@ -281,7 +283,7 @@ manifest/overlay · `4` I/O failure (including a refused overwrite) ·
 `6` differences found (`diff` only).
 
 ## Known limitations (honest list)
-- The Builder studio (Design H, IDE layout) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. The studio has run on a real Windows desktop (the v4.7.0 build, 2026-11-13); its 4.7.1 TesselGUI 1.4.0 re-theme — owner-drawn buttons, checkboxes and list headers, corrected label and edit colors, the PACKAGE-cluster layout fix — is **Unverified** until the next on-machine field pass, and current screenshots of both layouts are owed from that pass.
+- The Builder studio (Design H, IDE layout) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. The studio has run on a real Windows desktop (the v4.7.0 build, 2026-11-13, and the v4.7.1 build the same day): the 4.7.1 TesselGUI 1.4.0 re-theme's owner-drawn buttons and checkboxes and the PACKAGE-cluster layout fix field-verified there, but its list headers still rendered white — the owner-draw messages never reach the window (see the 4.7.2 changelog for the diagnosis) — and some text was clipped. The 4.7.2 pass (subclass-painted headers, the Program Folder consolidation, cancellable operations, Open output folder, Preview installer, the plain-English label/tooltip pass, and the cutoff fixes) is **Unverified** until the next on-machine field pass, and current screenshots of both layouts are owed from that pass.
 - Payloads are compressed per file (Windows Compression API on Windows; a built-in LZ codec elsewhere) and stored uncompressed when compression would not shrink them. Packages written by older SeanPak/CrucibleKit/RustPak versions remain readable and installable.
 - Windows GUI behavior is compile-verified in CI on all three targets; interactive on-machine testing is still recommended before shipping an installer to users. `docs/PARITY.md` tracks exactly what is shipped and what remains.
 
