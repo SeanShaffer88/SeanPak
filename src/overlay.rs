@@ -1490,9 +1490,9 @@ impl OverlayReader {
 
     /// Extracts every file recorded in the overlay into `dest_dir`, creating
     /// subdirectories as needed and returning the paths written, in record
-    /// order. Record paths are validated before anything is written for that
-    /// record: absolute paths and `..` traversal are rejected, so a crafted
-    /// overlay cannot write outside `dest_dir`.
+    /// order. Record paths and existing destination links are validated before
+    /// anything is written for that record, so a crafted overlay cannot use a
+    /// symlink or Windows reparse point inside `dest_dir` to escape it.
     pub fn extract<R: Read + Seek>(reader: R, dest_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         Self::extract_with_control(reader, dest_dir, &mut ExtractControl::default())
     }
@@ -1554,9 +1554,13 @@ impl OverlayReader {
                 on_file(seq, total, &rel);
             }
             let target = safe_join(dest_dir, &rel)?;
+            reject_reparse_points(dest_dir, &target)?;
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            // Check again after creating parents so a pre-existing link at
+            // any destination component can never redirect this write.
+            reject_reparse_points(dest_dir, &target)?;
             let bytes = Self::read_payload(&mut reader, &records, idx, stream_len)?;
             std::fs::write(&target, &bytes)?;
             written.push(target);
@@ -1613,6 +1617,45 @@ fn safe_join(dest_dir: &Path, rel: &str) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(out)
+}
+
+/// Rejects existing links/reparse points between the extraction root and target.
+/// The root itself may be a user-selected link; paths below it may not redirect writes.
+fn reject_reparse_points(dest_dir: &Path, target: &Path) -> std::io::Result<()> {
+    let relative = target.strip_prefix(dest_dir).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "overlay target is outside the extraction directory",
+        )
+    })?;
+    let mut current = dest_dir.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if is_reparse_point(&metadata) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("overlay destination contains a symlink or reparse point: {current:?}"),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn copy_str_to_fixed(dest: &mut [u8], src: &str) {
@@ -2340,6 +2383,58 @@ mod tests {
             )
             .unwrap();
         assert!(sel.contains(&"extras".to_string()));
+    }
+
+    #[cfg(unix)]
+    fn create_test_directory_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_test_directory_link(target: &Path, link: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_str().expect("test path is valid UTF-8"),
+                target.to_str().expect("test path is valid UTF-8"),
+            ])
+            .status()
+            .expect("create test directory junction");
+        assert!(status.success(), "mklink /J failed: {status}");
+    }
+
+    #[test]
+    fn extract_rejects_existing_destination_link() {
+        let root = unique_temp("extract_link");
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("linked")).unwrap();
+        std::fs::write(source.join("linked/payload.txt"), b"payload").unwrap();
+        let stub = root.join("stub.exe");
+        std::fs::write(&stub, vec![0xAAu8; 5000]).unwrap();
+        let package = root.join("Setup.exe");
+        OverlayWriter::build_from_folder(
+            &stub,
+            &package,
+            &source,
+            "Link Test",
+            "1.0.0",
+            "Tests",
+        )
+        .unwrap();
+
+        let dest = root.join("dest");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        create_test_directory_link(&outside, &dest.join("linked"));
+
+        let error = OverlayReader::extract_file(&package, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!outside.join("payload.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
