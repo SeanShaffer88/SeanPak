@@ -777,6 +777,24 @@ mod tests {
     }
 
     #[test]
+    fn blank_document_carries_the_v510_creation_defaults() {
+        // A new Builder project creates installers with the desktop
+        // icon on and launch-after-setup offered + ticked, and no
+        // recorded location (the pack default is the per-user token
+        // path, never Program Files).
+        let doc = StudioDocument::new_blank();
+        assert!(doc.manifest.desktop_shortcut);
+        assert!(doc.manifest.launch_after_install_offered);
+        assert!(doc.manifest.launch_after_install_default);
+        assert_eq!(doc.manifest.install_location, None);
+        let options = doc.manifest.to_install_options();
+        assert_eq!(
+            options.install_location(),
+            "%LOCALAPPDATA%\\Programs\\New App"
+        );
+    }
+
+    #[test]
     fn scan_and_rows_report_missing_entries() {
         let root = unique_temp("scan");
         std::fs::write(root.join("a.txt"), b"aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
@@ -2715,7 +2733,17 @@ mod imp {
             let m = &s.doc.manifest;
             match &m.install_location {
                 Some(loc) if !loc.trim().is_empty() => {
-                    format!("Install location default: {loc}")
+                    if loc.contains('%') {
+                        // A per-user token path (v5.1.0): show the
+                        // recorded value AND where it lands on this
+                        // PC — it resolves per user at install time.
+                        format!(
+                            "Install location default: {loc} — on this PC: {}",
+                            crate::install::resolve_install_location(loc, &m.app_name).display()
+                        )
+                    } else {
+                        format!("Install location default: {loc}")
+                    }
                 }
                 _ => format!(
                     "Installs go to each user's own folder — no admin rights needed (AppData\\Local\\Programs\\{})",

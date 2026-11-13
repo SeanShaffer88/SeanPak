@@ -170,10 +170,15 @@ const OPTIONS_EXT_DISK_SIZE: usize = std::mem::size_of::<OptionsDiskExt>();
 
 impl InstallOptions {
     /// Defaults matching what earlier SeanPak/CrucibleKit installers did:
-    /// per-app folder under Program Files, Start Menu entry on, desktop
+    /// Start Menu entry on, desktop
     /// shortcut on, no file associations, no PATH entry — plus the v5
     /// extension defaults: launch-after-install offered (checked), the
-    /// start-at-login option not offered, no data directories.
+    /// start-at-login option not offered, no data directories. The
+    /// recorded location is the v5.1.0 per-user default: the token
+    /// path `%LOCALAPPDATA%\Programs\<AppFolder>`
+    /// ([`crate::install::default_install_location`]), resolved on the
+    /// installing account at install time — never Program Files,
+    /// which a per-user installer cannot write.
     pub fn defaults_for(app_name: &str) -> Self {
         let mut options = Self {
             install_location_utf8: [0u8; 260],
@@ -191,7 +196,7 @@ impl InstallOptions {
         };
         copy_str_to_fixed(
             &mut options.install_location_utf8,
-            &format!("C:\\Program Files\\{app_name}"),
+            &crate::install::default_install_location(app_name),
         );
         copy_str_to_fixed(&mut options.start_menu_folder_utf8, app_name);
         options
@@ -1753,7 +1758,12 @@ mod tests {
             .expect("legacy overlay must be discoverable");
         assert_eq!(read_back.app_name(), "Legacy App");
         assert_eq!(records.len(), 1);
-        assert_eq!(options.install_location(), "C:\\Program Files\\Legacy App");
+        // No recorded location: the synthesized default is the
+        // v5.1.0 per-user token path (resolved at install time).
+        assert_eq!(
+            options.install_location(),
+            "%LOCALAPPDATA%\\Programs\\Legacy App"
+        );
         assert_eq!(options.start_menu_folder(), "Legacy App");
         assert!(options.wants_desktop_shortcut());
         assert!(options.wants_start_menu_shortcut());

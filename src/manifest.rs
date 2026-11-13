@@ -49,7 +49,7 @@ pub const MANIFEST_SCHEMA_JSON: &str = r##"{
     },
     "installLocation": {
       "type": "string",
-      "description": "Absolute Windows install path proposed by the installer (for example \"C:\\Program Files\\MyApp\"). Defaults to C:\\Program Files\\<appName>."
+      "description": "Install path proposed by the installer: an absolute Windows path (for example \"C:\\Program Files\\MyApp\"), or a per-user token path starting with %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% (for example \"%LOCALAPPDATA%\\Programs\\MyApp\"), resolved on the installing account at install time. Defaults to %LOCALAPPDATA%\\Programs\\<appName> — the per-user Programs folder."
     },
     "startMenuFolder": {
       "type": "string",
@@ -701,13 +701,8 @@ impl AppManifest {
             }
         }
         if let Some(location) = get_str("installLocation") {
-            let drive = location.chars().nth(1) == Some(':');
-            let unc = location.starts_with("\\\\");
-            if !drive && !unc {
-                errors.push(
-                    "\"installLocation\" must be an absolute Windows path (for example \"C:\\\\Program Files\\\\MyApp\")"
-                        .to_string(),
-                );
+            if let Err(problem) = validate_install_location(&location) {
+                errors.push(problem);
             }
         }
         if let Some(folder) = get_str("startMenuFolder") {
@@ -1604,6 +1599,63 @@ fn parse_shortcuts(root: &JsonValue, errors: &mut Vec<String>) -> Vec<RichShortc
     shortcuts
 }
 
+/// Validates an `installLocation` value (the manifest field and the
+/// answer file's field share this rule — `answers.rs` calls it too).
+/// Two forms are accepted: an absolute Windows path (drive or UNC —
+/// the package's explicit choice, honored exactly as written), or a
+/// per-user token path in the `dataDirs` token grammar: one of
+/// `%APPDATA%` / `%LOCALAPPDATA%` / `%USERPROFILE%` followed by at
+/// least one folder below it, resolved on the installing account at
+/// install time (see [`crate::install::resolve_install_location`]).
+/// `%INSTALLDIR%` is refused: it names the install folder itself, so
+/// it cannot say where the install folder goes. `..` and `;` are
+/// rejected, as in `dataDirs`.
+pub fn validate_install_location(location: &str) -> Result<(), String> {
+    let e = location.trim();
+    if e.is_empty() {
+        return Err("\"installLocation\" must not be empty".to_string());
+    }
+    if e.contains(';') {
+        return Err(format!(
+            "\"installLocation\" \"{location}\" must not contain ';'"
+        ));
+    }
+    if e.split(['\\', '/']).any(|part| part == "..") {
+        return Err(format!(
+            "\"installLocation\" \"{location}\" must not contain '..'"
+        ));
+    }
+    let upper = e.to_uppercase();
+    if upper.starts_with("%INSTALLDIR%") {
+        return Err(
+            "\"installLocation\" cannot start with %INSTALLDIR% (that token means the install folder itself). \
+             Use a per-user root instead, for example \"%LOCALAPPDATA%\\\\Programs\\\\MyApp\""
+                .to_string(),
+        );
+    }
+    const TOKENS: [&str; 3] = ["%APPDATA%", "%LOCALAPPDATA%", "%USERPROFILE%"];
+    for token in TOKENS {
+        if upper.starts_with(token) {
+            let rest = e[token.len()..].trim_start_matches(['\\', '/']);
+            if rest.is_empty() {
+                return Err(format!(
+                    "\"installLocation\" must name a folder below {token}, not {token} itself"
+                ));
+            }
+            return Ok(());
+        }
+    }
+    let drive = e.chars().nth(1) == Some(':');
+    let unc = e.starts_with("\\\\");
+    if drive || unc {
+        return Ok(());
+    }
+    Err(format!(
+        "\"installLocation\" \"{location}\" must be an absolute Windows path (for example \"C:\\\\Program Files\\\\MyApp\") \
+         or a per-user token path (for example \"%LOCALAPPDATA%\\\\Programs\\\\MyApp\")"
+    ))
+}
+
 /// Validates one `dataDirs` entry. Entries are token paths: one of the
 /// `%APPDATA%` / `%LOCALAPPDATA%` / `%USERPROFILE%` / `%INSTALLDIR%`
 /// roots followed by at least one folder below it, an absolute Windows
@@ -1787,6 +1839,108 @@ mod tests {
             errors.iter().any(|e| e.contains("startAtLogin")),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn install_location_accepts_token_and_absolute_forms() {
+        // v5.1.0: per-user token paths (the dataDirs grammar) and
+        // explicit absolutes are both accepted, and the recorded
+        // value is carried verbatim — resolution happens at install
+        // time, not at parse time.
+        for good in [
+            "%LOCALAPPDATA%\\Programs\\My App",
+            "%APPDATA%\\My App",
+            "%USERPROFILE%\\Apps\\My App",
+            "%localappdata%/Programs/My App",
+            "C:\\Program Files\\My App",
+            "D:\\Tools\\My App",
+            "\\\\server\\share\\My App",
+        ] {
+            let m = AppManifest::from_json(&format!(
+                r#"{{"appName":"X","version":"1.0","installLocation":"{}"}}"#,
+                good.replace('\\', "\\\\").replace('"', "\\\"")
+            ))
+            .unwrap_or_else(|e| panic!("{good} should parse: {e:?}"));
+            assert_eq!(m.install_location.as_deref(), Some(good));
+            // The rendered manifest re-parses identically.
+            let rendered = m.to_json_value().render();
+            assert_eq!(AppManifest::from_json(&rendered).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn install_location_rejects_circular_relative_and_escape_forms() {
+        for bad in [
+            "%INSTALLDIR%\\My App",
+            "%LOCALAPPDATA%",
+            "%LOCALAPPDATA%\\",
+            "Apps\\My App",
+            "My App",
+            "%LOCALAPPDATA%\\..\\evil",
+            "%LOCALAPPDATA%\\A;B",
+            "",
+        ] {
+            let errors = AppManifest::from_json(&format!(
+                r#"{{"appName":"X","version":"1.0","installLocation":"{}"}}"#,
+                bad.replace('\\', "\\\\")
+            ))
+            .unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.contains("installLocation")),
+                "{bad} -> {errors:?}"
+            );
+        }
+        // The circular form names its own problem.
+        let errors = AppManifest::from_json(
+            r#"{"appName":"X","version":"1.0","installLocation":"%INSTALLDIR%\\X"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("%INSTALLDIR%")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn creation_defaults_desktop_and_launch_on_unless_explicitly_off() {
+        // Absent fields (v5.1.0 creation defaults): desktop icon on,
+        // launch-after-setup offered and ticked — in the manifest
+        // model AND in the recorded install options.
+        let m = AppManifest::from_json(r#"{"appName":"New App","version":"1.0.0"}"#).unwrap();
+        assert!(m.desktop_shortcut);
+        assert!(m.launch_after_install_offered);
+        assert!(m.launch_after_install_default);
+        let options = m.to_install_options();
+        assert!(options.wants_desktop_shortcut());
+        assert!(options.offers_launch_after_install());
+        assert!(options.launch_after_install_default_checked());
+        // No recorded location: the options carry the per-user token
+        // default, never a Program Files path.
+        assert_eq!(
+            options.install_location(),
+            "%LOCALAPPDATA%\\Programs\\New App"
+        );
+
+        // Explicit false is never overridden by the defaults.
+        let m = AppManifest::from_json(
+            r#"{"appName":"X","version":"1.0","desktopShortcut":false,"launchAfterInstall":false}"#,
+        )
+        .unwrap();
+        assert!(!m.desktop_shortcut);
+        assert!(!m.launch_after_install_offered);
+        assert!(!m.launch_after_install_default);
+        let options = m.to_install_options();
+        assert!(!options.wants_desktop_shortcut());
+        assert!(!options.offers_launch_after_install());
+        assert!(!options.launch_after_install_default_checked());
+
+        // The object form keeps its independent halves.
+        let m = AppManifest::from_json(
+            r#"{"appName":"X","version":"1.0","launchAfterInstall":{"offered":true,"defaultChecked":false}}"#,
+        )
+        .unwrap();
+        assert!(m.launch_after_install_offered);
+        assert!(!m.launch_after_install_default);
     }
 
     #[test]

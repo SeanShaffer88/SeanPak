@@ -361,6 +361,62 @@ pub fn per_user_fallback_dir(app_name: &str, recorded_location: &str) -> PathBuf
     per_user_fallback_from(&local_app_data_dir(), app_name, recorded_location)
 }
 
+/// The install location a package records when its manifest names
+/// none (v5.1.0): the per-user Programs folder as a TOKEN path —
+/// `%LOCALAPPDATA%\Programs\<AppFolder>` — so the package itself
+/// carries the per-user intent and resolution happens on the
+/// installing account at install time. Program Files is never a
+/// SeanPak default: it needs administrator access this per-user
+/// installer does not have (the ai.md 0.7.0 wound). The folder leaf
+/// is the same one the writability fallback derives.
+pub fn default_install_location(app_name: &str) -> String {
+    format!(
+        "%LOCALAPPDATA%\\Programs\\{}",
+        install_folder_name(app_name, "")
+    )
+}
+
+/// Resolves a recorded install location to the folder an install
+/// actually targets, against explicit data-dir roots (the live form
+/// is [`resolve_install_location`]). Token paths use the `dataDirs`
+/// resolver ([`crate::uninstall::resolve_data_dir_with_roots`]) with
+/// the per-user default standing in for `%INSTALLDIR%` (a location
+/// may not name itself — the manifest validator refuses that token,
+/// and anything unresolvable lands on the default rather than on a
+/// relative path). Absolute paths stand exactly as written; an empty
+/// recorded location means the default.
+pub fn resolve_install_location_with_roots(
+    recorded: &str,
+    app_name: &str,
+    roots: &crate::uninstall::DataDirRoots,
+) -> PathBuf {
+    let default_token = default_install_location(app_name);
+    let default_dir = per_user_fallback_from(&roots.local_app_data, app_name, &default_token);
+    let raw = recorded.trim();
+    let effective = if raw.is_empty() {
+        default_token.as_str()
+    } else {
+        raw
+    };
+    // `%INSTALLDIR%` names the install folder itself, so as a
+    // location it can only mean "the default" (validation refuses it
+    // long before this — this is the second line of defense).
+    if effective.to_uppercase().starts_with("%INSTALLDIR%") {
+        return default_dir;
+    }
+    crate::uninstall::resolve_data_dir_with_roots(effective, roots, &default_dir)
+        .unwrap_or(default_dir)
+}
+
+/// [`resolve_install_location_with_roots`] against this machine's
+/// roots: token locations resolve per-user on the installing
+/// account. The one derivation every surface (wizard default,
+/// headless `--to` / answer-file locations, Modify, uninstall)
+/// shares.
+pub fn resolve_install_location(recorded: &str, app_name: &str) -> PathBuf {
+    resolve_install_location_with_roots(recorded, app_name, &crate::uninstall::data_dir_roots())
+}
+
 /// The nearest ancestor of `path` that exists (possibly `path` itself).
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     let mut cur = path;
@@ -1304,6 +1360,54 @@ mod tests {
             per_user_fallback_from(root, "My App", ""),
             root.join("Programs").join("My App")
         );
+    }
+
+    #[test]
+    fn token_locations_resolve_per_user() {
+        // The v5.1.0 default a package records when its manifest
+        // names no location: the per-user Programs token path.
+        assert_eq!(
+            default_install_location("ai.md"),
+            "%LOCALAPPDATA%\\Programs\\ai.md"
+        );
+        let roots = crate::uninstall::DataDirRoots {
+            app_data: PathBuf::from("C:\\Users\\x\\AppData\\Roaming"),
+            local_app_data: PathBuf::from("C:\\Users\\x\\AppData\\Local"),
+            user_profile: PathBuf::from("C:\\Users\\x"),
+        };
+        let local = PathBuf::from("C:\\Users\\x\\AppData\\Local");
+        let resolve =
+            |recorded: &str| resolve_install_location_with_roots(recorded, "My App", &roots);
+        // Every per-user token resolves against its own root, in any case.
+        assert_eq!(
+            resolve("%LOCALAPPDATA%\\Programs\\My App"),
+            local.join("Programs").join("My App")
+        );
+        assert_eq!(
+            resolve("%appdata%\\My App"),
+            PathBuf::from("C:\\Users\\x\\AppData\\Roaming").join("My App")
+        );
+        assert_eq!(
+            resolve("%USERPROFILE%\\Apps\\My App"),
+            PathBuf::from("C:\\Users\\x").join("Apps").join("My App")
+        );
+        // An explicit absolute location stands exactly as written —
+        // the package's choice (the 4.8.0 elevation offer covers it).
+        assert_eq!(
+            resolve("C:\\Program Files\\My App"),
+            PathBuf::from("C:/Program Files/My App")
+        );
+        // No recorded location resolves to the default: the per-user
+        // Programs folder built from the token default.
+        assert_eq!(resolve(""), local.join("Programs").join("My App"));
+        assert_eq!(resolve("  "), resolve(&default_install_location("My App")));
+        // Unresolvable forms land on the default, never on a relative
+        // path: %INSTALLDIR% (a location cannot name itself), a `..`
+        // escape, a bare token root.
+        let default = local.join("Programs").join("My App");
+        assert_eq!(resolve("%INSTALLDIR%\\My App"), default);
+        assert_eq!(resolve("%LOCALAPPDATA%\\..\\evil"), default);
+        assert_eq!(resolve("%LOCALAPPDATA%"), default);
     }
 
     #[test]

@@ -221,6 +221,11 @@ fn starter_manifest(app_name: &str, primary_exe: Option<&str>) -> JsonValue {
     }
     fields.push(("desktopShortcut", JsonValue::Bool(true)));
     fields.push(("startMenuShortcut", JsonValue::Bool(true)));
+    // The v5.1.0 creation defaults, written out loud so a project
+    // sees (and can change) them: a desktop icon, and the installer's
+    // Finish page offering "Launch <app>" already ticked. (`true` is
+    // the offer shorthand for offered + starts checked.)
+    fields.push(("launchAfterInstall", JsonValue::Bool(true)));
     fields.push((
         "components",
         JsonValue::Array(vec![jobj(vec![
@@ -288,6 +293,11 @@ mod tests {
         let manifest = AppManifest::from_json(&text).unwrap();
         assert_eq!(manifest.version, "1.0.0");
         assert_eq!(manifest.primary_exe.as_deref(), Some("widget.exe"));
+        // The v5.1.0 creation defaults ride the template: desktop
+        // icon on, launch-after-setup offered and ticked.
+        assert!(manifest.desktop_shortcut);
+        assert!(manifest.launch_after_install_offered);
+        assert!(manifest.launch_after_install_default);
         // The inert example component survives validation, claims no
         // files, and is off by default.
         assert_eq!(manifest.components.len(), 1);

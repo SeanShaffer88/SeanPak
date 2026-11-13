@@ -21,6 +21,7 @@ pub mod studio;
 pub mod sysinstall;
 pub mod theme;
 pub mod uninstall;
+pub mod update;
 pub mod wizard;
 pub mod writes;
 

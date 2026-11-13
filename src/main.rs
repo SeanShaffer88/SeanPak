@@ -358,9 +358,12 @@ fn run_install(args: &[String]) -> i32 {
         None => None,
     };
     let dest = match flag_value(args, &["--to"]) {
-        Some(dir) => PathBuf::from(dir),
+        // A token location resolves per-user, exactly like the
+        // wizard's default; an absolute path stands as written
+        // (v5.1.0 — one shared resolver).
+        Some(dir) => install::resolve_install_location(&dir, &manifest.app_name()),
         None => match answers.as_ref().and_then(|a| a.install_location.clone()) {
-            Some(location) => PathBuf::from(location),
+            Some(location) => install::resolve_install_location(&location, &manifest.app_name()),
             None => {
                 let app = own_overlay_app_name().unwrap_or_else(|| "App".to_string());
                 exe.parent()
@@ -755,6 +758,16 @@ fn run_install(args: &[String]) -> i32 {
                     ("app", jstr(plan.app_name.clone())),
                     ("version", jstr(plan.app_version.clone())),
                     ("installMode", jstr(outcome.mode.clone())),
+                    (
+                        // v5.1.0: whether this run updated an existing
+                        // install or installed fresh.
+                        "action",
+                        jstr(if outcome.previous_version.is_some() {
+                            "update"
+                        } else {
+                            "install"
+                        }),
+                    ),
                     (
                         "previousVersion",
                         outcome
@@ -1921,6 +1934,27 @@ fn run_wizard(
             return 1;
         }
     };
+    // Silent auto-update (v5.1.0): a plain installer start (not an
+    // elevated relaunch, which carries the user's choices) whose
+    // target already holds this app at an older or equal version
+    // skips the page flow and updates in place behind a minimal
+    // window. First runs, other apps' receipts, and newer installs
+    // (the downgrade refusal stands) get the normal wizard.
+    if preset_answers.is_none() && relaunch_location.is_none() {
+        let dest = seanpak::wizard::default_install_dir(&options, &manifest.app_name());
+        if let seanpak::update::UpdateDecision::SilentUpdate { .. } =
+            seanpak::update::decide_for_install(&dest, &manifest)
+        {
+            let primary_rel = records
+                .get(manifest.primary_exe_index as usize)
+                .map(|r| r.relative_path());
+            match seanpak::update::run_silent_update(&manifest, &exe, &dest, primary_rel.as_deref())
+            {
+                seanpak::update::SilentUpdateRun::Completed(code) => return code,
+                seanpak::update::SilentUpdateRun::OpenFullInstaller => {}
+            }
+        }
+    }
     let mut wizard = InstallWizard::new(manifest, records, options, exe, power);
     // An elevated relaunch carries the user's already-made choices
     // (v4.8.0): the preset they applied and the location they were

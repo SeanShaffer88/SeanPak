@@ -193,14 +193,13 @@ pub fn review_rows(
 }
 
 /// The install directory proposed by a package: its recorded install
-/// location, or `C:\Program Files\<AppName>` when none was recorded.
+/// location RESOLVED (v5.1.0 — a token location like
+/// `%LOCALAPPDATA%\Programs\<App>` becomes the real per-user folder
+/// on this account; an absolute location stands as written), or the
+/// per-user Programs default when none was recorded. What the wizard
+/// shows is always this resolved absolute path.
 pub fn default_install_dir(options: &InstallOptions, app_name: &str) -> PathBuf {
-    let recorded = options.install_location();
-    if recorded.trim().is_empty() {
-        PathBuf::from(format!("C:\\Program Files\\{app_name}"))
-    } else {
-        PathBuf::from(recorded)
-    }
+    crate::install::resolve_install_location(&options.install_location(), app_name)
 }
 
 /// Filesystem/registry-safe fragment of an app name (mirrors the folder
@@ -731,7 +730,10 @@ mod imp {
                 Ok(parsed) => {
                     parsed.apply_to_options(&mut options);
                     if let Some(location) = &parsed.install_location {
-                        install_dir = PathBuf::from(location);
+                        install_dir = crate::install::resolve_install_location(
+                            location,
+                            &manifest.app_name(),
+                        );
                     }
                     carried_preset_path = Some(path.clone());
                     preset_applied = Some(parsed);
@@ -2750,7 +2752,8 @@ mod imp {
             if let Some(s) = g.as_mut() {
                 answers.apply_to_options(&mut s.options);
                 if let Some(location) = &answers.install_location {
-                    s.install_dir = PathBuf::from(location);
+                    s.install_dir =
+                        crate::install::resolve_install_location(location, &s.manifest.app_name());
                 }
                 if answers.components.is_some() || !answers.without_components.is_empty() {
                     let primary_rel = s
@@ -3581,9 +3584,17 @@ mod tests {
     #[test]
     fn install_dir_and_key_defaults() {
         let options = InstallOptions::defaults_for("My App");
+        // v5.1.0: a package that names no location records the
+        // per-user token default, and the wizard's proposed folder is
+        // that token RESOLVED — the per-user Programs folder, never
+        // Program Files.
+        assert_eq!(
+            options.install_location(),
+            "%LOCALAPPDATA%\\Programs\\My App"
+        );
         assert_eq!(
             default_install_dir(&options, "My App"),
-            PathBuf::from("C:\\Program Files\\My App")
+            crate::install::per_user_fallback_dir("My App", &options.install_location())
         );
         assert_eq!(
             uninstall_key_path("My App"),

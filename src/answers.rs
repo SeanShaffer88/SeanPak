@@ -132,16 +132,11 @@ pub fn parse_answers(text: &str) -> Result<Answers, Vec<String>> {
     let mut answers = Answers::default();
 
     if let Some(location) = get_str("installLocation", &mut errors) {
-        // The same absoluteness rule the manifest enforces.
-        let drive = location.chars().nth(1) == Some(':');
-        let unc = location.starts_with("\\\\");
-        if !drive && !unc {
-            errors.push(
-                "\"installLocation\" must be an absolute Windows path (for example \"C:\\\\Program Files\\\\MyApp\")"
-                    .to_string(),
-            );
-        } else {
-            answers.install_location = Some(location);
+        // The manifest's rule, shared verbatim: an absolute path, or
+        // a per-user token path the install resolves at run time.
+        match crate::manifest::validate_install_location(&location) {
+            Ok(()) => answers.install_location = Some(location),
+            Err(problem) => errors.push(problem),
         }
     }
     answers.desktop_shortcut = get_bool("desktopShortcut", &mut errors);
