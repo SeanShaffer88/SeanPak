@@ -24,6 +24,38 @@ as inert examples) plus a `PACKAGING.md` stub with the pack command,
 and validates the generated manifest before reporting success. An
 existing manifest is never overwritten without `--force`.
 
+## Install location and creation defaults (5.1.0)
+
+`installLocation` accepts two forms:
+
+- **A per-user token path** — the same token grammar `dataDirs`
+  uses. `%LOCALAPPDATA%\Programs\MyApp`, `%APPDATA%\MyApp`, and
+  `%USERPROFILE%\Apps\MyApp` resolve on the installing account at
+  install time, so one package lands in each user's own folders.
+  `%INSTALLDIR%` is refused (a location cannot be defined in terms
+  of itself), as are relative paths and a bare token with no folder
+  below it.
+- **An absolute Windows path** (`D:\Apps\MyApp`) — honored exactly
+  as written, as before.
+
+Omit `installLocation` and the package records the per-user default
+`%LOCALAPPDATA%\Programs\<AppFolder>`: Program Files is never a
+SeanPak default. The wizard, answer files, and `--to` all resolve
+tokens through the same code; the wizard displays the resolved
+folder.
+
+Two creation defaults apply only when a manifest omits the field —
+explicit values (including `false`) are never overridden:
+`desktopShortcut` defaults to **on**, and `launchAfterInstall`
+defaults to **offered and ticked**. The `init` template writes both
+explicitly; a new Builder project starts with both on.
+
+Re-running a built Setup for an app already installed at the target
+location (same app in the receipt, older or equal version) silently
+updates it in place instead of opening the wizard — see the README's
+"Silent auto-update" section. Headless installs are unchanged apart
+from the success report's `"action": "install" | "update"` field.
+
 ## Power features (4.6.0 engine, 4.7.0 surface, overlay v6)
 
 Five optional manifest blocks for installers that need more than the
