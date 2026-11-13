@@ -134,7 +134,11 @@ jobs:
           cp artifacts/seanpak-x86_64-windows/dist/seanpak-x86_64-windows.exe selfpack/files/seanpak.exe
           cp README.md LICENSE selfpack/files/
           sed -i "s/\"version\": *\"[^\"]*\"/\"version\": \"$ver\"/" packaging/seanpak-manifest.json
-          SP=selfpack/files/seanpak.exe
+          # Run the tool from OUTSIDE the payload dir: seanpak writes its
+          # seanpak.log beside its own exe, and a tool copy inside the
+          # files dir would pack that log into the release (v4.5.0 did).
+          cp selfpack/files/seanpak.exe ./seanpak-tool.exe
+          SP=./seanpak-tool.exe
           "$SP" pack packaging/seanpak-manifest.json selfpack/files --out-dir release-assets --json
           "$SP" verify "release-assets/SeanPak-v$ver-x64-Setup.exe" --sandbox --json
           ls -la release-assets
