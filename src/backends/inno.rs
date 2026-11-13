@@ -1,0 +1,337 @@
+use super::{BuildConfig, InstallerBackend, PrivilegeLevel, TargetInstallDir, ToolStatus};
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+pub struct InnoSetupBackend;
+
+impl InnoSetupBackend {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Locate the Inno Setup compiler executable `ISCC.exe`
+    pub fn find_iscc() -> Option<PathBuf> {
+        // 1. Check if ISCC is in PATH
+        if let Ok(output) = Command::new("where").arg("ISCC.exe").output() {
+            if output.status.success() {
+                if let Ok(paths) = String::from_utf8(output.stdout) {
+                    if let Some(first) = paths.lines().next() {
+                        let path = PathBuf::from(first.trim());
+                        if path.is_file() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Check standard Windows installation directories
+        let standard_paths = [
+            r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            r"C:\Program Files\Inno Setup 6\ISCC.exe",
+            r"C:\Program Files (x86)\Inno Setup 5\ISCC.exe",
+            r"C:\Program Files\Inno Setup 5\ISCC.exe",
+            r"C:\Tools\InnoSetup\ISCC.exe",
+        ];
+
+        for path in standard_paths {
+            let p = PathBuf::from(path);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+
+        None
+    }
+}
+
+impl Default for InnoSetupBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InstallerBackend for InnoSetupBackend {
+    fn name(&self) -> &'static str {
+        "Inno Setup 6"
+    }
+
+    fn description(&self) -> &'static str {
+        "Industry-standard Windows installer engine with advanced compression (LZMA2/Ultra64) and native OS integration."
+    }
+
+    fn script_extension(&self) -> &'static str {
+        "iss"
+    }
+
+    fn check_tool_installed(&self) -> ToolStatus {
+        match Self::find_iscc() {
+            Some(path) => ToolStatus::Ready(path),
+            None => ToolStatus::NotFound {
+                hint: "ISCC.exe not found. Install Inno Setup 6 from https://jrsoftware.org/isdl.php or add to PATH.".to_string(),
+            },
+        }
+    }
+
+    fn generate_script(&self, config: &BuildConfig) -> std::io::Result<String> {
+        let app_dir_macro = match &config.target_dir {
+            TargetInstallDir::ProgramFiles64 => "{autopf64}",
+            TargetInstallDir::LocalAppData => "{localappdata}",
+            TargetInstallDir::Custom(custom) => custom.as_str(),
+        };
+
+        let privileges_required = match config.privileges {
+            PrivilegeLevel::RequireAdministrator => "admin",
+            PrivilegeLevel::AsInvoker => "lowest",
+        };
+
+        let source_files_path = config
+            .source_dir
+            .canonicalize()
+            .unwrap_or_else(|_| config.source_dir.clone())
+            .to_string_lossy()
+            .replace('/', "\\");
+
+        let icon_line = if let Some(ref icon) = config.custom_icon_path {
+            format!(
+                "SetupIconFile={}\n",
+                icon.to_string_lossy().replace('/', "\\")
+            )
+        } else {
+            String::new()
+        };
+
+        let startup_reg = if config.startup_registry {
+            format!(
+                "Root: HKA; Subkey: \"Software\\Microsoft\\Windows\\CurrentVersion\\Run\"; ValueType: string; ValueName: \"{}\"; ValueData: \"\"\"{{app}}\\{}\"\"\"; Flags: uninsdeletevalue\n",
+                config.app_name, config.primary_exe
+            )
+        } else {
+            String::new()
+        };
+
+        let file_assoc_reg = if let Some(ref ext) = config.file_association_ext {
+            let clean_ext = ext.trim_start_matches('.');
+            let desc = config
+                .file_association_desc
+                .clone()
+                .unwrap_or_else(|| format!("{} Document", config.app_name));
+            format!(
+                r#"
+; File association for .{ext}
+Root: HKA; Subkey: "Software\Classes\.{ext}\OpenWithProgids"; ValueType: string; ValueName: "{app_name}.{ext}"; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\{app_name}.{ext}"; ValueType: string; ValueName: ""; ValueData: "{desc}"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\{app_name}.{ext}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{{app}}\{primary_exe},0"
+Root: HKA; Subkey: "Software\Classes\{app_name}.{ext}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{{app}}\{primary_exe}"" ""%1"""
+"#,
+                ext = clean_ext,
+                app_name = config.app_name.replace(' ', ""),
+                desc = desc,
+                primary_exe = config.primary_exe
+            )
+        } else {
+            String::new()
+        };
+
+        let script = format!(
+            r#"; Script generated by SeanPak (High-Throughput Windows Packager)
+; Inno Setup 6 Modern Windows 11 Installer Script
+
+#define MyAppName "{app_name}"
+#define MyAppVersion "{version}"
+#define MyAppPublisher "{publisher}"
+#define MyAppURL "{website}"
+#define MyAppExeName "{primary_exe}"
+
+[Setup]
+; Basic Application Identification
+AppId={{{{{app_name}_SeanPak_AppId}}}}
+AppName={{#MyAppName}}
+AppVersion={{#MyAppVersion}}
+AppPublisher={{#MyAppPublisher}}
+AppPublisherURL={{#MyAppURL}}
+AppSupportURL={{#MyAppURL}}
+AppUpdatesURL={{#MyAppURL}}
+
+; Installation Directories & Privileges
+DefaultDirName={app_dir_macro}\{{#MyAppName}}
+DefaultGroupName={{#MyAppName}}
+DisableProgramGroupPage=yes
+PrivilegesRequired={privileges_required}
+PrivilegesRequiredOverridesAllowed=dialog
+
+; Output & Packaging
+OutputDir={output_dir}
+OutputBaseFilename={output_filename}
+Compression=lzma2/ultra64
+SolidCompression=yes
+WizardStyle=modern
+{icon_line}
+; Windows 11 Visual Settings & Architecture
+ArchitecturesInstallIn64BitMode=x64compatible
+UninstallDisplayIcon={{app}}\{{#MyAppExeName}}
+UninstallDisplayName={{#MyAppName}} (Remove)
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+{tasks_section}
+[Files]
+Source: "{source_files}\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+{start_menu_icon}
+{desktop_icon}
+
+[Registry]
+{startup_reg}{file_assoc_reg}
+
+[Run]
+Filename: "{{app}}\{{#MyAppExeName}}"; Description: "{{cm:LaunchProgram,{{#StringChange(MyAppName, '&', '&&')}}}}"; Flags: nowait postinstall skipifsilent
+"#,
+            app_name = config.app_name,
+            version = config.version,
+            publisher = config.publisher,
+            website = config.website,
+            primary_exe = config.primary_exe,
+            app_dir_macro = app_dir_macro,
+            privileges_required = privileges_required,
+            output_dir = config.output_dir.to_string_lossy().replace('/', "\\"),
+            output_filename = config.output_exe_name.trim_end_matches(".exe"),
+            icon_line = icon_line,
+            source_files = source_files_path,
+            tasks_section = if config.desktop_shortcut {
+                "Name: \"desktopicon\"; Description: \"{cm:CreateDesktopIcon}\"; GroupDescription: \"{cm:AdditionalIcons}\"; Flags: unchecked\n".to_string()
+            } else {
+                String::new()
+            },
+            start_menu_icon = if config.start_menu_shortcut {
+                "Name: \"{autoprograms}\\{#MyAppName}\"; Filename: \"{app}\\{#MyAppExeName}\""
+                    .to_string()
+            } else {
+                String::new()
+            },
+            desktop_icon = if config.desktop_shortcut {
+                "Name: \"{autodesktop}\\{#MyAppName}\"; Filename: \"{app}\\{#MyAppExeName}\"; Tasks: desktopicon".to_string()
+            } else {
+                String::new()
+            },
+            startup_reg = startup_reg,
+            file_assoc_reg = file_assoc_reg
+        );
+
+        Ok(script)
+    }
+
+    fn build(
+        &self,
+        config: &BuildConfig,
+        log_fn: &mut dyn FnMut(&str),
+    ) -> std::io::Result<PathBuf> {
+        let iscc_path = Self::find_iscc().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Inno Setup Compiler (ISCC.exe) was not found on this system.",
+            )
+        })?;
+
+        log_fn(&format!(
+            "Generating Inno Setup script for '{}'...",
+            config.app_name
+        ));
+        let iss_script = self.generate_script(config)?;
+
+        fs::create_dir_all(&config.output_dir)?;
+        let script_path = config
+            .output_dir
+            .join(format!("{}.iss", config.app_name.replace(' ', "_")));
+        fs::write(&script_path, &iss_script)?;
+        log_fn(&format!("Wrote script: {}", script_path.display()));
+
+        log_fn(&format!("Invoking compiler: {}", iscc_path.display()));
+        let mut child = Command::new(&iscc_path)
+            .arg(format!("/O{}", config.output_dir.display()))
+            .arg(format!(
+                "/F{}",
+                config.output_exe_name.trim_end_matches(".exe")
+            ))
+            .arg(&script_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        if let Some(stdout) = child.stdout.take() {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                log_fn(&line);
+            }
+        }
+
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "ISCC.exe compiler failed with exit code: {:?}",
+                status.code()
+            )));
+        }
+
+        let output_file = config.output_dir.join(&config.output_exe_name);
+        log_fn(&format!(
+            "Successfully generated Inno Setup installer at: {}",
+            output_file.display()
+        ));
+        Ok(output_file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::BuildConfig;
+
+    fn config() -> BuildConfig {
+        BuildConfig {
+            app_name: "Widget Pro".to_string(),
+            version: "3.1.0".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn script_contains_identity_and_files_section() {
+        let backend = InnoSetupBackend::new();
+        let script = backend.generate_script(&config()).unwrap();
+        assert!(script.contains("#define MyAppName \"Widget Pro\""));
+        assert!(script.contains("#define MyAppVersion \"3.1.0\""));
+        assert!(script.contains("[Files]"));
+        assert!(script.contains("{autopf64}"));
+        assert!(script.contains("PrivilegesRequired=admin"));
+    }
+
+    #[test]
+    fn desktop_task_only_when_shortcut_enabled() {
+        let backend = InnoSetupBackend::new();
+        let with = backend.generate_script(&config()).unwrap();
+        assert!(with.contains("Name: \"desktopicon\""));
+        assert!(with.contains("{cm:CreateDesktopIcon}"));
+
+        let off = BuildConfig {
+            desktop_shortcut: false,
+            ..config()
+        };
+        let without = backend.generate_script(&off).unwrap();
+        assert!(!without.contains("desktopicon"));
+    }
+
+    #[test]
+    fn tool_status_reports_not_found_without_iscc() {
+        // On machines without Inno Setup this must be NotFound; where ISCC is
+        // installed it is Ready. Either way it must not panic.
+        let backend = InnoSetupBackend::new();
+        let _ = backend.check_tool_installed();
+        assert_eq!(backend.script_extension(), "iss");
+    }
+}
