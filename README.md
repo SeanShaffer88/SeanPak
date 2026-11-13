@@ -52,8 +52,12 @@ seanpak/
     ├── backends/          # Installer engines: native overlay, Inno Setup, NSIS (std-only)
     ├── diag.rs            # Structured log (seanpak.log) incl. JSON-lines outcome records
     ├── hash.rs            # Hand-rolled SHA-256 / CRC-32 (no external crates)
+    ├── answers.rs         # Answer files: strict preset parser + template (4.7.0)
+    ├── init.rs            # `seanpak init` project scaffolding (4.7.0)
+    ├── inspect.rs         # `inspect` / `diff` package reports (4.7.0)
     ├── install.rs         # Shared install operation (wizard + CLI): plan, perform, rollback
     ├── manifest.rs        # JSON app manifest: parser, validation, JSON Schema text
+    ├── modify.rs          # Shared modify operation (wizard + CLI + ARP Modify) (4.7.0)
     ├── native_dialog.rs   # Native folder / save-file / icon pickers (SHBrowseForFolder + comdlg32)
     ├── overlay.rs         # Sector-aligned PE overlay writer, reader, and extractor
     ├── pack.rs            # Headless pack pipeline + verify (release set, stored ZIP, sums)
@@ -103,6 +107,12 @@ records to `seanpak.log` next to the executable so outcomes can be read
 back and confirmed.
 
 ```powershell
+# Scaffold a project: starter manifest.json (primary exe detected,
+# power blocks as inert examples) + a PACKAGING.md stub. The generated
+# manifest is validated before init reports success; an existing
+# manifest is kept unless --force.
+.\seanpak.exe init "C:\AppBuild" [--name "MyApp"] [--force] --json
+
 # Author a manifest (the format is self-describing):
 .\seanpak.exe schema                          # prints the manifest JSON Schema
 .\seanpak.exe validate app.json               # checks a manifest, plain-language errors
@@ -118,6 +128,14 @@ back and confirmed.
 # compare every file byte-for-byte, silent-uninstall, residue check.
 .\seanpak.exe verify "dist\MyApp-v1.0.0-x64-Setup.exe" --json
 .\seanpak.exe verify "dist\MyApp-v1.0.0-x64-Setup.exe" --sandbox --json
+
+# Read a package: identity, options, components with packed sizes,
+# hooks, writes, shortcuts, per-file sizes and compression.
+.\seanpak.exe inspect "dist\MyApp-v1.0.0-x64-Setup.exe" --json
+# Compare two packages (files added / removed / changed by content
+# hash, option and component deltas). Exit 0 = identical payloads,
+# 6 = differences found, 3 = a package could not be read.
+.\seanpak.exe diff "dist\MyApp-v1.0.0-x64-Setup.exe" "dist\MyApp-v1.1.0-x64-Setup.exe" --json
 
 # Install headlessly — the same operation the wizard's Install button
 # runs. --dry-run prints the exact plan (JSON with --json) and changes
@@ -140,6 +158,21 @@ back and confirmed.
 # launchRequested / launchPerformed). --start-at-login /
 # --no-start-at-login override the manifest's start-at-login default.
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --launch --json
+# Preset an install with an answer file (location, every option, the
+# component selection). `answers-template` prints one with the
+# package's defaults filled; explicit flags still win over the file,
+# and a malformed file is a usage error (exit 2) naming the field.
+# The wizard also offers an answers.json found beside the Setup.exe
+# on its Review page — Apply / Ignore, never applied silently.
+.\seanpak.exe answers-template "dist\MyApp-v1.0.0-x64-Setup.exe" --json > answers.json
+.\AppSetup.exe --install --answers answers.json --json
+# Change an existing install in place: add/remove components, flip
+# the shortcut / association / PATH / start-at-login choices. The
+# pre-modify state is snapshotted first; any failure rolls back to
+# it. The Add/Remove Programs Modify button runs the same operation,
+# and a bare interactive --modify opens the wizard in Modify mode.
+.\AppSetup.exe --modify --to "D:\Apps\MyApp" --components core,extras --json
+.\AppSetup.exe --modify --to "D:\Apps\MyApp" --dry-run --json
 # Interactive uninstall asks first (a native confirmation window);
 # silent / --json uninstalls never ask and never delete the app's
 # data folders unless --purge-data is passed explicitly.
@@ -160,6 +193,23 @@ uninstall's opt-in checkbox can offer to delete them. The two option
 fields accept a boolean or `{"offered": bool, "defaultChecked": bool}`;
 `seanpak schema` documents every field.
 
+**Power features (4.6.0 engine, 4.7.0 surface — the Power bundle is
+complete).** A manifest can also declare
+`components` (optional parts of the package; files no component claims
+form the required `core` part), `hooks` (pre/post install commands
+with an abort/continue failure policy), `registryWrites` (HKCU values)
+and `envWrites` (user environment variables, restored by uninstall),
+and `shortcuts` (rich shortcuts with arguments, icons, and a
+best-effort taskbar pin). See `docs/PACKAGING.md` for the shapes and
+the install-time rules; the wizard offers component checkboxes on its
+Options page, and `--install` takes `--components <id,id>` /
+`--without <id,id>`. On top of the engine, 4.7.0 adds **Modify mode**
+(`--modify`, the wizard's Modify mode, and the ARP entry's Modify
+button), **answer files** (`--install --answers`, `answers-template`,
+the wizard's Review-page offer), **`inspect` / `diff`** for packages,
+**`seanpak init`** scaffolding, and the Builder studio's **Power
+blocks** JSON editor in the manifest pane.
+
 **Packaging other projects in CI.** SeanPak is the standing packaging
 route for all of SEAN's Windows programs: a project's release workflow
 calls the reusable workflow in `.github/workflows/pack-reusable.yml`,
@@ -170,7 +220,8 @@ the caller-workflow example.
 **Exit codes** (deterministic; also printed by `--help`): `0` success ·
 `1` generic/GUI failure · `2` usage error · `3` bad or missing
 manifest/overlay · `4` I/O failure (including a refused overwrite) ·
-`5` install failed (destination rolled back; an unwritable destination is refused before anything changes, with JSON reason `location_not_writable`).
+`5` install failed (destination rolled back; an unwritable destination is refused before anything changes, with JSON reason `location_not_writable`) ·
+`6` differences found (`diff` only).
 
 ## Known limitations (honest list)
 - The Builder studio (Design H, IDE layout) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. Its Windows runtime behavior is **Unverified** until an on-machine field pass (the document/settings model and the full open → validate → pack → verify chain are covered by host tests). Screenshots of the 4.5.0 layouts are owed from that field pass.
