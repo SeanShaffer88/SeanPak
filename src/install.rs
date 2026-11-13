@@ -1223,10 +1223,9 @@ mod tests {
             std::fs::write(&stub, vec![0xAAu8; 5000]).unwrap();
         }
         let setup = root.join(format!("Setup-{version}.exe"));
-        let app_name = format!("Life App {}", root.file_name().unwrap().to_string_lossy());
-        let options = InstallOptions::defaults_for(&app_name);
+        let options = InstallOptions::defaults_for("Life App");
         OverlayWriter::build_from_folder_with_options(
-            &stub, &setup, &src, &app_name, version, "Tester", &options,
+            &stub, &setup, &src, "Life App", version, "Tester", &options,
         )
         .unwrap();
         setup

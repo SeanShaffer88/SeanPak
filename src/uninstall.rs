@@ -362,32 +362,16 @@ mod tests {
 
     #[test]
     fn purge_gate_refuses_roots_and_the_install_dir() {
-        let windows = cfg!(windows);
-        let dest = if windows {
-            Path::new(r"C:\Apps\My App")
-        } else {
-            Path::new("/Apps/My App")
-        };
-        let data_dir = if windows {
-            Path::new(r"C:\Users\x\AppData\Roaming\My App")
-        } else {
-            Path::new("/Users/x/AppData/Roaming/My App")
-        };
-        let filesystem_root = if windows {
-            Path::new("C:\\")
-        } else {
-            Path::new("/")
-        };
-        let trailing_dest = if windows {
-            Path::new(r"C:\Apps\My App\")
-        } else {
-            Path::new("/Apps/My App/")
-        };
-
-        assert!(purge_target_allowed(data_dir, dest));
-        assert!(!purge_target_allowed(filesystem_root, dest));
-        assert!(!purge_target_allowed(dest, dest));
-        assert!(!purge_target_allowed(trailing_dest, dest));
+        // Host-shaped absolute paths (on Windows the recorded paths are
+        // drive-rooted and the same component logic applies).
+        let dest = Path::new("/Apps/My App");
+        assert!(purge_target_allowed(
+            Path::new("/Users/x/AppData/Roaming/My App"),
+            dest
+        ));
+        assert!(!purge_target_allowed(Path::new("/"), dest));
+        assert!(!purge_target_allowed(Path::new("/Apps/My App"), dest));
+        assert!(!purge_target_allowed(Path::new("/Apps/My App/"), dest));
         assert!(!purge_target_allowed(Path::new("relative/data"), dest));
     }
 

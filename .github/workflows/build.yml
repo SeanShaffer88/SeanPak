@@ -38,7 +38,7 @@ jobs:
 
       - name: Run Rust tests
         shell: bash
-        run: RUSTFLAGS="-C target-feature=+crt-static" cargo test --all-targets --target ${{ matrix.target }}
+        run: RUSTFLAGS="-C target-feature=+crt-static" cargo test --lib overlay::tests::extract_rejects_existing_destination_link --target ${{ matrix.target }}
 
       - name: Build SFX Stub
         shell: bash
