@@ -11,8 +11,8 @@ pub mod receipt;
 pub mod restart_manager;
 pub mod rollback;
 pub mod scanner;
+pub mod studio;
 pub mod sysinstall;
-pub mod win32_ui;
 pub mod wizard;
 
 pub use backends::{
@@ -25,5 +25,5 @@ pub use overlay::{
 pub use restart_manager::RestartManagerSession;
 pub use rollback::{RollbackAction, TransactionRollbackLog};
 pub use scanner::{inspect_pe_architecture, PeArchitecture, ScannedFileEntry, ScannedFolder};
-pub use win32_ui::NativeWin32App;
+pub use studio::BuilderStudio;
 pub use wizard::InstallWizard;

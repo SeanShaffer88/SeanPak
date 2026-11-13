@@ -15,7 +15,7 @@ use seanpak::overlay::{
 use seanpak::pack::{PackError, PackOutcome};
 use seanpak::rollback::TransactionRollbackLog;
 use seanpak::scanner::ScannedFolder;
-use seanpak::win32_ui::NativeWin32App;
+use seanpak::studio::BuilderStudio;
 use seanpak::wizard::InstallWizard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1350,7 +1350,7 @@ fn main() {
         None
     };
 
-    let mut app = NativeWin32App::new(initial_folder);
+    let mut app = BuilderStudio::new(initial_folder);
     if let Err(err_code) = app.run() {
         // Never die silently: the failure goes to the log AND a dialog.
         let message = format!(
