@@ -12,7 +12,11 @@
 //! The JSON parser is hand-rolled: SeanPak's dependency rule is
 //! windows-sys only, so serde is not an option.
 
-use crate::overlay::{copy_str_to_fixed_pub, InstallOptions, DATA_DIRS_CAPACITY};
+use crate::overlay::{
+    copy_str_to_fixed_pub, ComponentSpec, EnvWriteSpec, HookFailurePolicy, HookSpec,
+    InstallOptions, PowerSpec, RegValueKind, RegWriteSpec, RichShortcutSpec, ShortcutLocation,
+    CORE_COMPONENT_ID, DATA_DIRS_CAPACITY,
+};
 
 /// The JSON Schema (draft 2020-12) for the app manifest. This exact text
 /// is what `seanpak schema` prints.
@@ -94,11 +98,101 @@ pub const MANIFEST_SCHEMA_JSON: &str = r##"{
       "default": [],
       "description": "The app's data folders, recorded (resolved to absolute paths) in the install receipt. The interactive uninstall offers a checkbox to delete them; a silent uninstall never deletes them without an explicit --purge-data. Each entry starts with %APPDATA%, %LOCALAPPDATA%, %USERPROFILE% or %INSTALLDIR%, or is a path relative to the install folder; each must name a folder below its root and must not contain '..' or ';'."
     },
+    "components": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "string", "description": "Unique component id: letters, digits, '-' and '_' only. The id 'core' is reserved for the files no component claims." },
+          "name": { "type": "string", "description": "Display name shown in the installer's component choices." },
+          "description": { "type": "string", "default": "" },
+          "files": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Package files this component claims (paths relative to the files directory). A file may be claimed by only one component; unclaimed files form the always-installed 'core' component." },
+          "required": { "type": "boolean", "default": false, "description": "Required components are always installed and cannot be deselected." },
+          "defaultSelected": { "type": "boolean", "default": true, "description": "Whether an optional component starts selected on a fresh install. Upgrades keep the previous install's choice for components the previous package also offered." }
+        }
+      },
+      "description": "Optional components: named subsets of the package the user can include or skip at install time (wizard Options page checkboxes, or --components / --without on the command line). The component holding the primary executable is always installed."
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "preInstall": { "type": "array", "items": { "$ref": "#/$defs/hook" }, "default": [], "description": "Commands run after the install location passes the writability check, before any file is extracted. Working directory: the folder the installer was run from." },
+        "postInstall": { "type": "array", "items": { "$ref": "#/$defs/hook" }, "default": [], "description": "Commands run after files, shortcuts and writes are applied, before the install is finalized. Working directory: the install folder. On a --repair run only postInstall hooks run." }
+      },
+      "description": "Pre/post install commands. Each run is recorded in the install receipt; hooks receive SEANPAK_INSTALL_DIR, SEANPAK_APP_NAME and SEANPAK_APP_VERSION in their environment. A hook's own changes are never rolled back — only SeanPak's are."
+    },
+    "registryWrites": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "value"],
+        "properties": {
+          "key": { "type": "string", "description": "Registry key path relative to HKEY_CURRENT_USER (for example \"Software\\\\MyApp\"). Absolute hives are rejected — writes are per-user only." },
+          "name": { "type": "string", "default": "", "description": "Value name; an empty string writes the key's default value." },
+          "type": { "type": "string", "enum": ["sz", "dword"], "default": "sz" },
+          "value": { "description": "The value to write: a string for type sz; for type dword, an integer or its decimal/0x-prefixed string form." }
+        }
+      },
+      "description": "Per-user (HKCU) registry values written at install time. The prior value (or its absence) is journaled in the install receipt, and uninstall restores it exactly."
+    },
+    "envWrites": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value"],
+        "properties": {
+          "name": { "type": "string", "description": "Environment variable name (no '=' character)." },
+          "value": { "type": "string" }
+        }
+      },
+      "description": "Per-user environment variables written at install time (HKCU Environment, with the usual change broadcast). Journaled and restored by uninstall exactly like registryWrites."
+    },
+    "shortcuts": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "target"],
+        "properties": {
+          "name": { "type": "string", "description": "Link display name (a plain file name — no path separators or <>:\"/\\\\|?* characters)." },
+          "target": { "type": "string", "description": "Path of the target file relative to the install folder; must be one of the packaged files." },
+          "arguments": { "type": "string", "default": "" },
+          "icon": { "type": "string", "description": "Icon file relative to the install folder (a packaged file). Defaults to the target itself." },
+          "iconIndex": { "type": "integer", "minimum": 0, "default": 0 },
+          "description": { "type": "string", "default": "" },
+          "location": { "type": "string", "enum": ["desktop", "startMenu", "both"], "default": "startMenu" },
+          "pin": { "type": "boolean", "default": false, "description": "Best-effort pin to taskbar after the link is created. Windows restricts pinning, so the outcome (pinned / unavailable) is recorded in the receipt and never fails the install." }
+        }
+      },
+      "description": "Extra shortcuts beyond the automatic primary-executable ones, with arguments, a custom icon, and an optional taskbar pin. Journaled in the receipt; uninstall deletes the link files. A shortcut is only created when its target's component is installed."
+    },
     "files": {
       "type": "array",
       "items": { "type": "string" },
       "default": [],
       "description": "Optional explicit file list: paths relative to the files directory to include in the package. Empty (the default) packs the whole files directory. Entries must be relative, unique, and contain no '..'."
+    }
+  },
+  "$defs": {
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string", "description": "Program to run (a name found on PATH, or a path)." },
+        "args": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "onFailure": { "type": "string", "enum": ["abort", "continue"], "default": "abort", "description": "abort: the install fails and rolls back (exit code 5), and the report names the failed hook and its exit code. continue: the failure is recorded as a warning in the receipt and the install proceeds." }
+      }
     }
   }
 }"##;
@@ -459,6 +553,11 @@ const KNOWN_KEYS: &[&str] = &[
     "launchAfterInstall",
     "startAtLogin",
     "dataDirs",
+    "components",
+    "hooks",
+    "registryWrites",
+    "envWrites",
+    "shortcuts",
     "files",
 ];
 
@@ -484,6 +583,19 @@ pub struct AppManifest {
     pub start_at_login_default: bool,
     /// The app's data folders (token paths), recorded into the receipt.
     pub data_dirs: Vec<String>,
+    /// Optional components (v6 power block; `packed_size` stays 0
+    /// here — the packer fills it in the package).
+    pub components: Vec<ComponentSpec>,
+    /// Pre-install hooks (v6).
+    pub pre_hooks: Vec<HookSpec>,
+    /// Post-install hooks (v6).
+    pub post_hooks: Vec<HookSpec>,
+    /// Journaled HKCU registry writes (v6).
+    pub registry_writes: Vec<RegWriteSpec>,
+    /// Journaled per-user environment writes (v6).
+    pub env_writes: Vec<EnvWriteSpec>,
+    /// Rich shortcuts beyond the automatic ones (v6).
+    pub shortcuts: Vec<RichShortcutSpec>,
     pub files: Vec<String>,
 }
 
@@ -688,6 +800,14 @@ impl AppManifest {
             ));
         }
 
+        // The v6 power blocks. Each parser appends its own plain-
+        // language problems to `errors`, so one pass reports everything.
+        let components = parse_components(&root, &mut errors);
+        let (pre_hooks, post_hooks) = parse_hooks(&root, &mut errors);
+        let registry_writes = parse_registry_writes(&root, &mut errors);
+        let env_writes = parse_env_writes(&root, &mut errors);
+        let shortcuts = parse_shortcuts(&root, &mut errors);
+
         let desktop_shortcut = get_bool("desktopShortcut", true, &mut errors);
         let start_menu_shortcut = get_bool("startMenuShortcut", true, &mut errors);
         let path_entry = get_bool("pathEntry", false, &mut errors);
@@ -711,6 +831,12 @@ impl AppManifest {
             start_at_login_offered,
             start_at_login_default,
             data_dirs,
+            components,
+            pre_hooks,
+            post_hooks,
+            registry_writes,
+            env_writes,
+            shortcuts,
             files,
         })
     }
@@ -819,14 +945,81 @@ impl AppManifest {
             "dataDirs",
             JsonValue::Array(self.data_dirs.iter().map(|d| jstr(d.clone())).collect()),
         ));
+        // The v6 power blocks render exactly as the overlay's power
+        // block encodes them — one encoding for the manifest file and
+        // the package, so a rendered manifest re-parses identically.
+        let mut object_pairs: Vec<(String, JsonValue)> =
+            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        if let JsonValue::Object(power_pairs) = self.to_power_spec().to_json_value() {
+            object_pairs.extend(power_pairs);
+        }
         if !self.files.is_empty() {
-            pairs.push((
-                "files",
+            object_pairs.push((
+                "files".to_string(),
                 JsonValue::Array(self.files.iter().map(|f| jstr(f.clone())).collect()),
             ));
         }
-        jobj(pairs)
+        JsonValue::Object(object_pairs)
     }
+
+    /// The v6 power spec this manifest declares (component packed
+    /// sizes stay 0 — the packer computes them into the package).
+    pub fn to_power_spec(&self) -> PowerSpec {
+        PowerSpec {
+            components: self.components.clone(),
+            pre_hooks: self.pre_hooks.clone(),
+            post_hooks: self.post_hooks.clone(),
+            registry_writes: self.registry_writes.clone(),
+            env_writes: self.env_writes.clone(),
+            shortcuts: self.shortcuts.clone(),
+        }
+    }
+}
+
+/// Parses the five v6 power blocks (`components`, `hooks`,
+/// `registryWrites`, `envWrites`, `shortcuts`) from a JSON object —
+/// the same parsers [`AppManifest::from_json`] runs, exposed so other
+/// surfaces that edit exactly those blocks (the Builder studio's power
+/// editor) validate with the identical rules. Unknown keys are an
+/// error here too, so a typo'd block name cannot pass silently.
+pub fn power_spec_from_json(root: &JsonValue) -> Result<PowerSpec, Vec<String>> {
+    let mut errors: Vec<String> = Vec::new();
+    if !matches!(root, JsonValue::Object(_)) {
+        return Err(vec!["power blocks must be a JSON object".to_string()]);
+    }
+    if let JsonValue::Object(pairs) = root {
+        for (key, _) in pairs {
+            if ![
+                "components",
+                "hooks",
+                "registryWrites",
+                "envWrites",
+                "shortcuts",
+            ]
+            .contains(&key.as_str())
+            {
+                errors.push(format!(
+                    "unknown power block \"{key}\" (allowed: components, hooks, registryWrites, envWrites, shortcuts)"
+                ));
+            }
+        }
+    }
+    let components = parse_components(root, &mut errors);
+    let (pre_hooks, post_hooks) = parse_hooks(root, &mut errors);
+    let registry_writes = parse_registry_writes(root, &mut errors);
+    let env_writes = parse_env_writes(root, &mut errors);
+    let shortcuts = parse_shortcuts(root, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(PowerSpec {
+        components,
+        pre_hooks,
+        post_hooks,
+        registry_writes,
+        env_writes,
+        shortcuts,
+    })
 }
 
 /// Parses an "offer" field (`launchAfterInstall`, `startAtLogin`): a
@@ -877,6 +1070,538 @@ fn offer_json_value(offered: bool, default_checked: bool) -> JsonValue {
         ("offered", JsonValue::Bool(offered)),
         ("defaultChecked", JsonValue::Bool(default_checked)),
     ])
+}
+
+/// A relative package path as used by `files`, component file lists,
+/// and shortcut targets/icons: normalized to `/` separators, or a
+/// plain-language error. `what` names the field for the message.
+fn check_relative_path(raw: &str, what: &str) -> Result<String, String> {
+    let normalized = raw.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.split('/').any(|part| part == "..")
+        || normalized.chars().nth(1) == Some(':')
+    {
+        return Err(format!(
+            "{what} \"{raw}\" must be a path relative to the files directory, without '..'"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn parse_components(root: &JsonValue, errors: &mut Vec<String>) -> Vec<ComponentSpec> {
+    let mut components: Vec<ComponentSpec> = Vec::new();
+    let Some(v) = root.get("components") else {
+        return components;
+    };
+    let JsonValue::Array(items) = v else {
+        errors.push("\"components\" must be an array of objects".to_string());
+        return components;
+    };
+    // Files claimed so far, across all components: a file belongs to
+    // at most one component.
+    let mut claimed: Vec<String> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let at = format!("components[{idx}]");
+        if !matches!(item, JsonValue::Object(_)) {
+            errors.push(format!("\"{at}\" must be an object"));
+            continue;
+        }
+        let id = item
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty()
+            || id == CORE_COMPONENT_ID
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            errors.push(format!(
+                "\"{at}.id\" must be a unique id of letters, digits, '-' and '_' (\"{CORE_COMPONENT_ID}\" is reserved)"
+            ));
+            continue;
+        }
+        if components.iter().any(|c| c.id == id) {
+            errors.push(format!("component id \"{id}\" is used more than once"));
+            continue;
+        }
+        let name = match item.get("name") {
+            Some(JsonValue::String(s)) if !s.trim().is_empty() => s.clone(),
+            _ => {
+                errors.push(format!("\"{at}.name\" is required and must not be empty"));
+                continue;
+            }
+        };
+        let description = match item.get("description") {
+            None => String::new(),
+            Some(JsonValue::String(s)) => s.clone(),
+            Some(_) => {
+                errors.push(format!("\"{at}.description\" must be a string"));
+                String::new()
+            }
+        };
+        let bool_field = |key: &str, default: bool, errors: &mut Vec<String>| -> bool {
+            match item.get(key) {
+                None => default,
+                Some(x) => match x.as_bool() {
+                    Some(b) => b,
+                    None => {
+                        errors.push(format!("\"{at}.{key}\" must be true or false"));
+                        default
+                    }
+                },
+            }
+        };
+        let required = bool_field("required", false, errors);
+        let default_selected = bool_field("defaultSelected", true, errors);
+        let mut files: Vec<String> = Vec::new();
+        if let Some(list) = item.get("files") {
+            match list {
+                JsonValue::Array(entries) => {
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(raw) => {
+                                match check_relative_path(raw, &format!("{at}.files entry")) {
+                                    Ok(normalized) => {
+                                        if claimed.contains(&normalized) {
+                                            errors.push(format!(
+                                                "file \"{raw}\" is claimed by more than one component"
+                                            ));
+                                        } else if files.contains(&normalized) {
+                                            errors.push(format!(
+                                                "\"{at}.files\" entry \"{raw}\" is duplicated"
+                                            ));
+                                        } else {
+                                            claimed.push(normalized.clone());
+                                            files.push(normalized);
+                                        }
+                                    }
+                                    Err(e) => errors.push(e),
+                                }
+                            }
+                            None => errors.push(format!("\"{at}.files\" entries must be strings")),
+                        }
+                    }
+                }
+                _ => errors.push(format!("\"{at}.files\" must be an array of strings")),
+            }
+        }
+        components.push(ComponentSpec {
+            id,
+            name,
+            description,
+            files,
+            required,
+            default_selected,
+            packed_size: 0,
+        });
+    }
+    components
+}
+
+fn parse_hook_list(hooks: &JsonValue, key: &str, errors: &mut Vec<String>) -> Vec<HookSpec> {
+    let mut out: Vec<HookSpec> = Vec::new();
+    let Some(v) = hooks.get(key) else {
+        return out;
+    };
+    let JsonValue::Array(items) = v else {
+        errors.push(format!("\"hooks.{key}\" must be an array of objects"));
+        return out;
+    };
+    for (idx, item) in items.iter().enumerate() {
+        let at = format!("hooks.{key}[{idx}]");
+        if !matches!(item, JsonValue::Object(_)) {
+            errors.push(format!("\"{at}\" must be an object"));
+            continue;
+        }
+        let command = match item.get("command") {
+            Some(JsonValue::String(s)) if !s.trim().is_empty() => s.clone(),
+            _ => {
+                errors.push(format!(
+                    "\"{at}.command\" is required and must not be empty"
+                ));
+                continue;
+            }
+        };
+        let mut args: Vec<String> = Vec::new();
+        if let Some(list) = item.get("args") {
+            match list {
+                JsonValue::Array(entries) => {
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(s) => args.push(s.to_string()),
+                            None => errors.push(format!("\"{at}.args\" entries must be strings")),
+                        }
+                    }
+                }
+                _ => errors.push(format!("\"{at}.args\" must be an array of strings")),
+            }
+        }
+        let on_failure = match item.get("onFailure") {
+            None => HookFailurePolicy::Abort,
+            Some(JsonValue::String(s)) => match HookFailurePolicy::parse(s) {
+                Some(p) => p,
+                None => {
+                    errors.push(format!(
+                        "\"{at}.onFailure\" must be \"abort\" or \"continue\""
+                    ));
+                    HookFailurePolicy::Abort
+                }
+            },
+            Some(_) => {
+                errors.push(format!(
+                    "\"{at}.onFailure\" must be \"abort\" or \"continue\""
+                ));
+                HookFailurePolicy::Abort
+            }
+        };
+        out.push(HookSpec {
+            command,
+            args,
+            on_failure,
+        });
+    }
+    out
+}
+
+fn parse_hooks(root: &JsonValue, errors: &mut Vec<String>) -> (Vec<HookSpec>, Vec<HookSpec>) {
+    let Some(v) = root.get("hooks") else {
+        return (Vec::new(), Vec::new());
+    };
+    if !matches!(v, JsonValue::Object(_)) {
+        errors.push(
+            "\"hooks\" must be an object with \"preInstall\" and \"postInstall\"".to_string(),
+        );
+        return (Vec::new(), Vec::new());
+    }
+    (
+        parse_hook_list(v, "preInstall", errors),
+        parse_hook_list(v, "postInstall", errors),
+    )
+}
+
+/// Validates a `registryWrites` key: it must be relative to
+/// HKEY_CURRENT_USER (writes are per-user only) — absolute hive names
+/// and prefixes, leading separators, drive syntax, and `..` segments
+/// are all refused, so a manifest can never name a key outside HKCU.
+fn validate_registry_key(key: &str) -> Result<String, String> {
+    let k = key.trim();
+    if k.is_empty() {
+        return Err("\"registryWrites\" key must not be empty".to_string());
+    }
+    if k.starts_with(['\\', '/']) || k.contains(':') || k.contains('/') {
+        return Err(format!(
+            "registryWrites key \"{key}\" must be a key path relative to HKEY_CURRENT_USER (backslashes only, no hive prefix)"
+        ));
+    }
+    const HIVES: [&str; 10] = [
+        "HKEY_CURRENT_USER",
+        "HKCU",
+        "HKEY_LOCAL_MACHINE",
+        "HKLM",
+        "HKEY_CLASSES_ROOT",
+        "HKCR",
+        "HKEY_USERS",
+        "HKU",
+        "HKEY_CURRENT_CONFIG",
+        "HKCC",
+    ];
+    let first = k.split('\\').next().unwrap_or("");
+    if HIVES.iter().any(|h| first.eq_ignore_ascii_case(h)) {
+        return Err(format!(
+            "registryWrites key \"{key}\" must be relative to HKEY_CURRENT_USER — remove the hive prefix"
+        ));
+    }
+    if k.split('\\').any(|part| part == ".." || part.is_empty()) {
+        return Err(format!(
+            "registryWrites key \"{key}\" must be a plain key path (no '..' or empty segments)"
+        ));
+    }
+    Ok(k.to_string())
+}
+
+fn parse_registry_writes(root: &JsonValue, errors: &mut Vec<String>) -> Vec<RegWriteSpec> {
+    let mut writes: Vec<RegWriteSpec> = Vec::new();
+    let Some(v) = root.get("registryWrites") else {
+        return writes;
+    };
+    let JsonValue::Array(items) = v else {
+        errors.push("\"registryWrites\" must be an array of objects".to_string());
+        return writes;
+    };
+    for (idx, item) in items.iter().enumerate() {
+        let at = format!("registryWrites[{idx}]");
+        if !matches!(item, JsonValue::Object(_)) {
+            errors.push(format!("\"{at}\" must be an object"));
+            continue;
+        }
+        let key = match item.get("key") {
+            Some(JsonValue::String(s)) => match validate_registry_key(s) {
+                Ok(k) => k,
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+            },
+            _ => {
+                errors.push(format!("\"{at}.key\" is required and must be a string"));
+                continue;
+            }
+        };
+        let name = match item.get("name") {
+            None => String::new(),
+            Some(JsonValue::String(s)) => s.clone(),
+            Some(_) => {
+                errors.push(format!("\"{at}.name\" must be a string"));
+                continue;
+            }
+        };
+        let kind = match item.get("type") {
+            None => RegValueKind::Sz,
+            Some(JsonValue::String(s)) => match RegValueKind::parse(s) {
+                Some(k) => k,
+                None => {
+                    errors.push(format!("\"{at}.type\" must be \"sz\" or \"dword\""));
+                    continue;
+                }
+            },
+            Some(_) => {
+                errors.push(format!("\"{at}.type\" must be \"sz\" or \"dword\""));
+                continue;
+            }
+        };
+        let value = match (kind, item.get("value")) {
+            (RegValueKind::Sz, Some(JsonValue::String(s))) => s.clone(),
+            (RegValueKind::Sz, _) => {
+                errors.push(format!(
+                    "\"{at}.value\" is required and must be a string for type \"sz\""
+                ));
+                continue;
+            }
+            (RegValueKind::Dword, Some(JsonValue::Number(n))) => {
+                if *n < 0.0 || *n > u32::MAX as f64 || n.fract() != 0.0 {
+                    errors.push(format!(
+                        "\"{at}.value\" must be an integer between 0 and {} for type \"dword\"",
+                        u32::MAX
+                    ));
+                    continue;
+                }
+                format!("{}", *n as u32)
+            }
+            (RegValueKind::Dword, Some(JsonValue::String(s))) => {
+                let trimmed = s.trim();
+                let parsed = match trimmed
+                    .strip_prefix("0x")
+                    .or_else(|| trimmed.strip_prefix("0X"))
+                {
+                    Some(hex) => u32::from_str_radix(hex, 16),
+                    None => trimmed.parse::<u32>(),
+                };
+                match parsed {
+                    Ok(n) => format!("{n}"),
+                    Err(_) => {
+                        errors.push(format!(
+                            "\"{at}.value\" \"{s}\" is not a valid dword (decimal or 0x-prefixed hex)"
+                        ));
+                        continue;
+                    }
+                }
+            }
+            (RegValueKind::Dword, _) => {
+                errors.push(format!(
+                    "\"{at}.value\" is required for type \"dword\" (an integer or its string form)"
+                ));
+                continue;
+            }
+        };
+        writes.push(RegWriteSpec {
+            key,
+            name,
+            kind,
+            value,
+        });
+    }
+    writes
+}
+
+fn parse_env_writes(root: &JsonValue, errors: &mut Vec<String>) -> Vec<EnvWriteSpec> {
+    let mut writes: Vec<EnvWriteSpec> = Vec::new();
+    let Some(v) = root.get("envWrites") else {
+        return writes;
+    };
+    let JsonValue::Array(items) = v else {
+        errors.push("\"envWrites\" must be an array of objects".to_string());
+        return writes;
+    };
+    for (idx, item) in items.iter().enumerate() {
+        let at = format!("envWrites[{idx}]");
+        if !matches!(item, JsonValue::Object(_)) {
+            errors.push(format!("\"{at}\" must be an object"));
+            continue;
+        }
+        let name = match item.get("name") {
+            Some(JsonValue::String(s)) if !s.trim().is_empty() && !s.contains('=') => s.clone(),
+            _ => {
+                errors.push(format!(
+                    "\"{at}.name\" is required (a variable name, without '=')"
+                ));
+                continue;
+            }
+        };
+        let value = match item.get("value") {
+            Some(JsonValue::String(s)) => s.clone(),
+            _ => {
+                errors.push(format!("\"{at}.value\" is required and must be a string"));
+                continue;
+            }
+        };
+        writes.push(EnvWriteSpec { name, value });
+    }
+    writes
+}
+
+/// A shortcut display name must be a plain file-name fragment: it
+/// becomes `<name>.lnk` in a user folder.
+fn validate_shortcut_name(name: &str) -> Result<(), String> {
+    let n = name.trim();
+    if n.is_empty()
+        || n == "."
+        || n == ".."
+        || n.ends_with(['.', ' '])
+        || n.chars().any(|c| {
+            matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || (c as u32) < 0x20
+        })
+    {
+        return Err(format!(
+            "shortcuts name \"{name}\" must be a plain name (no path separators or any of <>:\"/\\|?*)"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_shortcuts(root: &JsonValue, errors: &mut Vec<String>) -> Vec<RichShortcutSpec> {
+    let mut shortcuts: Vec<RichShortcutSpec> = Vec::new();
+    let Some(v) = root.get("shortcuts") else {
+        return shortcuts;
+    };
+    let JsonValue::Array(items) = v else {
+        errors.push("\"shortcuts\" must be an array of objects".to_string());
+        return shortcuts;
+    };
+    for (idx, item) in items.iter().enumerate() {
+        let at = format!("shortcuts[{idx}]");
+        if !matches!(item, JsonValue::Object(_)) {
+            errors.push(format!("\"{at}\" must be an object"));
+            continue;
+        }
+        let name = match item.get("name") {
+            Some(JsonValue::String(s)) => match validate_shortcut_name(s) {
+                Ok(()) => s.clone(),
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+            },
+            _ => {
+                errors.push(format!("\"{at}.name\" is required and must be a string"));
+                continue;
+            }
+        };
+        let target = match item.get("target") {
+            Some(JsonValue::String(s)) => match check_relative_path(s, &format!("{at}.target")) {
+                Ok(normalized) => normalized,
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+            },
+            _ => {
+                errors.push(format!("\"{at}.target\" is required and must be a string"));
+                continue;
+            }
+        };
+        let str_field = |key: &str, errors: &mut Vec<String>| -> String {
+            match item.get(key) {
+                None => String::new(),
+                Some(JsonValue::String(s)) => s.clone(),
+                Some(_) => {
+                    errors.push(format!("\"{at}.{key}\" must be a string"));
+                    String::new()
+                }
+            }
+        };
+        let arguments = str_field("arguments", errors);
+        let description = str_field("description", errors);
+        let icon = match item.get("icon") {
+            None => None,
+            Some(JsonValue::String(s)) => match check_relative_path(s, &format!("{at}.icon")) {
+                Ok(normalized) => Some(normalized),
+                Err(e) => {
+                    errors.push(e);
+                    None
+                }
+            },
+            Some(_) => {
+                errors.push(format!("\"{at}.icon\" must be a string"));
+                None
+            }
+        };
+        let icon_index = match item.get("iconIndex") {
+            None => 0,
+            Some(JsonValue::Number(n))
+                if *n >= 0.0 && n.fract() == 0.0 && *n <= i32::MAX as f64 =>
+            {
+                *n as i32
+            }
+            Some(_) => {
+                errors.push(format!(
+                    "\"{at}.iconIndex\" must be an integer of 0 or more"
+                ));
+                0
+            }
+        };
+        let location = match item.get("location") {
+            None => ShortcutLocation::StartMenu,
+            Some(JsonValue::String(s)) => match ShortcutLocation::parse(s) {
+                Some(l) => l,
+                None => {
+                    errors.push(format!(
+                        "\"{at}.location\" must be \"desktop\", \"startMenu\" or \"both\""
+                    ));
+                    ShortcutLocation::StartMenu
+                }
+            },
+            Some(_) => {
+                errors.push(format!(
+                    "\"{at}.location\" must be \"desktop\", \"startMenu\" or \"both\""
+                ));
+                ShortcutLocation::StartMenu
+            }
+        };
+        let pin = match item.get("pin") {
+            None => false,
+            Some(x) => match x.as_bool() {
+                Some(b) => b,
+                None => {
+                    errors.push(format!("\"{at}.pin\" must be true or false"));
+                    false
+                }
+            },
+        };
+        shortcuts.push(RichShortcutSpec {
+            name,
+            target,
+            arguments,
+            icon,
+            icon_index,
+            description,
+            location,
+            pin,
+        });
+    }
+    shortcuts
 }
 
 /// Validates one `dataDirs` entry. Entries are token paths: one of the
@@ -1062,6 +1787,108 @@ mod tests {
             errors.iter().any(|e| e.contains("startAtLogin")),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn power_blocks_parse_carry_through_and_round_trip() {
+        let m = AppManifest::from_json(
+            r#"{"appName":"Power App","version":"2.0",
+                "components":[
+                  {"id":"extras","name":"Extras","files":["extras\\big.bin"],"defaultSelected":false},
+                  {"id":"engine","name":"Engine","files":["engine.dll"],"required":true}
+                ],
+                "hooks":{
+                  "preInstall":[{"command":"prep.exe","args":["--go"],"onFailure":"continue"}],
+                  "postInstall":[{"command":"finish.exe"}]
+                },
+                "registryWrites":[
+                  {"key":"Software\\Power App","name":"Mode","type":"dword","value":"0x1F"},
+                  {"key":"Software\\Power App","value":"plain"}
+                ],
+                "envWrites":[{"name":"POWER_APP_HOME","value":"C:\\Power"}],
+                "shortcuts":[
+                  {"name":"Power Console","target":"app.exe","arguments":"--console","location":"both","pin":true}
+                ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.components.len(), 2);
+        assert_eq!(m.components[0].files, vec!["extras/big.bin".to_string()]);
+        assert!(!m.components[0].default_selected);
+        assert!(m.components[1].required);
+        assert_eq!(m.pre_hooks.len(), 1);
+        assert_eq!(m.pre_hooks[0].on_failure, HookFailurePolicy::Continue);
+        assert_eq!(m.post_hooks[0].on_failure, HookFailurePolicy::Abort);
+        // The dword hex string canonicalizes to decimal.
+        assert_eq!(m.registry_writes[0].value, "31");
+        assert_eq!(m.registry_writes[0].kind, RegValueKind::Dword);
+        assert_eq!(m.registry_writes[1].kind, RegValueKind::Sz);
+        assert_eq!(m.registry_writes[1].name, "");
+        assert_eq!(m.env_writes[0].name, "POWER_APP_HOME");
+        assert_eq!(m.shortcuts[0].location, ShortcutLocation::Both);
+        assert!(m.shortcuts[0].pin);
+
+        // The power spec the packer embeds matches the manifest's.
+        let power = m.to_power_spec();
+        assert_eq!(power.components.len(), 2);
+        assert_eq!(power.shortcuts.len(), 1);
+
+        // The rendered manifest re-parses to the same value.
+        let rendered = m.to_json_value().render();
+        let m2 = AppManifest::from_json(&rendered).unwrap();
+        assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn power_blocks_validation_reports_clear_errors() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"{"appName":"X","version":"1.0","components":[{"id":"core","name":"C"}]}"#,
+                "reserved",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","components":[{"id":"a","name":"A","files":["f.txt"]},{"id":"b","name":"B","files":["f.txt"]}]}"#,
+                "more than one component",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","components":[{"id":"a","name":"A"},{"id":"a","name":"A2"}]}"#,
+                "more than once",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","hooks":{"preInstall":[{"command":"x","onFailure":"retry"}]}}"#,
+                "onFailure",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","registryWrites":[{"key":"HKCU\\Software\\X","value":"v"}]}"#,
+                "relative to HKEY_CURRENT_USER",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","registryWrites":[{"key":"Software\\..\\X","value":"v"}]}"#,
+                "registryWrites key",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","registryWrites":[{"key":"Software\\X","type":"dword","value":"banana"}]}"#,
+                "dword",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","envWrites":[{"name":"A=B","value":"v"}]}"#,
+                "envWrites[0].name",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","shortcuts":[{"name":"bad/name","target":"a.exe"}]}"#,
+                "shortcuts name",
+            ),
+            (
+                r#"{"appName":"X","version":"1.0","shortcuts":[{"name":"Ok","target":"../evil.exe"}]}"#,
+                "target",
+            ),
+        ];
+        for (json, needle) in cases {
+            let errors = AppManifest::from_json(json).unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.contains(needle)),
+                "{json} -> {errors:?} (want mention of {needle:?})"
+            );
+        }
     }
 
     #[test]

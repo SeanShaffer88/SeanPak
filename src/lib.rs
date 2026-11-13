@@ -1,9 +1,14 @@
+pub mod answers;
 pub mod backends;
 pub mod codec;
 pub mod diag;
 pub mod hash;
+pub mod hooks;
+pub mod init;
+pub mod inspect;
 pub mod install;
 pub mod manifest;
+pub mod modify;
 pub mod native_dialog;
 pub mod overlay;
 pub mod pack;
@@ -15,6 +20,7 @@ pub mod studio;
 pub mod sysinstall;
 pub mod uninstall;
 pub mod wizard;
+pub mod writes;
 
 pub use backends::{
     BackendEngineType, BuildConfig, InnoSetupBackend, InstallerBackend, NativeSfxBackend,

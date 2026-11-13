@@ -22,6 +22,16 @@
 //! ([`ensure_location_writable`]) refuses destinations this per-user
 //! process cannot write, suggesting the per-user Programs folder
 //! instead — installs never elevate.
+//!
+//! Packages carrying an overlay v6 power block (see
+//! [`crate::overlay::PowerSpec`]) extend the same run: the component
+//! selection is resolved before anything is touched (an upgrade
+//! defaults to the previous receipt's choices) and only the selected
+//! components' files are extracted, snapshotted, and receipted;
+//! pre-install hooks run after the writability verdict (skipped on
+//! repair), post-install hooks after the artifacts and the journaled
+//! registry/environment writes ([`crate::writes`]) are applied — an
+//! abort-policy hook failure rolls the whole run back.
 
 use std::cmp::Ordering;
 use std::fs::File;
@@ -31,8 +41,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use crate::hash::sha256_hex;
 use crate::overlay::{
     ExtractControl, FileRecordHeader, InstallOptions, OverlayManifestHeader, OverlayReader,
+    PowerSpec,
 };
-use crate::receipt::{compare_versions, read_receipt, InstallReceipt, ReceiptFile};
+use crate::receipt::{
+    compare_versions, read_receipt, HookRunRecord, InstallReceipt, PinRecord, ReceiptFile,
+};
 use crate::rollback::TransactionRollbackLog;
 use crate::sysinstall::{apply_artifacts, plan_artifacts, remove_artifacts};
 use crate::wizard::uninstall_key_path;
@@ -87,13 +100,28 @@ fn mode_name(detected: &DetectedInstall, new_version: &str, repair: bool) -> Str
     }
 }
 
+/// One component in an install plan (v6): what it is and whether this
+/// install includes it.
+#[derive(Debug, Clone)]
+pub struct PlannedComponent {
+    pub id: String,
+    pub name: String,
+    pub required: bool,
+    pub selected: bool,
+    /// Packed size in the package.
+    pub packed_size: u64,
+    /// Payload files the component owns.
+    pub file_count: usize,
+}
+
 /// What an install would do, computed without side effects.
 #[derive(Debug, Clone)]
 pub struct InstallPlan {
     pub app_name: String,
     pub app_version: String,
     pub dest: PathBuf,
-    /// (relative path, size) for every payload file, in record order.
+    /// (relative path, size) for every payload file the component
+    /// selection installs, in record order.
     pub files: Vec<(String, u64)>,
     pub total_bytes: u64,
     pub uninstaller_path: PathBuf,
@@ -113,13 +141,33 @@ pub struct InstallPlan {
     pub location_writable: bool,
     /// When `dest` is not writable, the per-user folder offered instead.
     pub suggested_location: Option<PathBuf>,
+    /// The package's components (v6), with this plan's selection.
+    /// Empty for pre-v6 packages.
+    pub components: Vec<PlannedComponent>,
+    /// Hooks the install would run, as (phase, command line) pairs —
+    /// listed, never run, by a dry run.
+    pub hooks: Vec<(String, String)>,
+    /// Registry writes the install would apply (v6), as declared.
+    pub registry_writes: Vec<crate::overlay::RegWriteSpec>,
+    /// Environment writes the install would apply (v6), as declared.
+    pub env_writes: Vec<crate::overlay::EnvWriteSpec>,
+    /// Display names of the package's rich shortcuts this plan would
+    /// create (v6) — the automatic app shortcuts are in `shortcuts`.
+    pub rich_shortcuts: Vec<String>,
 }
 
+/// Computes what an install would do. `power` is the package's v6
+/// power block (empty for older packages) and `selection` the resolved
+/// component selection the plan assumes (from
+/// [`PowerSpec::resolve_selection`]).
 pub fn plan_install(
     manifest: &OverlayManifestHeader,
     records: &[FileRecordHeader],
     options: &InstallOptions,
     dest: &Path,
+    power: &PowerSpec,
+    selection: &[String],
+    stream_len: u64,
 ) -> InstallPlan {
     let detected = detect_existing(dest, manifest);
     let previous_version = match &detected {
@@ -129,21 +177,75 @@ pub fn plan_install(
     let primary_rel = records
         .get(manifest.primary_exe_index as usize)
         .map(|r| r.relative_path());
-    let artifacts = plan_artifacts(options, &manifest.app_name(), dest, primary_rel.as_deref());
+    let artifacts = plan_artifacts(
+        options,
+        &manifest.app_name(),
+        dest,
+        primary_rel.as_deref(),
+        power,
+        Some(selection),
+    );
     let (location_writable, suggested_location) =
         match location_verdict(dest, &manifest.app_name(), &options.install_location()) {
             LocationVerdict::Writable => (true, None),
             LocationVerdict::NotWritable { fallback, .. } => (false, Some(fallback)),
         };
+    let selected_records: Vec<&FileRecordHeader> = records
+        .iter()
+        .filter(|r| {
+            selection
+                .iter()
+                .any(|id| id == &power.component_id_for_file(&r.relative_path()))
+        })
+        .collect();
+    let include_core = power.has_core_files(records);
+    let components: Vec<PlannedComponent> = power
+        .part_ids(include_core)
+        .into_iter()
+        .map(|id| {
+            let (name, required, packed_size) = if id == crate::overlay::CORE_COMPONENT_ID {
+                (
+                    "Core files".to_string(),
+                    true,
+                    power.core_packed_size(records, stream_len),
+                )
+            } else {
+                let c = power.component(&id).expect("part id from the power spec");
+                (c.name.clone(), c.required, c.packed_size)
+            };
+            PlannedComponent {
+                selected: selection.iter().any(|s| s == &id),
+                file_count: records
+                    .iter()
+                    .filter(|r| power.component_id_for_file(&r.relative_path()) == id)
+                    .count(),
+                id,
+                name,
+                required,
+                packed_size,
+            }
+        })
+        .collect();
+    let mut hooks: Vec<(String, String)> = power
+        .pre_hooks
+        .iter()
+        .map(|h| ("preInstall".to_string(), crate::hooks::display_command(h)))
+        .collect();
+    hooks.extend(
+        power
+            .post_hooks
+            .iter()
+            .map(|h| ("postInstall".to_string(), crate::hooks::display_command(h))),
+    );
     InstallPlan {
         app_name: manifest.app_name(),
         app_version: manifest.app_version(),
         dest: dest.to_path_buf(),
-        files: records
+        files: selected_records
             .iter()
             .map(|r| (r.relative_path(), r.file_size))
             .collect(),
-        total_bytes: manifest.total_uncompressed_bytes,
+        total_bytes: selected_records.iter().map(|r| r.file_size).sum(),
         uninstaller_path: dest.join("Uninstall.exe"),
         arp_key: uninstall_key_path(&manifest.app_name()),
         mode: mode_name(&detected, &manifest.app_version(), false),
@@ -158,6 +260,16 @@ pub fn plan_install(
         start_at_login: artifacts.start_at_login,
         location_writable,
         suggested_location,
+        components,
+        hooks,
+        registry_writes: power.registry_writes.clone(),
+        env_writes: power.env_writes.clone(),
+        rich_shortcuts: artifacts
+            .shortcuts
+            .iter()
+            .filter(|s| power.shortcuts.iter().any(|rich| rich.name == s.label))
+            .map(|s| s.label.clone())
+            .collect(),
     }
 }
 
@@ -366,6 +478,20 @@ pub struct InstallRequest {
     /// the wizard passes `None` and carries the user's choice in
     /// `options_override` instead.
     pub start_at_login: Option<bool>,
+    /// Component selection for this install (v6): `Some(ids)` is the
+    /// explicit full selection (required components and the primary
+    /// exe's component are force-included at resolution); `None` =
+    /// the default selection — the previous install's choices on an
+    /// upgrade, else the manifest defaults.
+    pub components: Option<Vec<String>>,
+    /// Component ids to leave out of the default selection (v6; the
+    /// CLI's `--without`).
+    pub without_components: Vec<String>,
+    /// The uninstall confirmation's data-purge default to record in
+    /// the receipt (v7; set from an answer file's
+    /// `purgeDataOnUninstall`). A default only: silent uninstalls
+    /// still never purge without `--purge-data`.
+    pub purge_data_default: bool,
 }
 
 /// One progress update during extraction.
@@ -399,6 +525,19 @@ pub struct InstallOutcome {
     /// The start-at-login Run entry was applied (journaled in the
     /// receipt; Windows only — always false off Windows).
     pub start_at_login_applied: bool,
+    /// Component ids this install installed (v6; empty for pre-v6
+    /// packages).
+    pub components_installed: Vec<String>,
+    /// Every hook that ran (v6), in run order.
+    pub hook_results: Vec<HookRunRecord>,
+    /// Registry values the install wrote (v6; Windows only — always 0
+    /// off Windows, where the writes are an honest no-op).
+    pub registry_writes_applied: usize,
+    /// Environment variables the install wrote (v6; Windows only).
+    pub env_writes_applied: usize,
+    /// Taskbar pin outcomes for rich shortcuts that asked for one
+    /// (v6) — "pinned" or "unavailable", never a failure.
+    pub pins: Vec<PinRecord>,
 }
 
 /// Performs the install described by the module docs with default
@@ -422,7 +561,7 @@ pub fn perform_install_with(
 ) -> Result<InstallOutcome, String> {
     let file =
         File::open(exe_path).map_err(|e| format!("cannot open {}: {e}", exe_path.display()))?;
-    let (manifest, records, package_options) = OverlayReader::read_package(file)
+    let (manifest, records, package_options, power) = OverlayReader::read_package_full(file)
         .map_err(|e| format!("cannot read package: {e}"))?
         .ok_or_else(|| "this executable carries no SeanPak overlay".to_string())?;
     let mut options = request.options_override.unwrap_or(package_options);
@@ -453,14 +592,59 @@ pub fn perform_install_with(
     }
     let mode = mode_name(&detected, &manifest.app_version(), request.repair);
 
+    // Component selection (v6), resolved before anything is touched:
+    // an explicit selection wins; otherwise the previous install's
+    // choices are the default on upgrade, else the manifest defaults.
+    // An invalid selection (unknown id, leaving out a required part)
+    // refuses here, before any change.
+    let previous_receipt = read_receipt(dest).filter(|r| r.app == manifest.app_name());
+    let previous_selection = previous_receipt
+        .as_ref()
+        .map(|r| (r.components.as_slice(), r.components_known.as_slice()));
+    let primary_rel_for_selection = records
+        .get(manifest.primary_exe_index as usize)
+        .map(|r| r.relative_path())
+        .unwrap_or_default();
+    let selection = power.resolve_selection(
+        request.components.as_deref(),
+        &request.without_components,
+        previous_selection,
+        &records,
+        if primary_rel_for_selection.is_empty() {
+            None
+        } else {
+            Some(primary_rel_for_selection.as_str())
+        },
+    )?;
+    // Record indexes the selection installs, in record order.
+    let selected_indices: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            selection
+                .iter()
+                .any(|id| id == &power.component_id_for_file(&r.relative_path()))
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    let selected_total_bytes: u64 = selected_indices
+        .iter()
+        .map(|&idx| records[idx].file_size)
+        .sum();
+
     // Hash the payloads up front (decompressing as needed): the
     // pre-install damage scan and the receipt both use these hashes.
+    // (All records are hashed: payload lengths derive from the full
+    // record list's offsets, and the cost is one pass either way.)
     let payload_hashes = payload_hashes(exe_path, &records)?;
 
-    // Repair evidence: which existing targets are missing or damaged.
+    // Repair evidence: which existing targets (of the components
+    // being installed) are missing or damaged.
     let mut restored_files = 0usize;
     if detected != DetectedInstall::None {
-        for (record, want) in records.iter().zip(&payload_hashes) {
+        for &idx in &selected_indices {
+            let record = &records[idx];
+            let want = &payload_hashes[idx];
             let rel = record.relative_path().replace('\\', "/");
             if rel.is_empty() || rel.contains("..") {
                 continue;
@@ -479,9 +663,35 @@ pub fn perform_install_with(
     // anything is touched — never midway through extraction.
     ensure_location_writable(dest, &manifest.app_name(), &options.install_location())?;
 
+    // Pre-install hooks (v6): after the writability verdict, before
+    // the journal and any file change, running from the installer's
+    // own folder. A repair run skips this phase (post-install hooks
+    // still run — the documented rule). An abort-policy failure stops
+    // here: nothing has changed yet, so there is nothing to roll back.
+    let mut hook_records: Vec<HookRunRecord> = Vec::new();
+    if mode != "repair" && !power.pre_hooks.is_empty() {
+        let installer_dir = exe_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let (records_run, failure) = crate::hooks::run_hooks(
+            "preInstall",
+            &power.pre_hooks,
+            &installer_dir,
+            dest,
+            &manifest.app_name(),
+            &manifest.app_version(),
+        );
+        hook_records.extend(records_run);
+        if let Some(failure) = failure {
+            return Err(failure.message);
+        }
+    }
+
     let mut tx =
         TransactionRollbackLog::new().map_err(|e| format!("cannot start rollback journal: {e}"))?;
-    for record in &records {
+    for &idx in &selected_indices {
+        let record = &records[idx];
         let rel = record.relative_path().replace('\\', "/");
         if rel.is_empty() || rel.contains("..") {
             continue; // extraction itself validates and rejects escapes
@@ -497,8 +707,11 @@ pub fn perform_install_with(
     tx.snapshot_file_before_write(&receipt_file)
         .map_err(|e| format!("cannot snapshot receipt: {e}"))?;
 
-    // Extraction with progress + cancellation.
-    let total_bytes = manifest.total_uncompressed_bytes;
+    // Extraction with progress + cancellation — only the selected
+    // components' files (v6); for pre-v6 packages the selection is
+    // just `core`, which owns everything.
+    let total_bytes = selected_total_bytes;
+    let selected_count = selected_indices.len();
     let mut bytes_done: u64 = 0;
     let mut current_size: u64 = 0;
     let extract_result = {
@@ -512,7 +725,7 @@ pub fn perform_install_with(
             if let Some(sink) = progress.as_deref_mut() {
                 sink(&ProgressEvent {
                     file_index: _idx,
-                    file_count: records.len(),
+                    file_count: selected_count,
                     rel_path: rel.to_string(),
                     file_size: current_size,
                     bytes_done,
@@ -526,7 +739,18 @@ pub fn perform_install_with(
         };
         let file =
             File::open(exe_path).map_err(|e| format!("cannot open {}: {e}", exe_path.display()))?;
-        OverlayReader::extract_with_control(file, dest, &mut control)
+        let selection_ref = &selection;
+        let power_ref = &power;
+        OverlayReader::extract_selected_with_control(
+            file,
+            dest,
+            &|record: &FileRecordHeader| {
+                selection_ref
+                    .iter()
+                    .any(|id| id == &power_ref.component_id_for_file(&record.relative_path()))
+            },
+            &mut control,
+        )
     };
     let written = match extract_result {
         Ok(w) => w,
@@ -562,33 +786,80 @@ pub fn perform_install_with(
         }
     };
 
-    // System artifacts (shortcuts / associations / PATH). Their removal
-    // is registered as a rollback hook before anything else can fail.
+    // System artifacts (shortcuts / associations / PATH), then the
+    // journaled registry + environment writes (v6). Their removal is
+    // registered as one rollback hook before anything else can fail.
     let primary_rel = records
         .get(manifest.primary_exe_index as usize)
         .map(|r| r.relative_path());
-    let plan = plan_artifacts(&options, &manifest.app_name(), dest, primary_rel.as_deref());
-    let applied = match apply_artifacts(&plan, &manifest.app_name(), dest) {
+    let plan = plan_artifacts(
+        &options,
+        &manifest.app_name(),
+        dest,
+        primary_rel.as_deref(),
+        &power,
+        Some(&selection),
+    );
+    let mut applied = match apply_artifacts(&plan, &manifest.app_name(), dest) {
         Ok(applied) => applied,
         Err(e) => {
             tx.rollback();
             return Err(e);
         }
     };
+    match crate::writes::apply_writes(&power) {
+        Ok((reg_records, env_records)) => {
+            applied.registry_writes = reg_records;
+            applied.env_writes = env_records;
+        }
+        Err(e) => {
+            // Undo the artifacts by hand: the rollback hook is not
+            // registered yet at this point.
+            remove_artifacts(&applied);
+            tx.rollback();
+            return Err(e);
+        }
+    }
     let shortcuts_created = applied.shortcuts.len();
     let associations_applied = applied.associations.len();
     let path_entry_added = applied.path_segment_added.is_some();
     let start_at_login_applied = applied.start_at_login.is_some();
+    let registry_writes_applied = applied.registry_writes.len();
+    let env_writes_applied = applied.env_writes.len();
+    let pins = applied.pins.clone();
     if !applied.shortcuts.is_empty()
         || !applied.associations.is_empty()
         || path_entry_added
         || start_at_login_applied
+        || !applied.registry_writes.is_empty()
+        || !applied.env_writes.is_empty()
     {
         let journal = applied.clone();
         tx.record_rollback_hook(move || remove_artifacts(&journal));
     }
 
-    // Receipt — the record this install leaves behind.
+    // Post-install hooks (v6): after files, artifacts, and writes,
+    // before the receipt is finalized; they run from the install
+    // folder. An abort-policy failure rolls the whole install back.
+    if !power.post_hooks.is_empty() {
+        let (records_run, failure) = crate::hooks::run_hooks(
+            "postInstall",
+            &power.post_hooks,
+            dest,
+            dest,
+            &manifest.app_name(),
+            &manifest.app_version(),
+        );
+        hook_records.extend(records_run);
+        if let Some(failure) = failure {
+            tx.rollback();
+            return Err(failure.message);
+        }
+    }
+
+    // Receipt — the record this install leaves behind. Its file list
+    // is exactly the payloads this install wrote (the selected
+    // components), so the uninstall removes exactly those.
     let receipt = InstallReceipt {
         app: manifest.app_name(),
         version: manifest.app_version(),
@@ -597,13 +868,12 @@ pub fn perform_install_with(
         installed_at_unix: InstallReceipt::now_unix(),
         mode: mode.clone(),
         previous_version: previous_version.clone(),
-        files: records
+        files: selected_indices
             .iter()
-            .zip(&payload_hashes)
-            .map(|(record, hash)| ReceiptFile {
-                path: record.relative_path(),
-                size: record.file_size,
-                sha256: hash.clone(),
+            .map(|&idx| ReceiptFile {
+                path: records[idx].relative_path(),
+                size: records[idx].file_size,
+                sha256: payload_hashes[idx].clone(),
             })
             .collect(),
         desktop_shortcut: options.wants_desktop_shortcut(),
@@ -614,10 +884,14 @@ pub fn perform_install_with(
         launch_after_install_offered: options.offers_launch_after_install(),
         launch_after_install_default: options.launch_after_install_default_checked(),
         start_at_login: options.start_at_login_chosen(),
+        purge_data_default: request.purge_data_default,
         data_dirs: crate::uninstall::resolve_data_dirs(&options.data_dirs(), dest)
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
+        components: selection.clone(),
+        components_known: power.part_ids(power.has_core_files(&records)),
+        hooks: hook_records.clone(),
         artifacts: applied,
     };
     let receipt_path = match receipt.write_to(dest) {
@@ -667,6 +941,11 @@ pub fn perform_install_with(
         associations_applied,
         path_entry_added,
         start_at_login_applied,
+        components_installed: selection,
+        hook_results: hook_records,
+        registry_writes_applied,
+        env_writes_applied,
+        pins,
     })
 }
 
@@ -715,9 +994,16 @@ fn payload_hashes(exe_path: &Path, records: &[FileRecordHeader]) -> Result<Vec<S
 pub fn read_own_package(
     exe_path: &Path,
 ) -> Result<(OverlayManifestHeader, Vec<FileRecordHeader>, InstallOptions), String> {
+    let (manifest, records, options, _power) = read_own_package_full(exe_path)?;
+    Ok((manifest, records, options))
+}
+
+/// [`read_own_package`] plus the package's v6 power block (empty for
+/// pre-v6 packages).
+pub fn read_own_package_full(exe_path: &Path) -> Result<crate::overlay::PackageFull, String> {
     let file =
         File::open(exe_path).map_err(|e| format!("cannot open {}: {e}", exe_path.display()))?;
-    OverlayReader::read_package(file)
+    OverlayReader::read_package_full(file)
         .map_err(|e| format!("cannot read package: {e}"))?
         .ok_or_else(|| "this executable carries no SeanPak overlay".to_string())
 }
@@ -753,12 +1039,20 @@ fn write_uninstall_entry(
             uninstaller.display(),
             dest.display()
         );
-        let values: [(&str, String); 5] = [
+        // The Modify button (v7): Windows Settings shows it because
+        // ModifyPath is present and NoModify is not set.
+        let modify_string = format!(
+            "\"{}\" --modify --to \"{}\"",
+            uninstaller.display(),
+            dest.display()
+        );
+        let values: [(&str, String); 6] = [
             ("DisplayName", app_name.clone()),
             ("DisplayVersion", manifest.app_version()),
             ("Publisher", manifest.publisher()),
             ("InstallLocation", dest.to_string_lossy().into_owned()),
             ("UninstallString", uninstall_string),
+            ("ModifyPath", modify_string),
         ];
         let mut first_error = 0u32;
         for (name, value) in &values {
@@ -767,9 +1061,15 @@ fn write_uninstall_entry(
                 first_error = rc;
             }
         }
-        for name in ["NoModify", "NoRepair"] {
+        // NoRepair is set (SeanPak has no separate repair entry —
+        // reinstalling repairs); NoModify is deliberately NOT set, so
+        // the Modify button shows for the ModifyPath above.
+        {
             let one: u32 = 1;
-            let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide_name: Vec<u16> = "NoRepair"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let rc = RegSetValueExW(
                 hkey,
                 wide_name.as_ptr(),
@@ -822,6 +1122,17 @@ fn write_uninstall_entry(
     _uninstaller: &Path,
 ) -> Result<bool, String> {
     Ok(false)
+}
+
+/// Rewrites an existing install's ARP entry from the package (used by
+/// Modify mode, so an install made before ModifyPath existed gains
+/// the Modify button). Returns whether the entry was written
+/// (Windows only; false elsewhere).
+pub fn refresh_uninstall_entry(
+    manifest: &OverlayManifestHeader,
+    dest: &Path,
+) -> Result<bool, String> {
+    write_uninstall_entry(manifest, dest, &dest.join("Uninstall.exe"))
 }
 
 #[cfg(test)]
@@ -1076,8 +1387,17 @@ mod tests {
         let (manifest, records, options) = read_own_package(&setup).unwrap();
 
         // A writable destination plans clean, with no suggestion.
+        let stream_len = std::fs::metadata(&setup).map(|m| m.len()).unwrap_or(0);
         let good_dest = root.join("installed");
-        let plan = plan_install(&manifest, &records, &options, &good_dest);
+        let plan = plan_install(
+            &manifest,
+            &records,
+            &options,
+            &good_dest,
+            &PowerSpec::default(),
+            &[crate::overlay::CORE_COMPONENT_ID.to_string()],
+            stream_len,
+        );
         assert!(plan.location_writable);
         assert!(plan.suggested_location.is_none());
 
@@ -1087,7 +1407,15 @@ mod tests {
         let blocker = root.join("blocker.bin");
         std::fs::write(&blocker, b"file").unwrap();
         let bad_dest = blocker.join("sub");
-        let plan = plan_install(&manifest, &records, &options, &bad_dest);
+        let plan = plan_install(
+            &manifest,
+            &records,
+            &options,
+            &bad_dest,
+            &PowerSpec::default(),
+            &[crate::overlay::CORE_COMPONENT_ID.to_string()],
+            stream_len,
+        );
         assert!(!plan.location_writable);
         let suggestion = plan.suggested_location.expect("a suggestion is offered");
         assert!(suggestion.ends_with("Life App"), "{}", suggestion.display());

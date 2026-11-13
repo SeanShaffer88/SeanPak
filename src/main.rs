@@ -27,6 +27,7 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_BAD_MANIFEST: i32 = 3;
 const EXIT_IO: i32 = 4;
 const EXIT_INSTALL: i32 = 5;
+const EXIT_DIFFERENT: i32 = 6;
 // (1 remains the generic GUI/startup failure used by the window paths.)
 
 fn json_mode(args: &[String]) -> bool {
@@ -88,6 +89,28 @@ fn print_usage() {
          \x20 seanpak.exe schema                   Print the JSON Schema for the app manifest\n\
          \x20 seanpak.exe validate <manifest.json> [--json]\n\
          \x20                                      Check a manifest before packing with it\n\
+         \x20 seanpak.exe init <dir> [--name <App>] [--force] [--json]\n\
+         \x20                                      Scaffold a starter manifest.json (primary\n\
+         \x20                                      exe detected, power blocks as inert\n\
+         \x20                                      examples) + a PACKAGING.md stub in a\n\
+         \x20                                      project folder. The generated manifest is\n\
+         \x20                                      validated before init reports success;\n\
+         \x20                                      an existing manifest is kept unless --force\n\
+         \x20 seanpak.exe inspect <Setup.exe> [--json]\n\
+         \x20                                      Report a package: identity, options,\n\
+         \x20                                      components with packed sizes, hooks,\n\
+         \x20                                      writes, shortcuts, per-file sizes and\n\
+         \x20                                      compression\n\
+         \x20 seanpak.exe diff <A.exe> <B.exe> [--json]\n\
+         \x20                                      Compare two packages: files added,\n\
+         \x20                                      removed, or changed by content hash,\n\
+         \x20                                      plus option/component deltas. Exit 0 =\n\
+         \x20                                      identical, 6 = differences found,\n\
+         \x20                                      3 = a package could not be read\n\
+         \x20 seanpak.exe answers-template <Setup.exe> [--json]\n\
+         \x20                                      Print an answer-file template with the\n\
+         \x20                                      package's defaults filled in (edit it,\n\
+         \x20                                      then --install --answers <file>)\n\
          \n\
          MORE COMMANDS:\n\
          \x20 seanpak.exe                          Launch the packager GUI (secondary surface)\n\
@@ -101,6 +124,13 @@ fn print_usage() {
          \x20 seanpak.exe --install [--to <dir>] [--dry-run] [--json] [--silent|--headless]\n\
          \x20                                      [--repair] [--force] [--launch]\n\
          \x20                                      [--start-at-login|--no-start-at-login]\n\
+         \x20                                      [--components <id,id>] [--without <id,id>]\n\
+         \x20                                      [--answers <file.json>]\n\
+         \x20                                      --answers presets the install from an\n\
+         \x20                                      answer file (location, options,\n\
+         \x20                                      components); explicit flags still win\n\
+         \x20                                      over the file, and a malformed file is a\n\
+         \x20                                      usage error (exit 2) naming the field\n\
          \x20                                      Install this executable's own overlay: the\n\
          \x20                                      same operation the wizard's Install button\n\
          \x20                                      runs (extract + Uninstall.exe + uninstall\n\
@@ -121,12 +151,30 @@ fn print_usage() {
          \x20                                      explicit opt-in; headless installs never\n\
          \x20                                      launch by default). Default destination:\n\
          \x20                                      a folder named after the app, next to the exe\n\
+         \x20 seanpak.exe --modify [--to <dir>] [--dry-run] [--json] [--silent|--headless]\n\
+         \x20                                      [--components <id,id>] [--without <id,id>]\n\
+         \x20                                      [--start-at-login|--no-start-at-login]\n\
+         \x20                                      [--desktop-shortcut|--no-desktop-shortcut]\n\
+         \x20                                      [--start-menu-shortcut|--no-start-menu-shortcut]\n\
+         \x20                                      [--path-entry|--no-path-entry]\n\
+         \x20                                      Change an existing install in place:\n\
+         \x20                                      add/remove components, flip the\n\
+         \x20                                      shortcut / association / PATH /\n\
+         \x20                                      start-at-login choices, rewrite the\n\
+         \x20                                      receipt. The pre-modify state is\n\
+         \x20                                      snapshotted first; any failure rolls\n\
+         \x20                                      back to it. With no option flags and a\n\
+         \x20                                      console attached, opens the wizard in\n\
+         \x20                                      Modify mode instead. The Add/Remove\n\
+         \x20                                      Programs Modify button runs this too\n\
          \x20 seanpak.exe --uninstall [--to <dir>] [--json] [--purge-data]\n\
          \x20                                      Remove an installed app: deletes its payload\n\
          \x20                                      files, its uninstall entry, the journaled\n\
          \x20                                      shortcuts/associations/PATH segment/\n\
          \x20                                      start-at-login entry recorded in\n\
-         \x20                                      seanpak-receipt.json, and the receipt.\n\
+         \x20                                      seanpak-receipt.json, restores the registry\n\
+         \x20                                      and environment values the install replaced\n\
+         \x20                                      (v6 power packages), and deletes the receipt.\n\
          \x20                                      Interactive runs first show a confirmation\n\
          \x20                                      window with an opt-in checkbox to also\n\
          \x20                                      delete the app's recorded data folders.\n\
@@ -140,7 +188,8 @@ fn print_usage() {
          \n\
          EXIT CODES: 0 success · 1 generic/GUI failure · 2 usage error ·\n\
          3 bad or missing manifest/overlay · 4 I/O failure (including a refused\n\
-         overwrite) · 5 install failed (destination rolled back).\n\
+         overwrite) · 5 install failed (destination rolled back) · 6 differences\n\
+         found (diff only).\n\
          \n\
          A built native installer is this same executable with a payload overlay:\n\
          running it with no arguments opens the SeanPak installer wizard."
@@ -156,6 +205,18 @@ fn flag_value(args: &[String], names: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+/// A comma-separated flag value as a list of trimmed, non-empty
+/// items (`--components extras,engine`).
+fn flag_list(args: &[String], names: &[&str]) -> Option<Vec<String>> {
+    flag_value(args, names).map(|value| {
+        value
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect()
+    })
 }
 
 fn has_flag(args: &[String], names: &[&str]) -> bool {
@@ -178,6 +239,13 @@ fn own_overlay_package() -> Option<(OverlayManifestHeader, Vec<FileRecordHeader>
     let exe = std::env::current_exe().ok()?;
     let file = File::open(exe).ok()?;
     OverlayReader::read_package(file).ok()?
+}
+
+/// [`own_overlay_package`] plus the package's v6 power block.
+fn own_overlay_package_full() -> Option<seanpak::overlay::PackageFull> {
+    let exe = std::env::current_exe().ok()?;
+    let file = File::open(exe).ok()?;
+    OverlayReader::read_package_full(file).ok()?
 }
 
 fn sanitize_folder_name(name: &str) -> String {
@@ -252,18 +320,39 @@ fn run_install(args: &[String]) -> i32 {
             )
         }
     };
-    let (manifest, records, options) = match install::read_own_package(&exe) {
+    let (manifest, records, options, power) = match install::read_own_package_full(&exe) {
         Ok(pkg) => pkg,
         Err(e) => return fail(args, "install", EXIT_BAD_MANIFEST, &e),
     };
+    // Answer file (v7): an explicit preset for this run. A malformed
+    // file is a usage error naming the field, reported before
+    // anything else happens. Priority: explicit CLI flags > answer
+    // file > package defaults.
+    let answers = match flag_value(args, &["--answers"]) {
+        Some(path) => match seanpak::answers::load_answers(Path::new(&path)) {
+            Ok(a) => Some(a),
+            Err(errors) => {
+                return fail(
+                    args,
+                    "install",
+                    EXIT_USAGE,
+                    &format!("invalid answers file {path}: {}", errors.join("; ")),
+                )
+            }
+        },
+        None => None,
+    };
     let dest = match flag_value(args, &["--to"]) {
         Some(dir) => PathBuf::from(dir),
-        None => {
-            let app = own_overlay_app_name().unwrap_or_else(|| "App".to_string());
-            exe.parent()
-                .map(|p| p.join(sanitize_folder_name(&app)))
-                .unwrap_or_else(|| PathBuf::from(sanitize_folder_name(&app)))
-        }
+        None => match answers.as_ref().and_then(|a| a.install_location.clone()) {
+            Some(location) => PathBuf::from(location),
+            None => {
+                let app = own_overlay_app_name().unwrap_or_else(|| "App".to_string());
+                exe.parent()
+                    .map(|p| p.join(sanitize_folder_name(&app)))
+                    .unwrap_or_else(|| PathBuf::from(sanitize_folder_name(&app)))
+            }
+        },
     };
     // The start-at-login CLI flags override the package's recorded
     // choice for this run (the dry-run plan reflects them too).
@@ -275,11 +364,51 @@ fn run_install(args: &[String]) -> i32 {
         None
     };
     let mut options = options;
+    if let Some(a) = &answers {
+        a.apply_to_options(&mut options);
+    }
     if let Some(choice) = start_at_login_override {
         options.start_at_login = 1;
         options.start_at_login_default = choice as u8;
     }
-    let plan = install::plan_install(&manifest, &records, &options, &dest);
+    // Component selection (v6): --components is the explicit full
+    // selection, --without trims the default. The plan and the dry
+    // run reflect the same resolution the install will use; an
+    // invalid selection is a usage error, reported before anything
+    // else happens. The answer file's selection fills in when the
+    // flags are absent; its trims merge with the flag's.
+    let components_flag = flag_list(args, &["--components"])
+        .or_else(|| answers.as_ref().and_then(|a| a.components.clone()));
+    let mut without_list = flag_list(args, &["--without"]).unwrap_or_default();
+    if let Some(a) = &answers {
+        for id in &a.without_components {
+            if !without_list.contains(id) {
+                without_list.push(id.clone());
+            }
+        }
+    }
+    let previous_receipt =
+        seanpak::receipt::read_receipt(&dest).filter(|r| r.app == manifest.app_name());
+    let previous_selection = previous_receipt
+        .as_ref()
+        .map(|r| (r.components.as_slice(), r.components_known.as_slice()));
+    let primary_rel = records
+        .get(manifest.primary_exe_index as usize)
+        .map(|r| r.relative_path());
+    let selection = match power.resolve_selection(
+        components_flag.as_deref(),
+        &without_list,
+        previous_selection,
+        &records,
+        primary_rel.as_deref(),
+    ) {
+        Ok(selection) => selection,
+        Err(e) => return fail(args, "install", EXIT_USAGE, &e),
+    };
+    let stream_len = std::fs::metadata(&exe).map(|m| m.len()).unwrap_or(0);
+    let plan = install::plan_install(
+        &manifest, &records, &options, &dest, &power, &selection, stream_len,
+    );
 
     if has_flag(args, &["--dry-run"]) {
         diag::record(
@@ -330,6 +459,78 @@ fn run_install(args: &[String]) -> i32 {
                 ),
                 ("pathEntry", JsonValue::Bool(plan.path_entry)),
                 ("startAtLogin", JsonValue::Bool(plan.start_at_login)),
+                (
+                    "components",
+                    JsonValue::Array(
+                        plan.components
+                            .iter()
+                            .map(|c| {
+                                jobj(vec![
+                                    ("id", jstr(c.id.clone())),
+                                    ("name", jstr(c.name.clone())),
+                                    ("required", JsonValue::Bool(c.required)),
+                                    ("selected", JsonValue::Bool(c.selected)),
+                                    ("packedSize", jnum(c.packed_size)),
+                                    ("fileCount", jnum(c.file_count as u64)),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "hooks",
+                    JsonValue::Array(
+                        plan.hooks
+                            .iter()
+                            .map(|(phase, command)| {
+                                jobj(vec![
+                                    ("phase", jstr(phase.clone())),
+                                    ("command", jstr(command.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "registryWrites",
+                    JsonValue::Array(
+                        plan.registry_writes
+                            .iter()
+                            .map(|w| {
+                                jobj(vec![
+                                    ("key", jstr(w.key.clone())),
+                                    ("name", jstr(w.name.clone())),
+                                    ("type", jstr(w.kind.as_str())),
+                                    ("value", jstr(w.value.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "envWrites",
+                    JsonValue::Array(
+                        plan.env_writes
+                            .iter()
+                            .map(|w| {
+                                jobj(vec![
+                                    ("name", jstr(w.name.clone())),
+                                    ("value", jstr(w.value.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "richShortcuts",
+                    JsonValue::Array(
+                        plan.rich_shortcuts
+                            .iter()
+                            .map(|s| jstr(s.clone()))
+                            .collect(),
+                    ),
+                ),
+                ("answersApplied", JsonValue::Bool(answers.is_some())),
                 ("locationWritable", JsonValue::Bool(plan.location_writable)),
                 (
                     "suggestedLocation",
@@ -366,6 +567,33 @@ fn run_install(args: &[String]) -> i32 {
             }
             if plan.start_at_login {
                 println!("  + start-at-login entry for the app");
+            }
+            for component in &plan.components {
+                if component.selected {
+                    println!(
+                        "  + part \"{}\" ({} bytes packed, {} files)",
+                        component.name, component.packed_size, component.file_count
+                    );
+                } else {
+                    println!("  - part \"{}\" not selected", component.name);
+                }
+            }
+            for (phase, command) in &plan.hooks {
+                println!("  hook {phase}: {command} (listed only — a dry run never runs hooks)");
+            }
+            for write in &plan.registry_writes {
+                println!(
+                    "  + registry value HKCU\\{}{}",
+                    write.key,
+                    if write.name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\\{}", write.name)
+                    }
+                );
+            }
+            for write in &plan.env_writes {
+                println!("  + environment variable {}", write.name);
             }
             if !plan.location_writable {
                 match &plan.suggested_location {
@@ -418,17 +646,37 @@ fn run_install(args: &[String]) -> i32 {
     }
 
     let request = install::InstallRequest {
-        options_override: None,
+        // With an answer file, the preset's option choices drive the
+        // real install (not just the plan above): hand the operation
+        // the answers-applied options. Without one, the package's own
+        // recorded options stay in charge, as before.
+        options_override: if answers.is_some() {
+            Some(options)
+        } else {
+            None
+        },
         force: has_flag(args, &["--force"]),
         repair: has_flag(args, &["--repair"]),
         start_at_login: start_at_login_override,
+        components: components_flag.clone(),
+        without_components: without_list.clone(),
+        purge_data_default: answers
+            .as_ref()
+            .map(|a| a.purge_data_on_uninstall)
+            .unwrap_or(false),
     };
     match install::perform_install_with(&exe, &dest, &request, None, None) {
         Ok(outcome) => {
             // --launch is an explicit headless opt-in (headless installs
-            // never launch by default). A launch failure is a warning
-            // in the report, never an install failure.
-            let launch_requested = has_flag(args, &["--launch"]);
+            // never launch by default); an answer file's
+            // launchAfterInstall: true is the same explicit opt-in. A
+            // launch failure is a warning in the report, never an
+            // install failure.
+            let launch_requested = has_flag(args, &["--launch"])
+                || answers
+                    .as_ref()
+                    .and_then(|a| a.launch_after_install)
+                    .unwrap_or(false);
             let mut launch_performed = false;
             let mut launch_error: Option<String> = None;
             if launch_requested {
@@ -495,6 +743,65 @@ fn run_install(args: &[String]) -> i32 {
                     ),
                     ("launchRequested", JsonValue::Bool(launch_requested)),
                     ("launchPerformed", JsonValue::Bool(launch_performed)),
+                    (
+                        "componentsInstalled",
+                        JsonValue::Array(
+                            outcome
+                                .components_installed
+                                .iter()
+                                .map(|c| jstr(c.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "hooks",
+                        JsonValue::Array(
+                            outcome
+                                .hook_results
+                                .iter()
+                                .map(|h| {
+                                    jobj(vec![
+                                        ("phase", jstr(h.phase.clone())),
+                                        ("command", jstr(h.command.clone())),
+                                        (
+                                            "args",
+                                            JsonValue::Array(
+                                                h.args.iter().map(|a| jstr(a.clone())).collect(),
+                                            ),
+                                        ),
+                                        (
+                                            "exitCode",
+                                            h.exit_code
+                                                .map(|n| JsonValue::Number(n as f64))
+                                                .unwrap_or(JsonValue::Null),
+                                        ),
+                                        ("onFailure", jstr(h.on_failure.clone())),
+                                        ("succeeded", JsonValue::Bool(h.succeeded)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "registryWritesApplied",
+                        jnum(outcome.registry_writes_applied as u64),
+                    ),
+                    ("envWritesApplied", jnum(outcome.env_writes_applied as u64)),
+                    (
+                        "pins",
+                        JsonValue::Array(
+                            outcome
+                                .pins
+                                .iter()
+                                .map(|p| {
+                                    jobj(vec![
+                                        ("name", jstr(p.name.clone())),
+                                        ("outcome", jstr(p.outcome.clone())),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
                 ];
                 if let Some(e) = &launch_error {
                     pairs.push(("launchError", jstr(e.clone())));
@@ -514,6 +821,46 @@ fn run_install(args: &[String]) -> i32 {
                 println!("Receipt: {}", outcome.receipt_path.display());
                 if outcome.start_at_login_applied {
                     println!("Start at login: on (per-user Run entry).");
+                }
+                if !outcome.components_installed.is_empty() {
+                    println!(
+                        "Parts installed: {}",
+                        outcome.components_installed.join(", ")
+                    );
+                }
+                if outcome.registry_writes_applied > 0 {
+                    println!(
+                        "Registry values written: {} (recorded in the receipt; uninstall restores what was there).",
+                        outcome.registry_writes_applied
+                    );
+                }
+                if outcome.env_writes_applied > 0 {
+                    println!(
+                        "Environment variables set: {} (recorded in the receipt; uninstall restores what was there).",
+                        outcome.env_writes_applied
+                    );
+                }
+                for pin in &outcome.pins {
+                    if pin.outcome == "pinned" {
+                        println!("Pinned \"{}\" to the taskbar.", pin.name);
+                    } else {
+                        println!(
+                            "Note: \"{}\" could not be pinned to the taskbar (Windows did not allow it); the shortcut itself was created.",
+                            pin.name
+                        );
+                    }
+                }
+                for hook in &outcome.hook_results {
+                    if !hook.succeeded {
+                        eprintln!(
+                            "[WARN] The {} command \"{}\" failed ({}); the install continued because its failure policy is \"continue\". The failure is recorded in the receipt.",
+                            hook.phase,
+                            hook.command,
+                            hook.exit_code
+                                .map(|c| format!("exit code {c}"))
+                                .unwrap_or_else(|| "could not start".to_string())
+                        );
+                    }
                 }
                 if launch_performed {
                     println!("Launched {}.", plan.app_name);
@@ -572,15 +919,29 @@ fn run_uninstall(args: &[String]) -> i32 {
     };
 
     // The confirmation window lists the data folders the install
-    // receipt recorded; read them before anything is deleted.
-    let recorded_data_dirs: Vec<PathBuf> = seanpak::receipt::read_receipt(&dest)
+    // receipt recorded; read them before anything is deleted. The
+    // receipt also carries the data-purge checkbox's starting state
+    // (v7: set at install time by an answer file's
+    // purgeDataOnUninstall) — the user still decides in the window;
+    // silent runs still require the explicit --purge-data flag.
+    let receipt = seanpak::receipt::read_receipt(&dest);
+    let recorded_data_dirs: Vec<PathBuf> = receipt
+        .as_ref()
         .map(|r| r.data_dirs.iter().map(PathBuf::from).collect())
         .unwrap_or_default();
+    let purge_default = receipt
+        .as_ref()
+        .map(|r| r.purge_data_default)
+        .unwrap_or(false);
 
     let mut purge_data = has_flag(args, &["--purge-data"]);
     let interactive = !quiet_mode(args) && !json_mode(args);
     if interactive && !purge_data {
-        match seanpak::wizard::confirm_uninstall(&manifest.app_name(), &recorded_data_dirs) {
+        match seanpak::wizard::confirm_uninstall(
+            &manifest.app_name(),
+            &recorded_data_dirs,
+            purge_default,
+        ) {
             Some(purge) => purge_data = purge,
             None => {
                 println!("Uninstall cancelled; nothing was removed.");
@@ -659,12 +1020,289 @@ fn run_uninstall(args: &[String]) -> i32 {
     EXIT_OK
 }
 
-/// Bare-run mode for a built installer: opens the Design C wizard for this
-/// executable's own overlay package.
-fn run_wizard(
+/// Modify mode (v7): change an existing install in place through
+/// the shared modify operation. Destination resolution mirrors
+/// uninstall: `--to`, else the package's recorded location, else the
+/// Add/Remove Programs entry. With no option/component flags and an
+/// interactive console, main() routes to the wizard's Modify mode
+/// instead; anything flag-bearing (or `--json` / `--silent`) lands
+/// here, fully headless. `--dry-run` prints the plan and changes
+/// nothing.
+fn run_modify(args: &[String]) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            return fail(
+                args,
+                "modify",
+                EXIT_IO,
+                &format!("Cannot locate own executable: {e}"),
+            )
+        }
+    };
+    let (manifest, _records, options, _power) = match install::read_own_package_full(&exe) {
+        Ok(pkg) => pkg,
+        Err(e) => return fail(args, "modify", EXIT_BAD_MANIFEST, &e),
+    };
+    let app_name = manifest.app_name();
+    let dest = modify_dest(args, &options, &app_name);
+
+    // Option deltas from the flags, layered over the install's
+    // current state: the override the operation expects is the full
+    // new option set, which is the receipt's recorded state (via the
+    // operation's own reconstruction) with the flagged fields flipped.
+    let mut options_override: Option<InstallOptions> = None;
+    let mut edited = match seanpak::receipt::read_receipt(&dest) {
+        Some(receipt) => seanpak::modify::options_from_receipt(&options, &receipt),
+        None => options,
+    };
+    let mut any_option_flag = false;
+    let bool_flag = |args: &[String], on: &str, off: &str| -> Option<bool> {
+        if has_flag(args, &[on]) {
+            Some(true)
+        } else if has_flag(args, &[off]) {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    if let Some(on) = bool_flag(args, "--desktop-shortcut", "--no-desktop-shortcut") {
+        edited.desktop_shortcut = on as u8;
+        any_option_flag = true;
+    }
+    if let Some(on) = bool_flag(args, "--start-menu-shortcut", "--no-start-menu-shortcut") {
+        edited.start_menu_shortcut = on as u8;
+        any_option_flag = true;
+    }
+    if let Some(on) = bool_flag(args, "--path-entry", "--no-path-entry") {
+        edited.path_entry = on as u8;
+        any_option_flag = true;
+    }
+    if let Some(exts) = flag_value(args, &["--file-associations"]) {
+        seanpak::overlay::copy_str_to_fixed_pub(&mut edited.file_associations_utf8, &exts);
+        any_option_flag = true;
+    }
+    if any_option_flag {
+        options_override = Some(edited);
+    }
+    let start_at_login = if has_flag(args, &["--start-at-login"]) {
+        Some(true)
+    } else if has_flag(args, &["--no-start-at-login"]) {
+        Some(false)
+    } else {
+        None
+    };
+    let request = seanpak::modify::ModifyRequest {
+        options_override,
+        start_at_login,
+        components: flag_list(args, &["--components"]),
+        without_components: flag_list(args, &["--without"]).unwrap_or_default(),
+    };
+
+    if has_flag(args, &["--dry-run"]) {
+        return match seanpak::modify::plan_modify(&exe, &dest, &request) {
+            Ok(plan) => {
+                if json_mode(args) {
+                    print_json(&jobj(vec![
+                        ("command", jstr("modify")),
+                        ("status", jstr("dry-run")),
+                        ("app", jstr(plan.app_name.clone())),
+                        ("version", jstr(plan.package_version.clone())),
+                        ("installedVersion", jstr(plan.installed_version.clone())),
+                        ("dest", jpath(&dest)),
+                        (
+                            "componentsAdded",
+                            JsonValue::Array(
+                                plan.components_added
+                                    .iter()
+                                    .map(|c| jstr(c.clone()))
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "componentsRemoved",
+                            JsonValue::Array(
+                                plan.components_removed
+                                    .iter()
+                                    .map(|c| jstr(c.clone()))
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "componentsKept",
+                            JsonValue::Array(
+                                plan.components_kept
+                                    .iter()
+                                    .map(|c| jstr(c.clone()))
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "filesAdded",
+                            JsonValue::Array(
+                                plan.files_added
+                                    .iter()
+                                    .map(|(rel, size)| {
+                                        jobj(vec![
+                                            ("path", jstr(rel.clone())),
+                                            ("size", jnum(*size)),
+                                        ])
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "filesRemoved",
+                            JsonValue::Array(
+                                plan.files_removed.iter().map(|r| jstr(r.clone())).collect(),
+                            ),
+                        ),
+                        ("optionsBefore", modify_options_json(&plan.options_before)),
+                        ("optionsAfter", modify_options_json(&plan.options_after)),
+                        ("locationWritable", JsonValue::Bool(plan.location_writable)),
+                        (
+                            "suggestedLocation",
+                            plan.suggested_location
+                                .clone()
+                                .map(|p| jpath(&p))
+                                .unwrap_or(JsonValue::Null),
+                        ),
+                        ("changes", JsonValue::Bool(false)),
+                    ]));
+                } else {
+                    println!(
+                        "Dry run: would modify {} {} (installed: {}) at {}",
+                        plan.app_name,
+                        plan.package_version,
+                        plan.installed_version,
+                        dest.display()
+                    );
+                    for id in &plan.components_added {
+                        println!("  + part \"{id}\"");
+                    }
+                    for id in &plan.components_removed {
+                        println!("  - part \"{id}\"");
+                    }
+                    for (rel, size) in &plan.files_added {
+                        println!("  + {rel} ({size} bytes)");
+                    }
+                    for rel in &plan.files_removed {
+                        println!("  - {rel}");
+                    }
+                    println!("Nothing was changed.");
+                }
+                EXIT_OK
+            }
+            Err(e) => fail(args, "modify", EXIT_INSTALL, &e),
+        };
+    }
+
+    match seanpak::modify::perform_modify(&exe, &dest, &request, None, None) {
+        Ok(outcome) => {
+            diag::record(
+                "modify",
+                vec![
+                    ("app", jstr(app_name.clone())),
+                    ("dest", jpath(&dest)),
+                    ("filesAdded", jnum(outcome.files_added as u64)),
+                    ("filesRemoved", jnum(outcome.files_removed as u64)),
+                ],
+            );
+            if json_mode(args) {
+                print_json(&jobj(vec![
+                    ("command", jstr("modify")),
+                    ("status", jstr("ok")),
+                    ("app", jstr(app_name.clone())),
+                    ("dest", jpath(&dest)),
+                    ("filesAdded", jnum(outcome.files_added as u64)),
+                    ("filesRemoved", jnum(outcome.files_removed as u64)),
+                    (
+                        "componentsBefore",
+                        JsonValue::Array(
+                            outcome
+                                .components_before
+                                .iter()
+                                .map(|c| jstr(c.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "componentsAfter",
+                        JsonValue::Array(
+                            outcome
+                                .components_after
+                                .iter()
+                                .map(|c| jstr(c.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    ("receipt", jpath(&outcome.receipt_path)),
+                    ("shortcutsCreated", jnum(outcome.shortcuts_created as u64)),
+                    (
+                        "associationsApplied",
+                        jnum(outcome.associations_applied as u64),
+                    ),
+                    ("pathEntryAdded", JsonValue::Bool(outcome.path_entry_added)),
+                    (
+                        "startAtLoginApplied",
+                        JsonValue::Bool(outcome.start_at_login_applied),
+                    ),
+                ]));
+            } else if !quiet_mode(args) {
+                println!(
+                    "Modified {} at {}: {} file(s) added, {} removed.",
+                    app_name,
+                    dest.display(),
+                    outcome.files_added,
+                    outcome.files_removed
+                );
+                println!(
+                    "Parts now installed: {}",
+                    outcome.components_after.join(", ")
+                );
+                println!("Receipt: {}", outcome.receipt_path.display());
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            diag::record(
+                "modify",
+                vec![("status", jstr("error")), ("error", jstr(e.clone()))],
+            );
+            fail(args, "modify", EXIT_INSTALL, &e)
+        }
+    }
+}
+
+/// Where a modify acts: `--to`, else the install whose receipt sits
+/// at the package's recorded location, else the Add/Remove Programs
+/// entry's location, else the recorded location (where the operation
+/// will report the plain "nothing to modify" refusal).
+fn modify_dest(args: &[String], options: &InstallOptions, app_name: &str) -> PathBuf {
+    if let Some(dir) = flag_value(args, &["--to"]) {
+        return PathBuf::from(dir);
+    }
+    let recorded = seanpak::wizard::default_install_dir(options, app_name);
+    if seanpak::receipt::read_receipt(&recorded)
+        .map(|r| r.app == app_name)
+        .unwrap_or(false)
+    {
+        return recorded;
+    }
+    match seanpak::sysinstall::arp_install(app_name) {
+        Some((_, location)) if !location.as_os_str().is_empty() => location,
+        _ => recorded,
+    }
+}
+
+/// Bare interactive `--modify`: the wizard in Modify mode. The
+/// install must exist (receipt at the resolved destination) — the
+/// refusal is reported here, in plain words, before any window.
+fn run_wizard_modify(
     manifest: OverlayManifestHeader,
     records: Vec<FileRecordHeader>,
     options: InstallOptions,
+    power: seanpak::overlay::PowerSpec,
 ) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -673,7 +1311,410 @@ fn run_wizard(
             return 1;
         }
     };
-    let mut wizard = InstallWizard::new(manifest, records, options, exe);
+    let app_name = manifest.app_name();
+    let no_args: Vec<String> = Vec::new();
+    let dest = modify_dest(&no_args, &options, &app_name);
+    let found = seanpak::receipt::read_receipt(&dest)
+        .map(|r| r.app == app_name)
+        .unwrap_or(false);
+    if !found {
+        let message = format!(
+            "no SeanPak install of {app_name} found at {} (no install receipt there) — nothing to modify",
+            dest.display()
+        );
+        diag::record(
+            "modify",
+            vec![("status", jstr("error")), ("error", jstr(message.clone()))],
+        );
+        eprintln!("[ERROR] {message}");
+        return EXIT_INSTALL;
+    }
+    let mut wizard = InstallWizard::modify(manifest, records, options, exe, power, dest);
+    match wizard.run() {
+        Ok(()) => 0,
+        Err(err_code) => {
+            let message = format!(
+                "SeanPak could not start the Modify window (Windows error {err_code}).\n\nA diagnostic log was written to:\n{}",
+                diag::log_path().display()
+            );
+            diag::log("fatal", &message.replace('\n', " "));
+            diag::error_box("SeanPak Modify failed to start", &message);
+            err_code as i32
+        }
+    }
+}
+
+/// The before/after option summary as JSON (modify plan output).
+fn modify_options_json(summary: &seanpak::modify::ModifyOptionSummary) -> JsonValue {
+    jobj(vec![
+        ("desktopShortcut", JsonValue::Bool(summary.desktop_shortcut)),
+        (
+            "startMenuShortcut",
+            JsonValue::Bool(summary.start_menu_shortcut),
+        ),
+        ("startMenuFolder", jstr(summary.start_menu_folder.clone())),
+        (
+            "fileAssociations",
+            JsonValue::Array(
+                summary
+                    .file_associations
+                    .iter()
+                    .map(|e| jstr(e.clone()))
+                    .collect(),
+            ),
+        ),
+        ("pathEntry", JsonValue::Bool(summary.path_entry)),
+        ("startAtLogin", JsonValue::Bool(summary.start_at_login)),
+    ])
+}
+
+/// True when a `--modify` invocation carries any option/component
+/// flag (or a machine mode): those run headlessly; a bare interactive
+/// `--modify` opens the wizard's Modify mode instead.
+fn modify_is_headless(args: &[String]) -> bool {
+    if json_mode(args) || quiet_mode(args) || has_flag(args, &["--dry-run", "--to"]) {
+        return true;
+    }
+    const OPTION_FLAGS: [&str; 11] = [
+        "--components",
+        "--without",
+        "--start-at-login",
+        "--no-start-at-login",
+        "--desktop-shortcut",
+        "--no-desktop-shortcut",
+        "--start-menu-shortcut",
+        "--no-start-menu-shortcut",
+        "--path-entry",
+        "--no-path-entry",
+        "--file-associations",
+    ];
+    args.iter().any(|a| OPTION_FLAGS.contains(&a.as_str()))
+}
+
+/// `seanpak inspect <Setup.exe>`: the full package report.
+fn run_inspect(args: &[String]) -> i32 {
+    let path = match args.get(1) {
+        Some(p) if !p.starts_with('-') => PathBuf::from(p),
+        _ => {
+            return fail(
+                args,
+                "inspect",
+                EXIT_USAGE,
+                "usage: seanpak inspect <Setup.exe> [--json]",
+            )
+        }
+    };
+    match seanpak::inspect::inspect_package(&path) {
+        Ok(report) => {
+            if json_mode(args) {
+                print_json(&seanpak::inspect::inspect_json(&report));
+            } else {
+                println!(
+                    "{} {} — {}",
+                    report.app_name, report.version, report.publisher
+                );
+                println!("  package format v{}", report.manifest_version);
+                println!(
+                    "  options: location \"{}\", start menu folder \"{}\"",
+                    report.options.install_location(),
+                    report.options.start_menu_folder()
+                );
+                println!(
+                    "    desktop shortcut {}, start menu {}, PATH entry {}, associations \"{}\"",
+                    if report.options.wants_desktop_shortcut() {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    if report.options.wants_start_menu_shortcut() {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    if report.options.wants_path_entry() {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    report.options.file_associations()
+                );
+                for component in &report.power.components {
+                    println!(
+                        "  part \"{}\" — {} bytes packed, {} files{}",
+                        component.id,
+                        component.packed_size,
+                        component.files.len(),
+                        if component.default_selected {
+                            ", on by default"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                for hook in report
+                    .power
+                    .pre_hooks
+                    .iter()
+                    .chain(&report.power.post_hooks)
+                {
+                    println!("  hook: {}", seanpak::hooks::display_command(hook));
+                }
+                for write in &report.power.registry_writes {
+                    println!("  registry write: HKCU\\{}\\{}", write.key, write.name);
+                }
+                for write in &report.power.env_writes {
+                    println!("  environment write: {}", write.name);
+                }
+                for shortcut in &report.power.shortcuts {
+                    println!("  shortcut \"{}\" -> {}", shortcut.name, shortcut.target);
+                }
+                println!(
+                    "  files: {} ({} bytes, {} stored)",
+                    report.files.len(),
+                    report.total_bytes,
+                    report.total_stored_bytes
+                );
+                for f in &report.files {
+                    println!(
+                        "    {} ({} bytes, {} stored, {}, part {}){}",
+                        f.path,
+                        f.size,
+                        f.stored_size,
+                        seanpak::inspect::codec_label(f.compression),
+                        f.component,
+                        if f.is_primary { " [primary]" } else { "" }
+                    );
+                }
+            }
+            EXIT_OK
+        }
+        Err(e) => fail(args, "inspect", EXIT_BAD_MANIFEST, &e),
+    }
+}
+
+/// `seanpak diff <A> <B>`: exit 0 identical, 6 differences, 3
+/// unreadable.
+fn run_diff(args: &[String]) -> i32 {
+    let positional: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if positional.len() != 2 {
+        return fail(
+            args,
+            "diff",
+            EXIT_USAGE,
+            "usage: seanpak diff <A.exe> <B.exe> [--json]",
+        );
+    }
+    let (a, b) = (Path::new(positional[0]), Path::new(positional[1]));
+    match seanpak::inspect::diff_packages(a, b) {
+        Ok(report) => {
+            let identical = report.identical();
+            if json_mode(args) {
+                print_json(&seanpak::inspect::diff_json(&report, identical));
+            } else if identical {
+                println!("Packages are identical.");
+            } else {
+                println!("Packages differ:");
+                for (field, va, vb) in &report.identity_deltas {
+                    println!("  {field}: {va} -> {vb}");
+                }
+                for (field, va, vb) in &report.option_deltas {
+                    println!("  option {field}: {va} -> {vb}");
+                }
+                for delta in &report.power_deltas {
+                    println!("  {delta}");
+                }
+                for path in &report.files_added {
+                    println!("  + {path}");
+                }
+                for path in &report.files_removed {
+                    println!("  - {path}");
+                }
+                for path in &report.files_changed {
+                    println!("  ~ {path} (content changed)");
+                }
+            }
+            if identical {
+                EXIT_OK
+            } else {
+                EXIT_DIFFERENT
+            }
+        }
+        Err(e) => fail(args, "diff", EXIT_BAD_MANIFEST, &e),
+    }
+}
+
+/// `seanpak init <dir>`: scaffold a starter manifest + PACKAGING.md.
+fn run_init(args: &[String]) -> i32 {
+    let dir = match args.get(1) {
+        Some(p) if !p.starts_with('-') => PathBuf::from(p),
+        _ => {
+            return fail(
+                args,
+                "init",
+                EXIT_USAGE,
+                "usage: seanpak init <dir> [--name <App>] [--force] [--json]",
+            )
+        }
+    };
+    let name = flag_value(args, &["--name"]);
+    let force = has_flag(args, &["--force"]);
+    match seanpak::init::init_project(&dir, name.as_deref(), force) {
+        Ok(outcome) => {
+            diag::record(
+                "init",
+                vec![
+                    ("dir", jpath(&dir)),
+                    ("app", jstr(outcome.app_name.clone())),
+                    ("manifest", jpath(&outcome.manifest_path)),
+                ],
+            );
+            if json_mode(args) {
+                print_json(&jobj(vec![
+                    ("command", jstr("init")),
+                    ("status", jstr("ok")),
+                    ("app", jstr(outcome.app_name.clone())),
+                    ("version", jstr(outcome.version.clone())),
+                    ("manifest", jpath(&outcome.manifest_path)),
+                    (
+                        "packagingDoc",
+                        outcome
+                            .packaging_path
+                            .clone()
+                            .map(|p| jpath(&p))
+                            .unwrap_or(JsonValue::Null),
+                    ),
+                    ("filesDir", jstr(outcome.files_dir.clone())),
+                    (
+                        "primaryExe",
+                        outcome
+                            .primary_exe
+                            .clone()
+                            .map(jstr)
+                            .unwrap_or(JsonValue::Null),
+                    ),
+                    ("packCommand", jstr(outcome.pack_command.clone())),
+                ]));
+            } else if !quiet_mode(args) {
+                println!(
+                    "Initialized {} {} in {}",
+                    outcome.app_name,
+                    outcome.version,
+                    dir.display()
+                );
+                println!("  manifest: {}", outcome.manifest_path.display());
+                match &outcome.packaging_path {
+                    Some(p) => println!("  guide:    {}", p.display()),
+                    None => println!("  guide:    PACKAGING.md already existed, left as-is"),
+                }
+                match &outcome.primary_exe {
+                    Some(p) => println!("  primary executable detected: {p}"),
+                    None => println!(
+                        "  no executable found in the payload folder yet — set \"primaryExe\" in the manifest once the app is built"
+                    ),
+                }
+                println!("  pack with: {}", outcome.pack_command);
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            // Refusing to overwrite an existing manifest is the
+            // pack RefuseOverwrite shape (exit 4); a missing folder
+            // is a usage error.
+            if e.contains("already exists") {
+                fail(args, "init", EXIT_IO, &e)
+            } else if e.contains("is not a folder") {
+                fail(args, "init", EXIT_USAGE, &e)
+            } else {
+                fail(args, "init", EXIT_IO, &e)
+            }
+        }
+    }
+}
+
+/// `seanpak answers-template <Setup.exe>`: print the answer-file
+/// template for a package, defaults filled.
+fn run_answers_template(args: &[String]) -> i32 {
+    let path = match args.get(1) {
+        Some(p) if !p.starts_with('-') => PathBuf::from(p),
+        _ => {
+            return fail(
+                args,
+                "answers-template",
+                EXIT_USAGE,
+                "usage: seanpak answers-template <Setup.exe> [--json]",
+            )
+        }
+    };
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            return fail(
+                args,
+                "answers-template",
+                EXIT_IO,
+                &format!("Cannot open {}: {e}", path.display()),
+            )
+        }
+    };
+    match OverlayReader::read_package_full(file) {
+        Ok(Some((manifest, records, options, power))) => {
+            let primary_rel = records
+                .get(manifest.primary_exe_index as usize)
+                .map(|r| r.relative_path());
+            let template = seanpak::answers::answers_template(
+                &options,
+                &power,
+                &records,
+                primary_rel.as_deref(),
+            );
+            // JSON mode prints the bare template (so it can be piped
+            // straight into a file); the plain run labels it.
+            if json_mode(args) {
+                print_json(&template);
+            } else {
+                println!(
+                    "Answer-file template for {} — save as answers.json and edit:",
+                    path.display()
+                );
+                println!("{}", seanpak::studio::render_pretty(&template));
+            }
+            EXIT_OK
+        }
+        Ok(None) => fail(
+            args,
+            "answers-template",
+            EXIT_BAD_MANIFEST,
+            &format!("No SeanPak overlay found in {}", path.display()),
+        ),
+        Err(e) => fail(
+            args,
+            "answers-template",
+            EXIT_IO,
+            &format!("Failed to read {}: {e}", path.display()),
+        ),
+    }
+}
+
+/// Bare-run mode for a built installer: opens the Design E (Rail)
+/// wizard for this executable's own overlay package.
+fn run_wizard(
+    manifest: OverlayManifestHeader,
+    records: Vec<FileRecordHeader>,
+    options: InstallOptions,
+    power: seanpak::overlay::PowerSpec,
+) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[ERROR] Cannot locate own executable: {e}");
+            return 1;
+        }
+    };
+    let mut wizard = InstallWizard::new(manifest, records, options, exe, power);
     match wizard.run() {
         Ok(()) => 0,
         Err(err_code) => {
@@ -1175,6 +2216,12 @@ fn run_pack(args: &[String]) -> i32 {
                     outcome.portable.sha256
                 );
                 println!("  {}", outcome.sums_path.display());
+                for component in &outcome.components {
+                    println!(
+                        "  part {} \"{}\" — {} bytes packed, {} files",
+                        component.id, component.name, component.packed_size, component.file_count
+                    );
+                }
             }
             EXIT_OK
         }
@@ -1202,6 +2249,24 @@ fn pack_report_json(manifest: &AppManifest, outcome: &PackOutcome) -> JsonValue 
         ("fileCount", jnum(outcome.file_count as u64)),
         ("totalPayloadBytes", jnum(outcome.total_payload_bytes)),
         ("manifest", manifest.to_json_value()),
+        (
+            "components",
+            JsonValue::Array(
+                outcome
+                    .components
+                    .iter()
+                    .map(|c| {
+                        jobj(vec![
+                            ("id", jstr(c.id.clone())),
+                            ("name", jstr(c.name.clone())),
+                            ("required", JsonValue::Bool(c.required)),
+                            ("packedSize", jnum(c.packed_size)),
+                            ("fileCount", jnum(c.file_count as u64)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
         (
             "assets",
             JsonValue::Array(vec![asset(&outcome.setup), asset(&outcome.portable)]),
@@ -1427,12 +2492,17 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Word subcommands (the AI-control surface): schema / validate / pack / verify.
+    // Word subcommands (the AI-control surface): schema / validate /
+    // pack / verify / init / inspect / diff / answers-template.
     match args.first().map(|a| a.as_str()) {
         Some("schema") => std::process::exit(run_schema(&args)),
         Some("validate") => std::process::exit(run_validate(&args)),
         Some("pack") => std::process::exit(run_pack(&args)),
         Some("verify") => std::process::exit(run_verify(&args)),
+        Some("init") => std::process::exit(run_init(&args)),
+        Some("inspect") => std::process::exit(run_inspect(&args)),
+        Some("diff") => std::process::exit(run_diff(&args)),
+        Some("answers-template") => std::process::exit(run_answers_template(&args)),
         _ => {}
     }
 
@@ -1478,20 +2548,41 @@ fn main() {
         std::process::exit(run_uninstall(&args));
     }
 
+    // --modify (v7): the ARP Modify button's target, and the CLI's
+    // headless modify. A bare interactive --modify (no option flags,
+    // no machine modes) opens the wizard in Modify mode; anything
+    // else runs the headless operation.
+    if has_flag(&args, &["--modify"]) {
+        if modify_is_headless(&args) {
+            std::process::exit(run_modify(&args));
+        }
+        match own_overlay_package_full() {
+            Some((manifest, records, options, power)) => {
+                std::process::exit(run_wizard_modify(manifest, records, options, power));
+            }
+            None => std::process::exit(fail(
+                &args,
+                "modify",
+                EXIT_BAD_MANIFEST,
+                "This executable carries no SeanPak overlay; nothing to modify",
+            )),
+        }
+    }
+
     // A built native installer carries an overlay in its own executable:
     // --install extracts the payload headlessly, and running it with no
-    // arguments at all opens the installer wizard (Design C) instead of
-    // the packager.
+    // arguments at all opens the installer wizard (Design E, Rail)
+    // instead of the packager.
     if has_flag(&args, &["--install", "--extract-self"]) {
         std::process::exit(run_install(&args));
     }
     if args.is_empty() {
-        if let Some((manifest, records, options)) = own_overlay_package() {
+        if let Some((manifest, records, options, power)) = own_overlay_package_full() {
             diag::log(
                 "mode",
                 &format!("installer wizard (own overlay: {})", manifest.app_name()),
             );
-            std::process::exit(run_wizard(manifest, records, options));
+            std::process::exit(run_wizard(manifest, records, options, power));
         }
         diag::log("mode", "packager GUI (no overlay in own executable)");
     }
