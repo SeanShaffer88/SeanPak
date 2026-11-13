@@ -1,0 +1,104 @@
+name: SeanPak CI & Release Builder
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build SeanPak (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            name: seanpak-x86_64-windows
+          - target: i686-pc-windows-msvc
+            name: seanpak-i686-windows
+          - target: aarch64-pc-windows-msvc
+            name: seanpak-arm64-windows
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build SFX Stub
+        shell: bash
+        run: |
+          if [ -d "sfx_stub" ]; then
+            cd sfx_stub
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target ${{ matrix.target }}
+            cd ..
+          fi
+
+      - name: Build SeanPak Executable
+        shell: bash
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare Binary Artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/seanpak.exe dist/${{ matrix.name }}.exe
+          cp README.md dist/
+          cp app.manifest dist/
+          cd dist
+          7z a ../${{ matrix.name }}.zip *
+          cd ..
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}.exe
+            ${{ matrix.name }}.zip
+          retention-days: 90
+
+  publish-release:
+    name: Publish Release Assets
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp artifacts/seanpak-x86_64-windows/seanpak-x86_64-windows.zip release-assets/
+          cp artifacts/seanpak-i686-windows/seanpak-i686-windows.zip release-assets/
+          cp artifacts/seanpak-arm64-windows/seanpak-arm64-windows.zip release-assets/
+          cd release-assets
+          sha256sum seanpak-*.zip > SHA256SUMS.txt
+          ls -la
+      - name: Attach assets to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/seanpak-x86_64-windows.zip
+            release-assets/seanpak-i686-windows.zip
+            release-assets/seanpak-arm64-windows.zip
+            release-assets/SHA256SUMS.txt
