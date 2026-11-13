@@ -83,8 +83,8 @@ jobs:
         run: |
           SP=target/x86_64-pc-windows-msvc/release/seanpak.exe
           mkdir -p golden/files/data golden/out
-          yes "golden fixture exe bytes aaaaaaaa" | head -n 200 > golden/files/golden.exe
-          yes "golden fixture line bbbbbbbb" | head -n 5000 > golden/files/data/big.txt
+          awk 'BEGIN{for(i=0;i<200;i++) print "golden fixture exe bytes aaaaaaaa"}' > golden/files/golden.exe
+          awk 'BEGIN{for(i=0;i<5000;i++) print "golden fixture line bbbbbbbb"}' > golden/files/data/big.txt
           printf 'golden readme\n' > golden/files/readme.txt
           cat > golden/manifest.json <<'EOF'
           {"appName":"GoldenApp","version":"1.0.0","publisher":"SeanPak CI","primaryExe":"golden.exe","desktopShortcut":true,"startMenuShortcut":true,"fileAssociations":[".gold"],"pathEntry":false}
