@@ -1952,9 +1952,9 @@ mod imp {
                 ext as WPARAM,
                 ext as LPARAM,
             );
-            SendMessageW(list, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
-            SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
-            SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
+            SendMessageW(list, LVM_SETBKCOLOR, 0, theme::fill_color(theme::SURFACE) as LPARAM);
+            SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::fill_color(theme::SURFACE) as LPARAM);
+            SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::text_color(theme::FOREGROUND) as LPARAM);
             for (idx, (title, width)) in cols.iter().enumerate() {
                 let mut wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let col = LVCOLUMNW {
@@ -2230,9 +2230,9 @@ mod imp {
             progress,
             PBM_SETBARCOLOR_MSG,
             0,
-            theme::SELECTION_INDICATOR as LPARAM,
+            theme::fill_color(theme::SELECTION_INDICATOR) as LPARAM,
         );
-        SendMessageW(progress, PBM_SETBKCOLOR_MSG, 0, theme::SURFACE as LPARAM);
+        SendMessageW(progress, PBM_SETBKCOLOR_MSG, 0, theme::fill_color(theme::SURFACE) as LPARAM);
         // Revision 3 progress is ten segments; the subclass paints
         // them over the native control (position/range unchanged).
         theme::subclass_progress(progress);
@@ -5767,11 +5767,11 @@ mod imp {
         SetTextColor(
             hdc,
             if disabled {
-                theme::DISABLED_FOREGROUND
+                theme::disabled_text_color(theme::DISABLED_FOREGROUND)
             } else if selected {
-                theme::FOREGROUND
+                theme::highlight_text_color(theme::FOREGROUND)
             } else {
-                theme::MUTED
+                theme::text_color(theme::MUTED)
             },
         );
         select_body_font(hdc);
@@ -5831,9 +5831,9 @@ mod imp {
         SetTextColor(
             hdc,
             if selected {
-                theme::FOREGROUND
+                theme::button_text_color(theme::FOREGROUND)
             } else {
-                theme::MUTED
+                theme::text_color(theme::MUTED)
             },
         );
         select_body_font(hdc);
@@ -5899,7 +5899,7 @@ mod imp {
             return;
         }
         // The connecting line behind the circles.
-        let pen = CreatePen(PS_SOLID, 1, theme::EDGE);
+        let pen = CreatePen(PS_SOLID, 1, theme::border_color(theme::EDGE));
         let old_pen = SelectObject(hdc, pen as _);
         let (x0, y_first, _) = circles[0];
         let (_, y_last, _) = circles[circles.len() - 1];
@@ -5911,11 +5911,14 @@ mod imp {
         select_body_font(hdc);
         for (i, (cx, cy, r)) in circles.iter().enumerate() {
             let (fill, text_color) = if i < step {
-                (theme::SUCCESS, 0x00FF_FFFF)
+                (theme::SUCCESS, theme::button_text_color(0x00FF_FFFF))
             } else if i == step {
-                (theme::SELECTION_INDICATOR, 0x00FF_FFFF)
+                (
+                    theme::SELECTION_INDICATOR,
+                    theme::highlight_text_color(0x00FF_FFFF),
+                )
             } else {
-                (theme::RAISED, theme::MUTED)
+                (theme::RAISED, theme::button_text_color(theme::MUTED))
             };
             let rect = RECT {
                 left: cx - r,
@@ -5979,7 +5982,7 @@ mod imp {
         } else {
             std::ptr::null_mut()
         };
-        SetTextColor(hdc, theme::FOREGROUND);
+        SetTextColor(hdc, theme::button_text_color(theme::FOREGROUND));
         let title = format!("{app_name} Setup");
         let mut wide: Vec<u16> = title.encode_utf16().collect();
         let mut rc = RECT {
@@ -6020,9 +6023,9 @@ mod imp {
             SetTextColor(
                 hdc,
                 if i == 0 {
-                    theme::FOREGROUND
+                    theme::button_text_color(theme::FOREGROUND)
                 } else {
-                    theme::MUTED
+                    theme::button_text_color(theme::MUTED)
                 },
             );
             let mut wide: Vec<u16> = name.encode_utf16().collect();
@@ -6041,7 +6044,7 @@ mod imp {
             );
         }
         // Body copy + the two wizard buttons.
-        SetTextColor(hdc, theme::MUTED);
+        SetTextColor(hdc, theme::button_text_color(theme::MUTED));
         let body = format!(
             "Welcome\r\n\r\nThis wizard will guide you through the installation of {app_name}."
         );
@@ -6067,7 +6070,7 @@ mod imp {
             bottom: by + 30,
         };
         FillRect(hdc, &next_rc, theme::brush(theme::ACTION));
-        SetTextColor(hdc, 0x00FF_FFFF);
+        SetTextColor(hdc, theme::highlight_text_color(0x00FF_FFFF));
         let mut wide: Vec<u16> = "Next".encode_utf16().collect();
         let mut rc = next_rc;
         DrawTextW(
@@ -6085,7 +6088,7 @@ mod imp {
         };
         FillRect(hdc, &cancel_rc, theme::brush(theme::RAISED));
         FrameRect(hdc, &cancel_rc, theme::brush(theme::EDGE));
-        SetTextColor(hdc, theme::FOREGROUND);
+        SetTextColor(hdc, theme::button_text_color(theme::FOREGROUND));
         let mut wide: Vec<u16> = "Cancel".encode_utf16().collect();
         let mut rc = cancel_rc;
         DrawTextW(
@@ -6125,7 +6128,7 @@ mod imp {
         SetBkMode(hdc, TRANSPARENT as i32);
         if ok {
             // A white check mark.
-            let pen = CreatePen(PS_SOLID, 5, 0x00FF_FFFF);
+            let pen = CreatePen(PS_SOLID, 5, theme::button_text_color(0x00FF_FFFF));
             let old_pen = SelectObject(hdc, pen as _);
             let cx = x + w / 2;
             let cy = y + h / 2;
@@ -6135,7 +6138,7 @@ mod imp {
             SelectObject(hdc, old_pen);
             DeleteObject(pen as _);
         } else {
-            SetTextColor(hdc, 0x00FF_FFFF);
+            SetTextColor(hdc, theme::button_text_color(0x00FF_FFFF));
             let font = TITLE_FONT;
             let old_font = if !font.is_null() {
                 SelectObject(hdc, font as _)
@@ -6167,18 +6170,29 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                theme::refresh_system_colors();
+                theme::refresh_listview_colors(hwnd);
+                RedrawWindow(
+                    hwnd,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+                0
+            }
             WM_CTLCOLORSTATIC => {
                 let hdc = wparam as HDC;
                 let id = GetDlgCtrlID(lparam as HWND) as usize;
                 SetBkMode(hdc, TRANSPARENT as i32);
                 if id == ID_FOOTER_SEP {
-                    SetBkColor(hdc, theme::EDGE);
+                    SetBkColor(hdc, theme::fill_color(theme::EDGE));
                     return theme::brush(theme::EDGE) as LRESULT;
                 }
                 if id == ID_OUTPUT {
                     // A read-only edit reports here, not CTLCOLOREDIT.
-                    SetTextColor(hdc, theme::FOREGROUND);
-                    SetBkColor(hdc, theme::READ_ONLY_FILL);
+                    SetTextColor(hdc, theme::button_text_color(theme::FOREGROUND));
+                    SetBkColor(hdc, theme::fill_color(theme::READ_ONLY_FILL));
                     return theme::brush(theme::READ_ONLY_FILL) as LRESULT;
                 }
                 if id == ID_LBL_STATUS {
@@ -6186,21 +6200,21 @@ mod imp {
                     SetTextColor(
                         hdc,
                         match kind {
-                            StatusKind::Ok => theme::SUCCESS,
-                            StatusKind::Error => theme::DANGER,
-                            StatusKind::Neutral => theme::MUTED,
+                            StatusKind::Ok => theme::text_color(theme::SUCCESS),
+                            StatusKind::Error => theme::text_color(theme::DANGER),
+                            StatusKind::Neutral => theme::text_color(theme::MUTED),
                         },
                     );
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_DATA_NOTE || id == ID_LBL_REQ_NOTE {
-                    SetTextColor(hdc, theme::INFO);
+                    SetTextColor(hdc, theme::button_text_color(theme::INFO));
                     SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, theme::INFO_FILL);
+                    SetBkColor(hdc, theme::fill_color(theme::INFO_FILL));
                     return theme::brush(theme::INFO_FILL) as LRESULT;
                 }
                 if id == ID_LBL_WINREQ_TAG {
-                    SetTextColor(hdc, theme::SUCCESS);
+                    SetTextColor(hdc, theme::text_color(theme::SUCCESS));
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_RT_TAG1
@@ -6208,11 +6222,11 @@ mod imp {
                     || id == ID_LBL_RT_TAG3
                     || id == ID_LBL_RT_TAG4
                 {
-                    SetTextColor(hdc, theme::WARNING);
+                    SetTextColor(hdc, theme::text_color(theme::WARNING));
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_DONE_REASON {
-                    SetTextColor(hdc, theme::DANGER);
+                    SetTextColor(hdc, theme::text_color(theme::DANGER));
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_NP_STEP1 || id == ID_LBL_NP_STEP2 || id == ID_LBL_NP_STEP3 {
@@ -6221,11 +6235,11 @@ mod imp {
                     SetTextColor(
                         hdc,
                         if idx < step {
-                            theme::SUCCESS
+                            theme::text_color(theme::SUCCESS)
                         } else if idx == step {
-                            theme::FOREGROUND
+                            theme::text_color(theme::FOREGROUND)
                         } else {
-                            theme::MUTED
+                            theme::text_color(theme::MUTED)
                         },
                     );
                     return theme::brush(theme::BACKGROUND) as LRESULT;
@@ -6281,9 +6295,9 @@ mod imp {
                     ID_LBL_NP_SUMMARY,
                 ];
                 if MUTED_IDS.contains(&id) || PANEL_LABELS.contains(&id) {
-                    SetTextColor(hdc, theme::MUTED);
+                    SetTextColor(hdc, theme::text_color(theme::MUTED));
                 } else {
-                    SetTextColor(hdc, theme::FOREGROUND);
+                    SetTextColor(hdc, theme::text_color(theme::FOREGROUND));
                 }
                 theme::brush(theme::BACKGROUND) as LRESULT
             }
@@ -6291,12 +6305,12 @@ mod imp {
                 let hdc = wparam as HDC;
                 let ctrl = lparam as HWND;
                 if !ctrl.is_null() && IsWindowEnabled(ctrl) == 0 {
-                    SetTextColor(hdc, theme::DISABLED_FOREGROUND);
-                    SetBkColor(hdc, theme::DISABLED_FILL);
+                    SetTextColor(hdc, theme::disabled_text_color(theme::DISABLED_FOREGROUND));
+                    SetBkColor(hdc, theme::fill_color(theme::DISABLED_FILL));
                     return theme::brush(theme::DISABLED_FILL) as LRESULT;
                 }
-                SetTextColor(hdc, theme::FOREGROUND);
-                SetBkColor(hdc, theme::SURFACE);
+                SetTextColor(hdc, theme::text_color(theme::FOREGROUND));
+                SetBkColor(hdc, theme::fill_color(theme::SURFACE));
                 theme::brush(theme::SURFACE) as LRESULT
             }
             WM_DRAWITEM => {

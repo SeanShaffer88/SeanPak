@@ -40,6 +40,10 @@ jobs:
         shell: bash
         run: cargo test --lib authenticode --target ${{ matrix.target }}
 
+      - name: Test high-contrast palette roles
+        shell: bash
+        run: cargo test --lib high_contrast_fill_roles --target ${{ matrix.target }}
+
       - name: Validate release signing script without credentials
         shell: pwsh
         env:
