@@ -671,6 +671,9 @@ mod imp {
         SendMessageW(bar, PBM_SETRANGE32_MSG, 0, 1000);
         SendMessageW(bar, PBM_SETBARCOLOR_MSG, 0, theme::PROGRESS as LPARAM);
         SendMessageW(bar, PBM_SETBKCOLOR_MSG, 0, theme::SURFACE as LPARAM);
+        // Revision 3 progress is ten segments; the subclass paints
+        // them over the native control (position/range unchanged).
+        theme::subclass_progress(bar);
         let detail = mk(&static_class, "", 0, 20, 92, 500, 56, ID_LBL_DETAIL);
         SendMessageW(detail, WM_SETFONT, BODY_FONT as WPARAM, 1);
         // The still-running choice and the end-state buttons exist

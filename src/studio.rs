@@ -9,8 +9,8 @@
 //! folder → summary), the project editor as three tabs (Files and
 //! Folders · Installer Options · Program Requirements), and the
 //! build as three states (Build Settings → Building → Build
-//! Finished). The theme is VS Code's GitHub Dark High Contrast,
-//! taken directly through the shared tokens in `src/theme.rs`.
+//! Finished). The theme is TesselGUI 2.0.0 (design revision 3,
+//! Carmine), taken through the shared tokens in `src/theme.rs`.
 //! Every action calls a shared operation — pack is
 //! `pack::pack_with_hooks`, validate is
 //! `manifest::AppManifest::from_json`, verify is
@@ -972,8 +972,9 @@ mod imp {
     use crate::pack::{PackError, PackOutcome};
     use crate::scanner::format_bytes;
 
-    // Colors come from the shared theme module (VS Code GitHub Dark
-    // High Contrast tokens) — this window keeps no private palette.
+    // Colors come from the shared theme module (TesselGUI 2.0.0,
+    // design revision 3 tokens) — this window keeps no private
+    // palette.
     use crate::theme;
 
     // ---- pages ----
@@ -2232,6 +2233,9 @@ mod imp {
             theme::SELECTION_INDICATOR as LPARAM,
         );
         SendMessageW(progress, PBM_SETBKCOLOR_MSG, 0, theme::SURFACE as LPARAM);
+        // Revision 3 progress is ten segments; the subclass paints
+        // them over the native control (position/range unchanged).
+        theme::subclass_progress(progress);
         btn("Clear", ID_BTN_CLEAR);
 
         // Build Finished page (title, sub, and the summary/reason
@@ -5720,7 +5724,7 @@ mod imp {
     }
 
     /// Left-nav button: flat over the rail, the selected section
-    /// raised with a blue bar at its left edge.
+    /// raised with a Carmine bar at its left edge.
     unsafe fn draw_nav_button(hwnd: HWND, dis: *const DRAWITEMSTRUCT) {
         let rc = (*dis).rcItem;
         let id = (*dis).CtlID as usize;
@@ -5754,7 +5758,7 @@ mod imp {
             let bar = RECT {
                 left: rc.left,
                 top: rc.top,
-                right: rc.left + 3,
+                right: rc.left + 2,
                 bottom: rc.bottom,
             };
             FillRect(hdc, &bar, theme::brush(theme::SELECTION_INDICATOR));
@@ -5787,12 +5791,12 @@ mod imp {
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
         if (*dis).itemState & ODS_FOCUS != 0 && !disabled {
-            DrawFocusRect(hdc, &rc);
+            theme::draw_focus_ring(hdc, &rc);
         }
         let _ = hwnd;
     }
 
-    /// Editor tab: the current page raised with a blue underline,
+    /// Editor tab: the current page raised with a Carmine underline,
     /// the others flat and muted.
     unsafe fn draw_tab_button(hwnd: HWND, dis: *const DRAWITEMSTRUCT) {
         let rc = (*dis).rcItem;
@@ -5844,7 +5848,7 @@ mod imp {
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
         if (*dis).itemState & ODS_FOCUS != 0 {
-            DrawFocusRect(hdc, &rc);
+            theme::draw_focus_ring(hdc, &rc);
         }
         let _ = hwnd;
     }
@@ -5859,6 +5863,10 @@ mod imp {
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(hwnd, &mut client);
         FillRect(hdc, &client, theme::brush(theme::BACKGROUND));
+        // The revision 3 signature grid over the window background;
+        // the rail strip, panels and controls paint their solid
+        // fills over it, so it stays visible in the empty areas.
+        theme::paint_grid(hdc, &client, (theme::GRID_CELL as f32 * scale) as i32);
         match page {
             Page::NewProject => paint_np_rail(hwnd, hdc, scale),
             Page::EditorOptions => paint_preview(hwnd, hdc),

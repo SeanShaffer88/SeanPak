@@ -1,74 +1,108 @@
-//! TesselGUI 1.4.0 design tokens — the single source of truth for the
-//! colors of every SeanPak window (Builder studio, installer wizard,
-//! uninstall confirmation). SeanPak ships dark only.
+//! TesselGUI 2.0.0 (design revision 3, "Carmine") design tokens —
+//! the single source of truth for the colors of every SeanPak
+//! window (Builder studio, installer wizard in every mode,
+//! uninstall confirmation, silent-update window). SeanPak ships
+//! dark only, so only the standard's dark palette lives here.
 //!
-//! Values are the TesselGUI dark theme from `docs/tokens.json` (the
-//! GitHub Dark High Contrast values adopted in TesselGUI 1.3.0),
-//! expressed as Win32 COLORREFs (`0x00BBGGRR`). Windows keep no
-//! private palettes: they consume these constants and the shared
-//! control painters below, so the three windows cannot drift apart
+//! Values are the TesselGUI revision 3 dark theme, taken from the
+//! published standard's own files — `docs/tokens.json` (the dark
+//! `color` block) in github.com/SeanShaffer88/TesselGUI at v2.0.0,
+//! cross-checked against the generated Rust export `dist/tessel.rs`
+//! (`DARK`) — expressed as Win32 COLORREFs (`0x00BBGGRR`). Windows
+//! keep no private palettes: they consume these constants and the
+//! shared control painters below, so the windows cannot drift apart
 //! again the way the revision-2 copies did.
+//!
+//! Revision 3 in brief: near-black charcoal surfaces separated
+//! mainly by 1px edges, soft off-white text, and one deep Carmine
+//! accent. Carmine indicators measure 1.38–1.89:1 on these
+//! surfaces, so per the standard's own accent-indicator rule a
+//! Carmine mark is never the only cue — it always pairs with a fill
+//! change, a label, a position, or a native state. The primary
+//! action is a Carmine fill with a white label (9.09:1) and a 1px
+//! rim in the `border` role.
 
-/// `background` — #010409: window background; also the wizard rail.
-pub const BACKGROUND: u32 = 0x0009_0401;
-/// `surface` — #0A0C10: panels, edit fields, list bodies.
-pub const SURFACE: u32 = 0x0010_0C0A;
-/// `raised` — #191C20: secondary button fill.
-pub const RAISED: u32 = 0x0020_1C19;
-/// `selected` — #272B33: selected row fill.
-pub const SELECTED: u32 = 0x0033_2B27;
-/// `selectedStrong` — #40454D.
-pub const SELECTED_STRONG: u32 = 0x004D_4540;
-/// `foreground` — #F0F3F6: enabled text.
-pub const FOREGROUND: u32 = 0x00F6_F3F0;
-/// `muted` — #BDC4CC: section captions and genuinely secondary text.
-pub const MUTED: u32 = 0x00CC_C4BD;
-/// `border` / `edge` — #7A828E: 1px structural edges and dividers.
-pub const EDGE: u32 = 0x008E_827A;
-/// `accent` — #15263C: deep accent fill (the wizard's info box).
-pub const ACCENT: u32 = 0x003C_2615;
-/// `accentForeground` — #F0F6FC: text on the accent fill.
-pub const ACCENT_FOREGROUND: u32 = 0x00FC_F6F0;
-/// `selectionIndicator` — #409EFF: the selected row's marker bar.
-pub const SELECTION_INDICATOR: u32 = 0x00FF_9E40;
-/// `focus` — #71B7FF: focus rings.
-pub const FOCUS: u32 = 0x00FF_B771;
-/// `action` — #1A7F37: the one primary action per view.
-pub const ACTION: u32 = 0x0037_7F1A;
-/// `actionHover` — #238636.
-pub const ACTION_HOVER: u32 = 0x0036_8623;
-/// `actionPressed` — #116329.
-pub const ACTION_PRESSED: u32 = 0x0029_6311;
+/// `background` — #1B1B1D: window background; also the wizard rail.
+pub const BACKGROUND: u32 = 0x001D_1B1B;
+/// `surface` — #1F1F22: panels, edit fields, list bodies.
+pub const SURFACE: u32 = 0x0022_1F1F;
+/// `raised` — #232326: secondary button fill, floating layers.
+pub const RAISED: u32 = 0x0026_2323;
+/// `selected` — #2A2A2F: selected row fill.
+pub const SELECTED: u32 = 0x002F_2A2A;
+/// `selectedStrong` — #33333A.
+pub const SELECTED_STRONG: u32 = 0x003A_3333;
+/// `foreground` — #E6E3E1: enabled text.
+pub const FOREGROUND: u32 = 0x00E1_E3E6;
+/// `muted` — #89868A: short secondary labels (the standard scopes
+/// muted to short labels on raised/selected fills; long reading
+/// text uses `foreground`).
+pub const MUTED: u32 = 0x008A_8689;
+/// `border` — #76767C: control boundaries (button and field rims).
+pub const BORDER: u32 = 0x007C_7676;
+/// `edge` — #43434A: 1px structural edges, dividers, list gridlines.
+pub const EDGE: u32 = 0x004A_4343;
+/// `accent` — #960018: the deep Carmine accent fill.
+pub const ACCENT: u32 = 0x0018_0096;
+/// `accentForeground` — #E6E3E1: text on the accent fill.
+pub const ACCENT_FOREGROUND: u32 = 0x00E1_E3E6;
+/// `selectionIndicator` — #960018 (Carmine): the selected row's
+/// marker bar, the active tab's underline, the active-region rule.
+pub const SELECTION_INDICATOR: u32 = 0x0018_0096;
+/// `focus` — #960018 (Carmine): focus outlines.
+pub const FOCUS: u32 = 0x0018_0096;
+/// `action` — #960018 (Carmine): the one primary action per view.
+pub const ACTION: u32 = 0x0018_0096;
+/// `actionHover` — #A81226.
+pub const ACTION_HOVER: u32 = 0x0026_12A8;
+/// `actionPressed` — #7E0014.
+pub const ACTION_PRESSED: u32 = 0x0014_007E;
 /// `actionForeground` — #FFFFFF: text on the action fill.
 pub const ACTION_FOREGROUND: u32 = 0x00FF_FFFF;
-/// `hover` fill — #20242B: hovered secondary button.
-pub const HOVER_FILL: u32 = 0x002B_2420;
-/// `pressed` fill — #2E333B: pressed secondary button.
-pub const PRESSED_FILL: u32 = 0x003B_332E;
-/// `success` — #3FB950: success text, completed-step checks.
-pub const SUCCESS: u32 = 0x0050_B93F;
-/// `warning` — #F0B72F.
-pub const WARNING: u32 = 0x002F_B7F0;
-/// `warningFill` — #3A2A00.
-pub const WARNING_FILL: u32 = 0x0000_2A3A;
-/// `danger` — #FFA198: error text.
-pub const DANGER: u32 = 0x0098_A1FF;
-/// `dangerFill` — #4C1A1A.
-pub const DANGER_FILL: u32 = 0x001A_1A4C;
-/// `info` — #A5D6FF: informational note text.
-pub const INFO: u32 = 0x00FF_D6A5;
-/// `infoFill` — #0C2D6B.
-pub const INFO_FILL: u32 = 0x006B_2D0C;
-/// `grid` — #0F1318: table gridlines.
-pub const GRID: u32 = 0x0018_130F;
-/// `disabledForeground` — #7A828E: text of disabled controls only.
-pub const DISABLED_FOREGROUND: u32 = 0x008E_827A;
-/// `disabledFill` — #0A0C10: fill of disabled controls.
-pub const DISABLED_FILL: u32 = 0x0010_0C0A;
-/// `readOnlyFill` — #11151B: read-only edit fields.
-pub const READ_ONLY_FILL: u32 = 0x001B_1511;
-/// `progress` — #BDC4CC (the progress role shares the muted value).
-pub const PROGRESS: u32 = MUTED;
+/// `hover` fill — #28282D: hovered secondary button or row.
+pub const HOVER_FILL: u32 = 0x002D_2828;
+/// `pressed` fill — #2E2E34: pressed secondary button.
+pub const PRESSED_FILL: u32 = 0x0034_2E2E;
+/// `success` — #A3B58A: success text, completed-step marks.
+pub const SUCCESS: u32 = 0x008A_B5A3;
+/// `successFill` — #222B1D: banner fill behind success text.
+pub const SUCCESS_FILL: u32 = 0x001D_2B22;
+/// `warning` — #C9A86A.
+pub const WARNING: u32 = 0x006A_A8C9;
+/// `warningFill` — #2E2617.
+pub const WARNING_FILL: u32 = 0x0017_262E;
+/// `danger` — #E8939F: error text.
+pub const DANGER: u32 = 0x009F_93E8;
+/// `dangerFill` — #3B1B22.
+pub const DANGER_FILL: u32 = 0x0022_1B3B;
+/// `info` — #72AAA5: informational note text.
+pub const INFO: u32 = 0x00A5_AA72;
+/// `infoFill` — #1C2B29.
+pub const INFO_FILL: u32 = 0x0029_2B1C;
+/// `grid` — #28282B: the signature fine square-grid texture
+/// (24px cells, 1px lines; see [`win::paint_grid`]).
+pub const GRID: u32 = 0x002B_2828;
+/// The grid texture's cell size in CSS pixels (scaled by DPI at
+/// the call site, like every size in the standard's exports).
+pub const GRID_CELL: i32 = 24;
+/// `materialRim` — #3D3D42: the shallow-relief rim of a surface.
+pub const MATERIAL_RIM: u32 = 0x0042_3D3D;
+/// `materialShade` — #111113: the shallow-relief shade.
+pub const MATERIAL_SHADE: u32 = 0x0013_1111;
+/// `surround` — #191919: the near-black status-bar / surround fill.
+pub const SURROUND: u32 = 0x0019_1919;
+/// `textSelection` — #3F3F46: selected text fill (soft gray; the
+/// standard pairs it with a thin Carmine edge in editors).
+pub const TEXT_SELECTION: u32 = 0x0046_3F3F;
+/// `disabledForeground` — #89868A: text of disabled controls only.
+pub const DISABLED_FOREGROUND: u32 = 0x008A_8689;
+/// `disabledFill` — #1B1B1D: fill of disabled controls.
+pub const DISABLED_FILL: u32 = 0x001D_1B1B;
+/// `readOnlyFill` — #232326: read-only edit fields.
+pub const READ_ONLY_FILL: u32 = 0x0026_2323;
+/// `progress` — #B8AAA0: the determinate-progress fill (drawn as
+/// the standard's ten segments; see [`win::subclass_progress`]).
+pub const PROGRESS: u32 = 0x00A0_AAB8;
 
 #[cfg(test)]
 mod tests {
@@ -84,41 +118,47 @@ mod tests {
     }
 
     #[test]
-    fn core_tokens_match_tesselgui_140() {
-        assert_eq!(hex(BACKGROUND), "#010409");
-        assert_eq!(hex(SURFACE), "#0A0C10");
-        assert_eq!(hex(EDGE), "#7A828E");
-        assert_eq!(hex(ACTION), "#1A7F37");
-        assert_eq!(hex(FOCUS), "#71B7FF");
-        assert_eq!(hex(DANGER), "#FFA198");
+    fn core_tokens_match_tesselgui_200_rev3() {
+        assert_eq!(hex(BACKGROUND), "#1B1B1D");
+        assert_eq!(hex(SURFACE), "#1F1F22");
+        assert_eq!(hex(EDGE), "#43434A");
+        assert_eq!(hex(BORDER), "#76767C");
+        assert_eq!(hex(ACTION), "#960018");
+        assert_eq!(hex(FOCUS), "#960018");
+        assert_eq!(hex(DANGER), "#E8939F");
     }
 
     #[test]
-    fn remaining_tokens_match_tesselgui_140() {
-        assert_eq!(hex(RAISED), "#191C20");
-        assert_eq!(hex(SELECTED), "#272B33");
-        assert_eq!(hex(SELECTED_STRONG), "#40454D");
-        assert_eq!(hex(FOREGROUND), "#F0F3F6");
-        assert_eq!(hex(MUTED), "#BDC4CC");
-        assert_eq!(hex(ACCENT), "#15263C");
-        assert_eq!(hex(ACCENT_FOREGROUND), "#F0F6FC");
-        assert_eq!(hex(SELECTION_INDICATOR), "#409EFF");
-        assert_eq!(hex(ACTION_HOVER), "#238636");
-        assert_eq!(hex(ACTION_PRESSED), "#116329");
+    fn remaining_tokens_match_tesselgui_200_rev3() {
+        assert_eq!(hex(RAISED), "#232326");
+        assert_eq!(hex(SELECTED), "#2A2A2F");
+        assert_eq!(hex(SELECTED_STRONG), "#33333A");
+        assert_eq!(hex(FOREGROUND), "#E6E3E1");
+        assert_eq!(hex(MUTED), "#89868A");
+        assert_eq!(hex(ACCENT), "#960018");
+        assert_eq!(hex(ACCENT_FOREGROUND), "#E6E3E1");
+        assert_eq!(hex(SELECTION_INDICATOR), "#960018");
+        assert_eq!(hex(ACTION_HOVER), "#A81226");
+        assert_eq!(hex(ACTION_PRESSED), "#7E0014");
         assert_eq!(hex(ACTION_FOREGROUND), "#FFFFFF");
-        assert_eq!(hex(HOVER_FILL), "#20242B");
-        assert_eq!(hex(PRESSED_FILL), "#2E333B");
-        assert_eq!(hex(SUCCESS), "#3FB950");
-        assert_eq!(hex(WARNING), "#F0B72F");
-        assert_eq!(hex(WARNING_FILL), "#3A2A00");
-        assert_eq!(hex(DANGER_FILL), "#4C1A1A");
-        assert_eq!(hex(INFO), "#A5D6FF");
-        assert_eq!(hex(INFO_FILL), "#0C2D6B");
-        assert_eq!(hex(GRID), "#0F1318");
-        assert_eq!(hex(DISABLED_FOREGROUND), "#7A828E");
-        assert_eq!(hex(DISABLED_FILL), "#0A0C10");
-        assert_eq!(hex(READ_ONLY_FILL), "#11151B");
-        assert_eq!(hex(PROGRESS), "#BDC4CC");
+        assert_eq!(hex(HOVER_FILL), "#28282D");
+        assert_eq!(hex(PRESSED_FILL), "#2E2E34");
+        assert_eq!(hex(SUCCESS), "#A3B58A");
+        assert_eq!(hex(SUCCESS_FILL), "#222B1D");
+        assert_eq!(hex(WARNING), "#C9A86A");
+        assert_eq!(hex(WARNING_FILL), "#2E2617");
+        assert_eq!(hex(DANGER_FILL), "#3B1B22");
+        assert_eq!(hex(INFO), "#72AAA5");
+        assert_eq!(hex(INFO_FILL), "#1C2B29");
+        assert_eq!(hex(GRID), "#28282B");
+        assert_eq!(hex(MATERIAL_RIM), "#3D3D42");
+        assert_eq!(hex(MATERIAL_SHADE), "#111113");
+        assert_eq!(hex(SURROUND), "#191919");
+        assert_eq!(hex(TEXT_SELECTION), "#3F3F46");
+        assert_eq!(hex(DISABLED_FOREGROUND), "#89868A");
+        assert_eq!(hex(DISABLED_FILL), "#1B1B1D");
+        assert_eq!(hex(READ_ONLY_FILL), "#232326");
+        assert_eq!(hex(PROGRESS), "#B8AAA0");
     }
 }
 
@@ -205,10 +245,18 @@ mod win {
         SelectObject(hdc, font as HGDIOBJ)
     }
 
-    /// The TesselGUI focus ring for buttons and checkboxes: a 2px
-    /// ring in the focus color, drawn just inside the control rect
-    /// (the native-toolkit adaptation of the outline ring).
-    unsafe fn draw_focus_ring(hdc: HDC, rc: &RECT) {
+    /// The TesselGUI focus outline for buttons and checkboxes: a
+    /// 2px outline in the focus role (Carmine in revision 3). The
+    /// standard places the outline outside the control at a 2px
+    /// offset; owner-drawn native controls cannot paint outside
+    /// their own rect, so the ring is drawn just inside it — the
+    /// native-toolkit adaptation of the same outline, and the
+    /// standard's inset style for rows and tabs.
+    ///
+    /// # Safety
+    /// `hdc` must be a live device context and `rc` a valid rect
+    /// for the duration of the call (the draw-item contract).
+    pub unsafe fn draw_focus_ring(hdc: HDC, rc: &RECT) {
         let mut inner = *rc;
         inner.left += 1;
         inner.top += 1;
@@ -225,8 +273,12 @@ mod win {
 
     /// Owner-drawn push button, TesselGUI component rules: exactly
     /// one primary (action family) per view; secondaries are raised
-    /// fill + edge border + foreground text. Pressed, hover, disabled
-    /// and keyboard-focus states all come from the draw item state.
+    /// fill + foreground text. Every button's rim is the `border`
+    /// role — the standard gives the Carmine primary a 1px border
+    /// rim so its fill never relies on surface contrast alone, and
+    /// control boundaries use `border` throughout (structure uses
+    /// `edge`). Pressed, hover, disabled and keyboard-focus states
+    /// all come from the draw item state.
     ///
     /// # Safety
     /// `dis` must be a valid DRAWITEMSTRUCT delivered with a
@@ -263,7 +315,7 @@ mod win {
             )
         };
         FillRect(dis.hDC, &dis.rcItem, brush(fill));
-        FrameRect(dis.hDC, &dis.rcItem, brush(EDGE));
+        FrameRect(dis.hDC, &dis.rcItem, brush(BORDER));
         let old_font = select_control_font(dis.hDC, dis.hwndItem);
         SetBkMode(dis.hDC, TRANSPARENT as i32);
         SetTextColor(dis.hDC, text_color);
@@ -318,7 +370,7 @@ mod win {
             (SURFACE, FOREGROUND)
         };
         FillRect(dis.hDC, &box_rc, brush(box_fill));
-        FrameRect(dis.hDC, &box_rc, brush(EDGE));
+        FrameRect(dis.hDC, &box_rc, brush(BORDER));
         if checked {
             // A three-point check, thick enough to read at 12px.
             let pen = CreatePen(PS_SOLID, (side / 6).max(2), check_color);
@@ -540,11 +592,14 @@ mod win {
     /// NM_CUSTOMDRAW handler for the dark list views: selected rows
     /// take the `selected` fill (the native selection is a system
     /// highlight blue), and gridlines are drawn per subitem in the
-    /// `grid` color at postpaint (the native LVS_EX_GRIDLINES color
-    /// is a fixed light system color that cannot be themed). The
-    /// selected row also gets the selectionIndicator bar at its left
-    /// edge. Returns the LRESULT the parent's WM_NOTIFY must return,
-    /// or None when `lparam` is not a list-view custom-draw.
+    /// `edge` color at postpaint — the standard's data-list rule
+    /// puts row and column gridlines in the `edge` role, and the
+    /// native LVS_EX_GRIDLINES color is a fixed light system color
+    /// that cannot be themed. The selected row also gets the
+    /// selectionIndicator bar (2px, the standard's marker width) at
+    /// its left edge. Returns the LRESULT the parent's WM_NOTIFY
+    /// must return, or None when `lparam` is not a list-view
+    /// custom-draw.
     ///
     /// # Safety
     /// `lparam` must be the LPARAM of a WM_NOTIFY message (a valid
@@ -581,7 +636,7 @@ mod win {
         if draw_grid && stage == (CDDS_SUBITEM | CDDS_ITEMPOSTPAINT | CDDS_ITEM) {
             let rc = (*cd).nmcd.rc;
             let hdc = (*cd).nmcd.hdc;
-            let pen = CreatePen(PS_SOLID, 1, GRID);
+            let pen = CreatePen(PS_SOLID, 1, EDGE);
             let old_pen = SelectObject(hdc, pen as HGDIOBJ);
             let mut pt: POINT = std::mem::zeroed();
             MoveToEx(hdc, rc.left, rc.bottom - 1, &mut pt);
@@ -594,7 +649,7 @@ mod win {
                 let bar = RECT {
                     left: rc.left,
                     top: rc.top,
-                    right: rc.left + 3,
+                    right: rc.left + 2,
                     bottom: rc.bottom,
                 };
                 FillRect(hdc, &bar, brush(SELECTION_INDICATOR));
@@ -603,7 +658,168 @@ mod win {
         }
         Some(0)
     }
+
+    /// The signature grid texture: 1px lines in the `grid` role on
+    /// a `cell`-pixel square lattice (the standard's cell is
+    /// [`GRID_CELL`] CSS pixels; callers pass it DPI-scaled). The
+    /// standard draws the grid fully in empty areas and fading
+    /// behind dense content; GDI has no per-region fade, so callers
+    /// paint it across the window background and let content —
+    /// panels, fields, lists, and the statics' own solid fills —
+    /// cover it where content sits. What remains visible is the
+    /// empty area, which is where the standard wants it, and the
+    /// token value itself sits at the quiet end of the standard's
+    /// own grid contrast range (1.04–1.3:1). Callers paint it over
+    /// the `background` fill, never inside a control.
+    ///
+    /// # Safety
+    /// `hdc` must be a live device context for the duration of the
+    /// call (a paint or erase-background DC).
+    pub unsafe fn paint_grid(hdc: HDC, rect: &RECT, cell: i32) {
+        if cell < 4 || rect.right <= rect.left || rect.bottom <= rect.top {
+            return;
+        }
+        let pen = CreatePen(PS_SOLID, 1, GRID);
+        let old_pen = SelectObject(hdc, pen as HGDIOBJ);
+        let mut pt: POINT = std::mem::zeroed();
+        let mut x = rect.left + cell;
+        while x < rect.right {
+            MoveToEx(hdc, x, rect.top, &mut pt);
+            LineTo(hdc, x, rect.bottom);
+            x += cell;
+        }
+        let mut y = rect.top + cell;
+        while y < rect.bottom {
+            MoveToEx(hdc, rect.left, y, &mut pt);
+            LineTo(hdc, rect.right, y);
+            y += cell;
+        }
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen as HGDIOBJ);
+    }
+
+    // Progress-bar messages windows-sys keeps behind features this
+    // crate does not enable; defined locally like the others.
+    const PBM_GETRANGE_MSG: u32 = 0x0400 + 7;
+    const PBM_GETPOS_MSG: u32 = 0x0400 + 8;
+
+    #[repr(C)]
+    struct PbRange {
+        low: i32,
+        high: i32,
+    }
+
+    /// Paints a native progress bar the revision 3 way by
+    /// subclassing it: determinate progress is **ten equal
+    /// segments** with a gap between them (the standard's progress
+    /// signature), filled in the `progress` role over the `surface`
+    /// track, the unfilled part of each segment in the `hover`
+    /// fill so the ten-segment structure stays visible. The native
+    /// control keeps owning the range and position — the subclass
+    /// reads them back with PBM_GETRANGE / PBM_GETPOS at paint
+    /// time — so every existing PBM_SETPOS driver works unchanged,
+    /// and the PBM_SETBARCOLOR / PBM_SETBKCOLOR messages the
+    /// windows send simply become no-ops under the paint. Each
+    /// segment's fill is proportional, so the current segment fills
+    /// smoothly instead of jumping in tenths.
+    ///
+    /// # Safety
+    /// `bar` must be a live msctls_progress32 window handle.
+    pub unsafe fn subclass_progress(bar: HWND) {
+        if bar.is_null() {
+            return;
+        }
+        SetWindowSubclass(bar, Some(progress_subclass_proc), PROGRESS_SUBCLASS_ID, 0);
+    }
+
+    const PROGRESS_SUBCLASS_ID: usize = 0x5E42;
+
+    unsafe extern "system" fn progress_subclass_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _uid_subclass: usize,
+        _ref_data: usize,
+    ) -> LRESULT {
+        match msg {
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if !hdc.is_null() {
+                    paint_progress_dc(hwnd, hdc);
+                    EndPaint(hwnd, &ps);
+                }
+                0
+            }
+            WM_PRINTCLIENT_MSG => {
+                paint_progress_dc(hwnd, wparam as HDC);
+                0
+            }
+            WM_ERASEBKGND => 1,
+            WM_NCDESTROY => {
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                RemoveWindowSubclass(hwnd, Some(progress_subclass_proc), PROGRESS_SUBCLASS_ID);
+                result
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// The segmented progress paint itself: ten segments across the
+    /// client rect, each filled in proportion to the position
+    /// within its tenth of the range.
+    unsafe fn paint_progress_dc(hwnd: HWND, hdc: HDC) {
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut client);
+        FillRect(hdc, &client, brush(SURFACE));
+        let mut range = PbRange { low: 0, high: 100 };
+        SendMessageW(
+            hwnd,
+            PBM_GETRANGE_MSG,
+            0,
+            &mut range as *mut PbRange as LPARAM,
+        );
+        let pos = SendMessageW(hwnd, PBM_GETPOS_MSG, 0, 0) as i32;
+        let span = (range.high - range.low).max(1) as f32;
+        let frac = ((pos - range.low) as f32 / span).clamp(0.0, 1.0);
+        const SEGMENTS: i32 = 10;
+        const GAP: i32 = 2;
+        let width = client.right - client.left;
+        let seg_w = ((width - GAP * (SEGMENTS - 1)) / SEGMENTS).max(0);
+        for i in 0..SEGMENTS {
+            let left = client.left + i * (seg_w + GAP);
+            let right = if i == SEGMENTS - 1 {
+                client.right
+            } else {
+                left + seg_w
+            };
+            if right <= left {
+                continue;
+            }
+            let seg = RECT {
+                left,
+                top: client.top,
+                right,
+                bottom: client.bottom,
+            };
+            FillRect(hdc, &seg, brush(HOVER_FILL));
+            let fill_frac = (frac * SEGMENTS as f32 - i as f32).clamp(0.0, 1.0);
+            if fill_frac > 0.0 {
+                let filled = RECT {
+                    right: left + ((right - left) as f32 * fill_frac) as i32,
+                    ..seg
+                };
+                if filled.right > filled.left {
+                    FillRect(hdc, &filled, brush(PROGRESS));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
-pub use win::{brush, draw_checkbox, draw_push_button, listview_custom_draw, subclass_list_header};
+pub use win::{
+    brush, draw_checkbox, draw_focus_ring, draw_push_button, listview_custom_draw, paint_grid,
+    subclass_list_header, subclass_progress,
+};

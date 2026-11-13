@@ -456,9 +456,10 @@ mod imp {
     use crate::overlay::{FileRecordHeader, OverlayManifestHeader, PowerSpec};
     use crate::scanner::format_bytes;
 
-    // Colors come from the shared TesselGUI 1.4.0 theme module —
-    // this window keeps no private palette. (The rail takes the
-    // theme's background token; the info box its accent token.)
+    // Colors come from the shared TesselGUI 2.0.0 (revision 3)
+    // theme module — this window keeps no private palette. (The
+    // rail takes the theme's background token; the Review banner
+    // its info/warning status fills.)
     use crate::theme;
 
     // The rail: fixed left panel, its step list, and its disk block.
@@ -1434,6 +1435,9 @@ mod imp {
         // wherever the control paints with message colors).
         SendMessageW(bar, PBM_SETBARCOLOR_MSG, 0, theme::PROGRESS as LPARAM);
         SendMessageW(bar, PBM_SETBKCOLOR_MSG, 0, theme::SURFACE as LPARAM);
+        // Revision 3 progress is ten segments; the subclass paints
+        // them over the native control (position/range unchanged).
+        theme::subclass_progress(bar);
 
         // ---- Page 4: Finish ----
         mk(&static_class, "", 0, 174, 82, 674, 330, ID_LBL_FINISH);
@@ -2103,6 +2107,18 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
+            WM_ERASEBKGND => {
+                // The page background: the background fill with the
+                // revision 3 signature grid over it. The rail static
+                // and every control paint their own solid fills on
+                // top, so the grid stays in the page's empty areas.
+                let hdc = wparam as HDC;
+                let mut client: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut client);
+                FillRect(hdc, &client, theme::brush(theme::BACKGROUND));
+                theme::paint_grid(hdc, &client, theme::GRID_CELL);
+                1
+            }
             WM_CTLCOLORSTATIC => {
                 let hdc = wparam as HDC;
                 let ctrl = lparam as HWND;
@@ -2113,7 +2129,7 @@ mod imp {
                     .and_then(|g| g.as_ref().map(|s| (s.installed, s.page)))
                     .unwrap_or((false, 1));
                 if id == ID_TILE {
-                    // The monogram tile: app-green block, light initial.
+                    // The monogram tile: Carmine block, light initial.
                     SetBkMode(hdc, OPAQUE as i32);
                     SetBkColor(hdc, theme::ACTION);
                     SetTextColor(hdc, theme::ACCENT_FOREGROUND);
@@ -2126,7 +2142,7 @@ mod imp {
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if let Some(i) = ID_STEP_ACCENTS.iter().position(|a| *a == id) {
-                    // Accent bar: green for the current step, rail
+                    // Accent bar: Carmine for the current step, rail
                     // color (invisible) for the rest.
                     SetBkMode(hdc, OPAQUE as i32);
                     if page == (i + 1) as u8 {
@@ -2137,8 +2153,9 @@ mod imp {
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if let Some(i) = ID_STEP_NUMS.iter().position(|a| *a == id) {
-                    // Step number: green-filled while current, a green
-                    // check once complete, dim while still ahead.
+                    // Step number: Carmine-filled while current, a
+                    // success-colored check once complete, dim while
+                    // still ahead.
                     let step = (i + 1) as u8;
                     if page == step {
                         SetBkMode(hdc, OPAQUE as i32);
@@ -2186,15 +2203,30 @@ mod imp {
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_INFO {
-                    // The info box: light text on the deep-blue fill.
+                    // The Review banner, in the standard's status
+                    // fills: info colors while the location is
+                    // usable; warning colors while it is not (the
+                    // banner's text switches between the ready note
+                    // and the writability explanation on the same
+                    // verdict).
+                    let location_ok = STATE
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|s| s.location_ok))
+                        .unwrap_or(true);
                     SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, theme::ACCENT);
-                    SetTextColor(hdc, theme::FOREGROUND);
-                    return theme::brush(theme::ACCENT) as LRESULT;
+                    if location_ok {
+                        SetBkColor(hdc, theme::INFO_FILL);
+                        SetTextColor(hdc, theme::INFO);
+                        return theme::brush(theme::INFO_FILL) as LRESULT;
+                    }
+                    SetBkColor(hdc, theme::WARNING_FILL);
+                    SetTextColor(hdc, theme::WARNING);
+                    return theme::brush(theme::WARNING_FILL) as LRESULT;
                 }
                 SetBkMode(hdc, TRANSPARENT as i32);
                 if (id == ID_LBL_STATUS || id == ID_LBL_FINISH) && installed {
-                    // Success green, always paired with the status text.
+                    // Success color, always paired with the status text.
                     SetTextColor(hdc, theme::SUCCESS);
                 } else if id == ID_LBL_STEP
                     || id == ID_LBL_HINT
