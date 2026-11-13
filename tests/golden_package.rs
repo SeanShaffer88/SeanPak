@@ -89,7 +89,7 @@ fn golden_package_packs_verifies_and_sandbox_installs() {
     let report = verify_package(&outcome.setup.path).expect("verify must run");
     assert!(report.ok, "verify failed: {:?}", report.checks);
     assert_eq!(report.app_name, "GoldenApp");
-    assert_eq!(report.manifest_version, 4);
+    assert_eq!(report.manifest_version, 5);
 
     // The sandbox proof: real silent install / compare / uninstall /
     // residue check, driven through the packed binary itself.
