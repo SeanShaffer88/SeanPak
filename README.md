@@ -111,15 +111,31 @@ back and confirmed.
 .\seanpak.exe pack app.json "C:\AppBuild" --out-dir dist --json
 
 # Prove a built installer before publishing it (overlay readable,
-# embedded manifest sane, embedded file list matches the payloads):
+# embedded manifest sane, embedded file list matches the payloads).
+# --sandbox goes further: silent-install into a fresh temp dir,
+# compare every file byte-for-byte, silent-uninstall, residue check.
 .\seanpak.exe verify "dist\MyApp-v1.0.0-x64-Setup.exe" --json
+.\seanpak.exe verify "dist\MyApp-v1.0.0-x64-Setup.exe" --sandbox --json
 
 # Install headlessly — the same operation the wizard's Install button
 # runs. --dry-run prints the exact plan (JSON with --json) and changes
-# nothing; --silent / --headless suppress interactive output.
+# nothing; --silent / --headless suppress interactive output. Install
+# applies the manifest's shortcuts, file associations, and PATH entry
+# (all journaled for uninstall), writes seanpak-receipt.json into the
+# install dir, and detects an existing install: same version repairs
+# with --repair, a newer version makes downgrade refused unless
+# --force, an older one upgrades in place.
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --json
+.\AppSetup.exe --install --to "D:\Apps\MyApp" --repair --json
 .\AppSetup.exe --uninstall --to "D:\Apps\MyApp" --json
 ```
+
+**Packaging other projects in CI.** SeanPak is the standing packaging
+route for all of SEAN's Windows programs: a project's release workflow
+calls the reusable workflow in `.github/workflows/pack-reusable.yml`,
+which builds SeanPak, runs `seanpak pack` with the project's manifest
+and files, and uploads the three assets. See `docs/PACKAGING.md` for
+the caller-workflow example.
 
 **Exit codes** (deterministic; also printed by `--help`): `0` success ·
 `1` generic/GUI failure · `2` usage error · `3` bad or missing
@@ -128,9 +144,8 @@ manifest/overlay · `4` I/O failure (including a refused overwrite) ·
 
 ## Known limitations (honest list)
 - The native GUI is a single-window packager (folder → build); multi-page configuration lives in the CLI flags and the `BuildConfig` used by the script engines.
-- The native wizard is a single review page: it installs the payload and registers the uninstaller, but shortcut creation, file associations, and PATH entries are recorded in the package and shown in the wizard without being applied yet, and there is no progress page. `docs/PARITY.md` tracks exactly what remains.
-- Payloads are stored uncompressed by design: installers are larger than compressed formats in exchange for packaging/extraction speed.
-- Windows GUI behavior is compile-verified in CI on all three targets; interactive on-machine testing is still recommended before shipping an installer to users.
+- Payloads are compressed per file (Windows Compression API on Windows; a built-in LZ codec elsewhere) and stored uncompressed when compression would not shrink them. Packages written by older SeanPak/CrucibleKit/RustPak versions remain readable and installable.
+- Windows GUI behavior is compile-verified in CI on all three targets; interactive on-machine testing is still recommended before shipping an installer to users. `docs/PARITY.md` tracks exactly what is shipped and what remains.
 
 ## License
 Licensed under the MIT License. 100% Free and Open Source Software (FOSS).

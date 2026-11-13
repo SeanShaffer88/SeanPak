@@ -2,6 +2,24 @@
 
 All notable changes to the SeanPak utility are documented in this file. (3.0.0 was published under the product's former name, CrucibleKit; releases before 3.0.0 under its original name, RustPak.)
 
+## [4.1.0] - 2026-11-13
+### Added
+- **Install now applies everything the wizard shows.** Desktop and Start Menu shortcuts (`.lnk` via IShellLink), per-user file associations (HKCU `Software\Classes`, no admin), and the PATH entry (HKCU Environment, appended only when absent, change broadcast) are created at install time from the manifest's install options — and journaled, so uninstall removes exactly what install added: shortcuts are deleted, an association is reverted only while it still points at this app (its previous default is restored), and PATH loses only the exact segment that was added. The CLI `--install` and the wizard run the same shared operation.
+- **Wizard pages 2–4.** Page 2 Options edits the install location (typed or folder picker), the shortcut/PATH toggles, the Start Menu folder, and the file associations — the Review table's Change column routes there. Page 3 Progress runs the install on a worker thread with live per-file progress; Cancel rolls the install back and lands on an honest "cancelled, nothing kept" Finish state. Page 4 Finish reports what was installed, where, and the receipt path; failures show the plain-language reason and the rollback note. The wizard header shows the packaged app's monogram tile in the app-green style.
+- **Payload compression (overlay manifest v4).** Each payload is compressed per file — the Windows Compression API (XPRESS Huffman) on Windows, a built-in LZ codec as the portable fallback — and stored uncompressed when compression would not shrink it. Packages written by 4.0.0 (v3), CrucibleKit (v2), and RustPak install exactly as before.
+- **Upgrade / repair / downgrade protection.** Install detects an existing install (install receipt first, uninstall entry as fallback): an older version upgrades in place with the old files journaled so a failed upgrade restores the old install; the same version repairs with `--repair` (missing or changed files are restored and reported); a newer installed version makes the install refuse the downgrade unless `--force`.
+- **Install receipt.** A successful install writes `seanpak-receipt.json` into the install folder (app, version, publisher, path, timestamp, file list with SHA-256 hashes, options applied, and the journaled system artifacts) and mirrors a record into `seanpak.log`; uninstall reads the receipt to remove the artifacts.
+- **`seanpak verify --sandbox <Setup.exe>`:** the end-to-end proof — silent-install into a fresh temp dir, byte-for-byte comparison of every installed file against the payload, silent uninstall, and a residue assertion, as a JSON report with a pass/fail exit code. Wired into CI against a golden fixture package, next to a new stub-size budget step (4 MiB; measured stub ≈ 0.6 MB).
+- **Reusable CI for other projects:** `.github/workflows/pack-reusable.yml` (`workflow_call`) builds SeanPak and packs a caller project's release from its manifest + files; `docs/PACKAGING.md` shows the caller workflow. SeanPak is the standing packaging route for all of SEAN's Windows programs.
+- **Golden-package fixture** (`tests/golden_package.rs`): the test suite packs a tiny fixture app with compressible payloads and asserts the Setup.exe beats the stored-only size, verify passes, and the sandbox proof passes.
+
+### Fixed
+- The rollback journal's backup directory could collide when two transactions started within the same millisecond in one process (backups overwrote each other); transaction directories are now unique per transaction.
+
+### Known limitations
+- All Windows runtime behavior in this release is **Unverified** until a field pass on a real Windows machine (the full lifecycle — pack with compression, sandbox proof, install, upgrade, downgrade refusal, repair, uninstall — is verified on the host build, where Windows-only system integration is a no-op by design).
+- The Builder GUI keeps its 3.0.0-era layout (Design D studio layout remains future work), and builds are still folder + flags driven (no `.seanpak` project model file yet).
+
 ## [4.0.0] - 2026-11-12
 ### Changed
 - **CrucibleKit is now SeanPak.** The product, repository (now https://github.com/SeanShaffer88/SeanPak), crate, and executable (`seanpak.exe`) were renamed in one pass; SeanPak is the single custom TesselGUI installer for all of SEAN's projects. The overlay format marker changed from `CRUCIBLEKIT_OVL` to `SEANPAK_OVL`; the reader still accepts both legacy markers (`CRUCIBLEKIT_OVL` and `RUSTPAK_OVERLAY`), so packages built with CrucibleKit or RustPak remain listable, extractable, and installable.
