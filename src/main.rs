@@ -99,7 +99,8 @@ fn print_usage() {
          \x20 seanpak.exe --extract <packed.exe> --to <dir> [--json]\n\
          \x20                                      Extract a SeanPak overlay to a directory\n\
          \x20 seanpak.exe --install [--to <dir>] [--dry-run] [--json] [--silent|--headless]\n\
-         \x20                                      [--repair] [--force]\n\
+         \x20                                      [--repair] [--force] [--launch]\n\
+         \x20                                      [--start-at-login|--no-start-at-login]\n\
          \x20                                      Install this executable's own overlay: the\n\
          \x20                                      same operation the wizard's Install button\n\
          \x20                                      runs (extract + Uninstall.exe + uninstall\n\
@@ -109,13 +110,28 @@ fn print_usage() {
          \x20                                      existing install is detected: same version\n\
          \x20                                      repairs with --repair, a newer version makes\n\
          \x20                                      downgrade refused unless --force, an older\n\
-         \x20                                      one upgrades in place. Default destination:\n\
+         \x20                                      one upgrades in place. Installs are per-user:\n\
+         \x20                                      a destination your account cannot write is\n\
+         \x20                                      refused before anything changes (JSON reason\n\
+         \x20                                      \"location_not_writable\" plus a suggested\n\
+         \x20                                      per-user location). --start-at-login /\n\
+         \x20                                      --no-start-at-login override the package's\n\
+         \x20                                      start-at-login default for this run;\n\
+         \x20                                      --launch starts the app afterwards (an\n\
+         \x20                                      explicit opt-in; headless installs never\n\
+         \x20                                      launch by default). Default destination:\n\
          \x20                                      a folder named after the app, next to the exe\n\
-         \x20 seanpak.exe --uninstall [--to <dir>] [--json]\n\
+         \x20 seanpak.exe --uninstall [--to <dir>] [--json] [--purge-data]\n\
          \x20                                      Remove an installed app: deletes its payload\n\
          \x20                                      files, its uninstall entry, the journaled\n\
-         \x20                                      shortcuts/associations/PATH segment recorded\n\
-         \x20                                      in seanpak-receipt.json, and the receipt\n\
+         \x20                                      shortcuts/associations/PATH segment/\n\
+         \x20                                      start-at-login entry recorded in\n\
+         \x20                                      seanpak-receipt.json, and the receipt.\n\
+         \x20                                      Interactive runs first show a confirmation\n\
+         \x20                                      window with an opt-in checkbox to also\n\
+         \x20                                      delete the app's recorded data folders.\n\
+         \x20                                      Silent/JSON runs never delete data unless\n\
+         \x20                                      --purge-data is passed\n\
          \x20 seanpak.exe --help                   This help\n\
          \x20 seanpak.exe --version                Print version\n\
          \n\
@@ -221,7 +237,9 @@ fn run_extract(args: &[String], packed: &Path, dest: &Path) -> i32 {
 /// as the wizard's Install button (see `install::perform_install`) against
 /// this executable's own overlay. Default destination is a folder named
 /// after the app, next to the executable. `--dry-run` reports the exact
-/// plan and changes nothing.
+/// plan (including the destination writability verdict) and changes
+/// nothing; a real run refuses an unwritable destination before the
+/// operation starts, with the `location_not_writable` JSON reason.
 fn run_install(args: &[String]) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -247,6 +265,20 @@ fn run_install(args: &[String]) -> i32 {
                 .unwrap_or_else(|| PathBuf::from(sanitize_folder_name(&app)))
         }
     };
+    // The start-at-login CLI flags override the package's recorded
+    // choice for this run (the dry-run plan reflects them too).
+    let start_at_login_override = if has_flag(args, &["--start-at-login"]) {
+        Some(true)
+    } else if has_flag(args, &["--no-start-at-login"]) {
+        Some(false)
+    } else {
+        None
+    };
+    let mut options = options;
+    if let Some(choice) = start_at_login_override {
+        options.start_at_login = 1;
+        options.start_at_login_default = choice as u8;
+    }
     let plan = install::plan_install(&manifest, &records, &options, &dest);
 
     if has_flag(args, &["--dry-run"]) {
@@ -297,6 +329,15 @@ fn run_install(args: &[String]) -> i32 {
                     JsonValue::Array(plan.associations.iter().map(|s| jstr(s.clone())).collect()),
                 ),
                 ("pathEntry", JsonValue::Bool(plan.path_entry)),
+                ("startAtLogin", JsonValue::Bool(plan.start_at_login)),
+                ("locationWritable", JsonValue::Bool(plan.location_writable)),
+                (
+                    "suggestedLocation",
+                    plan.suggested_location
+                        .clone()
+                        .map(|p| jpath(&p))
+                        .unwrap_or(JsonValue::Null),
+                ),
                 ("changes", JsonValue::Bool(false)),
             ]));
         } else {
@@ -323,18 +364,88 @@ fn run_install(args: &[String]) -> i32 {
             if plan.path_entry {
                 println!("  + PATH entry for the install folder");
             }
+            if plan.start_at_login {
+                println!("  + start-at-login entry for the app");
+            }
+            if !plan.location_writable {
+                match &plan.suggested_location {
+                    Some(fallback) => println!(
+                        "  ! {} is not writable by your user account (it needs administrator access, and this installer runs per user). Per-user location: {}",
+                        plan.dest.display(),
+                        fallback.display()
+                    ),
+                    None => println!(
+                        "  ! {} is not writable by your user account (it needs administrator access, and this installer runs per user).",
+                        plan.dest.display()
+                    ),
+                }
+            }
             println!("Nothing was changed.");
         }
         return EXIT_OK;
+    }
+
+    // Pre-flight writability check, before the operation runs: the
+    // refusal carries the stable `location_not_writable` reason and
+    // the suggested per-user folder in JSON. The operation re-checks
+    // authoritatively before it changes anything.
+    if let install::LocationVerdict::NotWritable { fallback, detail } =
+        install::location_verdict(&dest, &plan.app_name, &options.install_location())
+    {
+        let message = install::location_not_writable_message(&dest, &fallback, &detail);
+        diag::record(
+            "install",
+            vec![
+                ("mode", jstr("real")),
+                ("status", jstr("error")),
+                ("reason", jstr(install::REASON_LOCATION_NOT_WRITABLE)),
+                ("error", jstr(message.clone())),
+            ],
+        );
+        if json_mode(args) {
+            print_json(&jobj(vec![
+                ("command", jstr("install")),
+                ("status", jstr("error")),
+                ("reason", jstr(install::REASON_LOCATION_NOT_WRITABLE)),
+                ("error", jstr(message)),
+                ("dest", jpath(&dest)),
+                ("suggestedLocation", jpath(&fallback)),
+                ("exitCode", JsonValue::Number(EXIT_INSTALL as f64)),
+            ]));
+            return EXIT_INSTALL;
+        }
+        return fail(args, "install", EXIT_INSTALL, &message);
     }
 
     let request = install::InstallRequest {
         options_override: None,
         force: has_flag(args, &["--force"]),
         repair: has_flag(args, &["--repair"]),
+        start_at_login: start_at_login_override,
     };
     match install::perform_install_with(&exe, &dest, &request, None, None) {
         Ok(outcome) => {
+            // --launch is an explicit headless opt-in (headless installs
+            // never launch by default). A launch failure is a warning
+            // in the report, never an install failure.
+            let launch_requested = has_flag(args, &["--launch"]);
+            let mut launch_performed = false;
+            let mut launch_error: Option<String> = None;
+            if launch_requested {
+                match records.get(manifest.primary_exe_index as usize) {
+                    Some(record) => {
+                        let target = outcome.dest.join(record.relative_path().replace('\\', "/"));
+                        match install::launch_program(&target) {
+                            Ok(()) => launch_performed = true,
+                            Err(e) => launch_error = Some(e),
+                        }
+                    }
+                    None => {
+                        launch_error =
+                            Some("the package records no primary executable".to_string());
+                    }
+                }
+            }
             diag::record(
                 "install",
                 vec![
@@ -344,10 +455,16 @@ fn run_install(args: &[String]) -> i32 {
                     ("files", jnum(outcome.files_written as u64)),
                     ("arpWritten", JsonValue::Bool(outcome.arp_written)),
                     ("installMode", jstr(outcome.mode.clone())),
+                    (
+                        "startAtLoginApplied",
+                        JsonValue::Bool(outcome.start_at_login_applied),
+                    ),
+                    ("launchRequested", JsonValue::Bool(launch_requested)),
+                    ("launchPerformed", JsonValue::Bool(launch_performed)),
                 ],
             );
             if json_mode(args) {
-                print_json(&jobj(vec![
+                let mut pairs: Vec<(&str, JsonValue)> = vec![
                     ("command", jstr("install")),
                     ("status", jstr("ok")),
                     ("app", jstr(plan.app_name.clone())),
@@ -372,7 +489,17 @@ fn run_install(args: &[String]) -> i32 {
                         jnum(outcome.associations_applied as u64),
                     ),
                     ("pathEntryAdded", JsonValue::Bool(outcome.path_entry_added)),
-                ]));
+                    (
+                        "startAtLoginApplied",
+                        JsonValue::Bool(outcome.start_at_login_applied),
+                    ),
+                    ("launchRequested", JsonValue::Bool(launch_requested)),
+                    ("launchPerformed", JsonValue::Bool(launch_performed)),
+                ];
+                if let Some(e) = &launch_error {
+                    pairs.push(("launchError", jstr(e.clone())));
+                }
+                print_json(&jobj(pairs));
             } else if !quiet_mode(args) {
                 println!(
                     "Installed {} files to {} (uninstall entry: {}).",
@@ -385,6 +512,15 @@ fn run_install(args: &[String]) -> i32 {
                     }
                 );
                 println!("Receipt: {}", outcome.receipt_path.display());
+                if outcome.start_at_login_applied {
+                    println!("Start at login: on (per-user Run entry).");
+                }
+                if launch_performed {
+                    println!("Launched {}.", plan.app_name);
+                }
+                if let Some(e) = &launch_error {
+                    eprintln!("[WARN] Install succeeded, but the program did not start: {e}");
+                }
             }
             EXIT_OK
         }
@@ -402,11 +538,15 @@ fn run_install(args: &[String]) -> i32 {
     }
 }
 
-/// Uninstall mode (the ARP entry's uninstall string points here): deletes
-/// every payload file this executable's overlay records under the install
-/// directory, removes now-empty payload subdirectories, and removes the
-/// Add/Remove Programs entry. The running `Uninstall.exe` copy itself
-/// cannot be deleted while it runs; it is reported and left behind.
+/// Uninstall mode (the ARP entry's uninstall string points here): the
+/// shared uninstall operation (`seanpak::uninstall::perform_uninstall`)
+/// removes the payload, the journaled system artifacts, the receipt,
+/// and the Add/Remove Programs entry. Interactive runs (not silent,
+/// not `--json`) first open the native confirmation window, whose
+/// checkbox is the only interactive route to deleting the app's data
+/// folders; silent runs delete data only with an explicit
+/// `--purge-data`. The running `Uninstall.exe` copy itself cannot be
+/// deleted while it runs; it is reported and left behind.
 fn run_uninstall(args: &[String]) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -431,58 +571,26 @@ fn run_uninstall(args: &[String]) -> i32 {
         None => seanpak::wizard::default_install_dir(&options, &manifest.app_name()),
     };
 
-    // The install receipt is the journal of system artifacts (shortcuts,
-    // associations, PATH segment) this install applied; read it before
-    // anything is deleted so uninstall can remove exactly those.
-    let receipt = seanpak::receipt::read_receipt(&dest);
+    // The confirmation window lists the data folders the install
+    // receipt recorded; read them before anything is deleted.
+    let recorded_data_dirs: Vec<PathBuf> = seanpak::receipt::read_receipt(&dest)
+        .map(|r| r.data_dirs.iter().map(PathBuf::from).collect())
+        .unwrap_or_default();
 
-    let mut removed: Vec<String> = Vec::new();
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for record in &records {
-        let rel = record.relative_path().replace('\\', "/");
-        if rel.is_empty() || rel.contains("..") {
-            continue;
-        }
-        let target = dest.join(&rel);
-        if target.is_file() {
-            match std::fs::remove_file(&target) {
-                Ok(()) => removed.push(rel),
-                Err(e) => eprintln!("[WARN] Could not remove {}: {e}", target.display()),
+    let mut purge_data = has_flag(args, &["--purge-data"]);
+    let interactive = !quiet_mode(args) && !json_mode(args);
+    if interactive && !purge_data {
+        match seanpak::wizard::confirm_uninstall(&manifest.app_name(), &recorded_data_dirs) {
+            Some(purge) => purge_data = purge,
+            None => {
+                println!("Uninstall cancelled; nothing was removed.");
+                return EXIT_OK;
             }
         }
-        let mut dir = target.parent().map(|p| p.to_path_buf());
-        while let Some(d) = dir {
-            if d == dest {
-                break;
-            }
-            subdirs.push(d.clone());
-            dir = d.parent().map(|p| p.to_path_buf());
-        }
     }
-    subdirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-    subdirs.dedup();
-    for dir in &subdirs {
-        let _ = std::fs::remove_dir(dir); // only succeeds when empty
-    }
-    // Remove the journaled system artifacts and the receipt itself.
-    let mut artifacts_removed = 0usize;
-    if let Some(receipt) = &receipt {
-        artifacts_removed = receipt.artifacts.shortcuts.len()
-            + receipt.artifacts.associations.len()
-            + receipt.artifacts.path_segment_added.is_some() as usize;
-        seanpak::sysinstall::remove_artifacts(&receipt.artifacts);
-    }
-    let receipt_removed = std::fs::remove_file(seanpak::receipt::receipt_path(&dest)).is_ok();
-    seanpak::wizard::delete_uninstall_entry(&manifest.app_name());
-    diag::record(
-        "uninstall",
-        vec![
-            ("app", jstr(manifest.app_name())),
-            ("from", jpath(&dest)),
-            ("removed", jnum(removed.len() as u64)),
-            ("artifactsRemoved", jnum(artifacts_removed as u64)),
-        ],
-    );
+
+    let outcome =
+        seanpak::uninstall::perform_uninstall(&manifest.app_name(), &records, &dest, purge_data);
     let self_copy_note = exe.starts_with(&dest);
     if json_mode(args) {
         print_json(&jobj(vec![
@@ -491,22 +599,55 @@ fn run_uninstall(args: &[String]) -> i32 {
             ("uninstalled", jstr(manifest.app_name())),
             (
                 "removed",
-                JsonValue::Array(removed.iter().map(|r| jstr(r.clone())).collect()),
+                JsonValue::Array(
+                    outcome
+                        .removed_files
+                        .iter()
+                        .map(|r| jstr(r.clone()))
+                        .collect(),
+                ),
             ),
-            ("artifactsRemoved", jnum(artifacts_removed as u64)),
-            ("receiptRemoved", JsonValue::Bool(receipt_removed)),
+            ("artifactsRemoved", jnum(outcome.artifacts_removed as u64)),
+            ("receiptRemoved", JsonValue::Bool(outcome.receipt_removed)),
             ("from", jpath(&dest)),
             ("selfCopyLeftBehind", JsonValue::Bool(self_copy_note)),
+            ("dataPurged", JsonValue::Bool(purge_data)),
+            (
+                "dataDeleted",
+                JsonValue::Array(
+                    outcome
+                        .data_deleted
+                        .iter()
+                        .map(|d| jstr(d.clone()))
+                        .collect(),
+                ),
+            ),
+            (
+                "dataDeleteFailures",
+                JsonValue::Array(
+                    outcome
+                        .data_delete_failures
+                        .iter()
+                        .map(|d| jstr(d.clone()))
+                        .collect(),
+                ),
+            ),
         ]));
-    } else {
+    } else if !quiet_mode(args) {
         println!(
             "Uninstalled {}: removed {} file(s) from {}",
             manifest.app_name(),
-            removed.len(),
+            outcome.removed_files.len(),
             dest.display()
         );
-        for rel in &removed {
+        for rel in &outcome.removed_files {
             println!("  {rel}");
+        }
+        for deleted in &outcome.data_deleted {
+            println!("  deleted data folder {deleted}");
+        }
+        for failure in &outcome.data_delete_failures {
+            eprintln!("[WARN] Could not delete data folder {failure}");
         }
         if self_copy_note {
             println!(

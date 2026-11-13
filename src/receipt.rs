@@ -6,7 +6,9 @@
 //!
 //! - upgrade/repair detection reads the recorded version,
 //! - uninstall removes exactly the artifacts recorded here (shortcut
-//!   files, file associations with their prior values, the PATH segment),
+//!   files, file associations with their prior values, the PATH segment,
+//!   the start-at-login Run entry) and offers to delete the recorded
+//!   data directories,
 //! - `verify --sandbox` compares installed files against the recorded
 //!   payload hashes.
 //!
@@ -43,6 +45,19 @@ pub struct AssocRecord {
     pub created_prog_id: bool,
 }
 
+/// The HKCU Run ("start at login") entry an install applied, with the
+/// state it replaced — uninstall removes the value only while it still
+/// holds `command`, then restores `prior_value` if there was one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunRecord {
+    /// The Run value's name (the app name).
+    pub name: String,
+    /// The command written (the quoted primary-exe path).
+    pub command: String,
+    /// The value that was there before install, if any.
+    pub prior_value: Option<String>,
+}
+
 /// System artifacts an install applied (all paths are the exact files /
 /// values created, so removal touches nothing else).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -50,6 +65,7 @@ pub struct AppliedArtifacts {
     pub shortcuts: Vec<String>,
     pub associations: Vec<AssocRecord>,
     pub path_segment_added: Option<String>,
+    pub start_at_login: Option<RunRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +84,17 @@ pub struct InstallReceipt {
     pub start_menu_folder: String,
     pub path_entry: bool,
     pub file_associations: Vec<String>,
+    /// The package offered "Launch <app>" on the Finish page…
+    pub launch_after_install_offered: bool,
+    /// …and the checkbox started checked.
+    pub launch_after_install_default: bool,
+    /// The install applied the start-at-login choice (the Run entry
+    /// itself, when applied, is journaled in `artifacts`).
+    pub start_at_login: bool,
+    /// The app's data directories, resolved to absolute paths at
+    /// install time. The uninstall's data-purge option works from
+    /// exactly this list.
+    pub data_dirs: Vec<String>,
     pub artifacts: AppliedArtifacts,
 }
 
@@ -149,7 +176,20 @@ impl InstallReceipt {
                                 .collect(),
                         ),
                     ),
+                    (
+                        "launchAfterInstallOffered",
+                        JsonValue::Bool(self.launch_after_install_offered),
+                    ),
+                    (
+                        "launchAfterInstallDefault",
+                        JsonValue::Bool(self.launch_after_install_default),
+                    ),
+                    ("startAtLogin", JsonValue::Bool(self.start_at_login)),
                 ]),
+            ),
+            (
+                "dataDirs",
+                JsonValue::Array(self.data_dirs.iter().map(|d| jstr(d.clone())).collect()),
             ),
             (
                 "artifacts",
@@ -172,6 +212,20 @@ impl InstallReceipt {
                             .clone()
                             .map(jstr)
                             .unwrap_or(JsonValue::Null),
+                    ),
+                    (
+                        "startAtLogin",
+                        match &self.artifacts.start_at_login {
+                            Some(run) => jobj(vec![
+                                ("name", jstr(run.name.clone())),
+                                ("command", jstr(run.command.clone())),
+                                (
+                                    "priorValue",
+                                    run.prior_value.clone().map(jstr).unwrap_or(JsonValue::Null),
+                                ),
+                            ]),
+                            None => JsonValue::Null,
+                        },
                     ),
                 ]),
             ),
@@ -255,6 +309,25 @@ impl InstallReceipt {
                 .collect(),
             _ => Vec::new(),
         };
+        let start_at_login = match artifacts.get("startAtLogin") {
+            Some(run @ JsonValue::Object(_)) => Some(RunRecord {
+                name: run
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                command: run
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                prior_value: run
+                    .get("priorValue")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            }),
+            _ => None,
+        };
         Some(InstallReceipt {
             app: get_s("app")?,
             version: get_s("version").unwrap_or_default(),
@@ -276,6 +349,18 @@ impl InstallReceipt {
                 .to_string(),
             path_entry: opt_b("pathEntry"),
             file_associations: str_list(options.get("fileAssociations")),
+            // Receipts written before these fields existed parse with
+            // the same defaults the pre-v5 options used.
+            launch_after_install_offered: options
+                .get("launchAfterInstallOffered")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            launch_after_install_default: options
+                .get("launchAfterInstallDefault")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            start_at_login: opt_b("startAtLogin"),
+            data_dirs: str_list(root.get("dataDirs")),
             artifacts: AppliedArtifacts {
                 shortcuts: str_list(artifacts.get("shortcuts")),
                 associations,
@@ -283,6 +368,7 @@ impl InstallReceipt {
                     .get("pathSegmentAdded")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                start_at_login,
             },
         })
     }
@@ -355,6 +441,10 @@ mod tests {
             start_menu_folder: "Test App".to_string(),
             path_entry: true,
             file_associations: vec!["txt".to_string()],
+            launch_after_install_offered: true,
+            launch_after_install_default: false,
+            start_at_login: true,
+            data_dirs: vec!["C:\\Users\\x\\AppData\\Roaming\\Test App".to_string()],
             artifacts: AppliedArtifacts {
                 shortcuts: vec!["C:\\Users\\x\\Desktop\\Test App.lnk".to_string()],
                 associations: vec![AssocRecord {
@@ -365,6 +455,11 @@ mod tests {
                     created_prog_id: true,
                 }],
                 path_segment_added: Some("C:\\Apps\\Test App".to_string()),
+                start_at_login: Some(RunRecord {
+                    name: "Test App".to_string(),
+                    command: "\"C:\\Apps\\Test App\\app.exe\"".to_string(),
+                    prior_value: None,
+                }),
             },
         }
     }
@@ -376,6 +471,19 @@ mod tests {
         let back = InstallReceipt::from_json(&text).expect("receipt must parse back");
         assert_eq!(back, receipt);
         assert!(text.contains("\"installedAt\":\"2023-11-14 22:13:20Z\""));
+    }
+
+    #[test]
+    fn legacy_receipt_without_new_fields_parses_with_defaults() {
+        // A receipt written before the launch/login/data fields existed.
+        let text = r#"{"app":"Old App","version":"1.0","installPath":"C:\\Apps\\Old App",
+            "options":{"desktopShortcut":true},"artifacts":{"shortcuts":[]}}"#;
+        let receipt = InstallReceipt::from_json(text).expect("legacy receipt must parse");
+        assert!(receipt.launch_after_install_offered);
+        assert!(receipt.launch_after_install_default);
+        assert!(!receipt.start_at_login);
+        assert!(receipt.data_dirs.is_empty());
+        assert!(receipt.artifacts.start_at_login.is_none());
     }
 
     #[test]

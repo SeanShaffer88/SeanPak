@@ -1,6 +1,7 @@
 //! System artifacts: the parts of an install that live outside the
 //! install directory — Desktop / Start Menu shortcuts, per-user file
-//! associations, and the per-user PATH entry.
+//! associations, the per-user PATH entry, and the per-user start-at-login
+//! Run entry.
 //!
 //! [`plan_artifacts`] computes what an install *would* apply from the
 //! package's install options (pure apart from resolving the user's
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use crate::overlay::InstallOptions;
 use crate::receipt::AppliedArtifacts;
 #[cfg(windows)]
-use crate::receipt::AssocRecord;
+use crate::receipt::{AssocRecord, RunRecord};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShortcutSpec {
@@ -41,6 +42,13 @@ pub struct ArtifactPlan {
     pub associations: Vec<String>,
     pub prog_id: String,
     pub path_dir: Option<PathBuf>,
+    /// The primary executable's installed path, when the package has
+    /// one — the target of the association open command and of the
+    /// start-at-login Run entry.
+    pub primary_target: Option<PathBuf>,
+    /// Apply the start-at-login Run entry (the option was offered and
+    /// the user's final choice is on, and a primary exe exists).
+    pub start_at_login: bool,
 }
 
 /// ProgId for `app_name`: `SeanPak.<AppName>` with everything outside
@@ -128,6 +136,7 @@ pub fn plan_with_roots(
     }
     if let Some(primary) = primary_rel {
         let target = dest.join(primary.replace('\\', "/"));
+        plan.primary_target = Some(target.clone());
         if options.wants_desktop_shortcut() {
             if let Some(desktop) = desktop_root {
                 plan.shortcuts.push(ShortcutSpec {
@@ -165,6 +174,7 @@ pub fn plan_with_roots(
             }
         }
     }
+    plan.start_at_login = options.start_at_login_chosen() && plan.primary_target.is_some();
     plan
 }
 
@@ -216,9 +226,8 @@ pub fn apply_artifacts(
         }
         if !plan.associations.is_empty() {
             let primary_target = plan
-                .shortcuts
-                .first()
-                .map(|s| s.target.clone())
+                .primary_target
+                .clone()
                 .unwrap_or_else(|| dest.to_path_buf());
             let open_command = format!("\"{}\" \"%1\"", primary_target.display());
             for ext in &plan.associations {
@@ -228,6 +237,12 @@ pub fn apply_artifacts(
         }
         if let Some(dir) = &plan.path_dir {
             applied.path_segment_added = win::apply_path_entry(&dir.to_string_lossy())?;
+        }
+        if plan.start_at_login {
+            if let Some(target) = &plan.primary_target {
+                let command = format!("\"{}\"", target.display());
+                applied.start_at_login = Some(win::apply_run_entry(app_name, &command)?);
+            }
         }
         Ok(())
     })();
@@ -272,6 +287,9 @@ pub fn remove_artifacts(artifacts: &AppliedArtifacts) {
         if let Some(segment) = &artifacts.path_segment_added {
             win::remove_path_entry(segment);
         }
+        if let Some(record) = &artifacts.start_at_login {
+            win::remove_run_entry(record);
+        }
     }
 }
 
@@ -302,6 +320,7 @@ mod win {
 
     const CLASSES: &str = "Software\\Classes";
     const ENVIRONMENT_KEY: &str = "Environment";
+    const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
     pub fn ensure_com() {
         unsafe {
@@ -697,6 +716,36 @@ mod win {
         }
     }
 
+    // -- Start at login (HKCU Run) ------------------------------------------
+
+    /// Writes the Run value named `app_name` with `command`, recording
+    /// the value it replaced (if any) so removal can restore it.
+    pub fn apply_run_entry(app_name: &str, command: &str) -> Result<RunRecord, String> {
+        let prior_value = reg_get_sz(RUN_KEY, Some(app_name)).map(|(v, _)| v);
+        reg_set_sz(RUN_KEY, Some(app_name), command, REG_SZ)?;
+        Ok(RunRecord {
+            name: app_name.to_string(),
+            command: command.to_string(),
+            prior_value,
+        })
+    }
+
+    /// Removes the Run entry an install applied — only while the value
+    /// still holds the recorded command (a value the user or another
+    /// tool has since pointed elsewhere is left alone). Restores the
+    /// value the install replaced, when there was one.
+    pub fn remove_run_entry(record: &RunRecord) {
+        let current = reg_get_sz(RUN_KEY, Some(&record.name)).map(|(v, _)| v);
+        if current.as_deref() == Some(record.command.as_str()) {
+            match &record.prior_value {
+                Some(prior) => {
+                    let _ = reg_set_sz(RUN_KEY, Some(&record.name), prior, REG_SZ);
+                }
+                None => reg_delete_value(RUN_KEY, Some(&record.name)),
+            }
+        }
+    }
+
     // -- ARP detection --------------------------------------------------------
 
     pub fn arp_install(app_name: &str) -> Option<(String, PathBuf)> {
@@ -772,5 +821,36 @@ mod tests {
         assert_eq!(plan.associations, vec!["txt", "md"]);
         assert_eq!(plan.path_dir.as_deref(), Some(dest));
         assert_eq!(plan.prog_id, "SeanPak.MyApp");
+        assert_eq!(
+            plan.primary_target.as_deref(),
+            Some(dest.join("myapp.exe").as_path())
+        );
+        // Start-at-login is not offered by default.
+        assert!(!plan.start_at_login);
+    }
+
+    #[test]
+    fn plan_start_at_login_follows_the_effective_choice() {
+        let dest = Path::new("C:\\Apps\\My App");
+        let mut options = InstallOptions::defaults_for("My App");
+        options.start_at_login = 1;
+        options.start_at_login_default = 1;
+        let plan = plan_with_roots(&options, "My App", dest, Some("myapp.exe"), None, None);
+        assert!(plan.start_at_login);
+        assert_eq!(
+            plan.primary_target.as_deref(),
+            Some(dest.join("myapp.exe").as_path())
+        );
+
+        // Offered but defaulted off (or turned off in the wizard): no entry.
+        options.start_at_login_default = 0;
+        let plan = plan_with_roots(&options, "My App", dest, Some("myapp.exe"), None, None);
+        assert!(!plan.start_at_login);
+
+        // No primary exe: nothing to point the Run entry at.
+        options.start_at_login_default = 1;
+        let plan = plan_with_roots(&options, "My App", dest, None, None, None);
+        assert!(!plan.start_at_login);
+        assert!(plan.primary_target.is_none());
     }
 }

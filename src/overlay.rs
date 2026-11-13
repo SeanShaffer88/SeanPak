@@ -99,12 +99,23 @@ impl FileRecordHeader {
     }
 }
 
-/// Install-time choices recorded in a version 3 overlay, stored as a fixed
-/// block immediately after the file-record table (payload offsets account
-/// for it). Version 2 packages have no block; reading one yields
-/// [`InstallOptions::defaults_for`] for its app name, so legacy packages
-/// stay installable with sensible defaults.
-#[repr(C)]
+/// Capacity of the recorded data-directories field (the v5 options
+/// extension): the app's data locations as one `;`-separated list of
+/// token paths (see `crate::uninstall::resolve_data_dirs`).
+pub const DATA_DIRS_CAPACITY: usize = 1024;
+
+/// Install-time choices recorded in an overlay's options block, stored
+/// immediately after the file-record table (payload offsets account for
+/// it). The on-disk layout is versioned: manifest v3/v4 packages carry
+/// the base block only ([`OptionsDiskBase`]); v5 packages append an
+/// extension block ([`OptionsDiskExt`]) with the launch-after-install
+/// offer, the start-at-login offer, and the app's data directories.
+/// Version 2 packages have no block at all. Readers convert every
+/// version into this one logical struct — pre-v5 packages get the
+/// extension defaults (launch offered, start-at-login not offered, no
+/// data directories) — so legacy packages stay installable with
+/// sensible defaults. This struct is the in-memory form; it is never
+/// serialized raw.
 #[derive(Debug, Clone, Copy)]
 pub struct InstallOptions {
     pub install_location_utf8: [u8; 260],
@@ -114,12 +125,55 @@ pub struct InstallOptions {
     pub start_menu_shortcut: u8,
     pub path_entry: u8,
     pub reserved: [u8; 5],
+    /// v5: the Finish page offers "Launch <App>" (0 = not offered).
+    pub launch_after_install: u8,
+    /// v5: the Finish page's launch checkbox starts checked.
+    pub launch_after_install_default: u8,
+    /// v5: the install offers "Start <App> at login" (0 = not offered).
+    pub start_at_login: u8,
+    /// v5: the start-at-login choice starts on. The wizard's Options
+    /// page edits this field in place (like `desktop_shortcut`), so at
+    /// apply time it holds the user's final choice.
+    pub start_at_login_default: u8,
+    /// v5: the app's data directories, `;`-separated token paths.
+    pub data_dirs_utf8: [u8; DATA_DIRS_CAPACITY],
 }
+
+/// The v3/v4 on-disk options block — byte-for-byte the layout those
+/// packages carry, kept so the reader/writer conversions stay explicit.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct OptionsDiskBase {
+    install_location_utf8: [u8; 260],
+    start_menu_folder_utf8: [u8; 128],
+    file_associations_utf8: [u8; 128],
+    desktop_shortcut: u8,
+    start_menu_shortcut: u8,
+    path_entry: u8,
+    reserved: [u8; 5],
+}
+
+/// The v5 on-disk extension block, written immediately after the base
+/// block in v5 packages.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct OptionsDiskExt {
+    launch_after_install: u8,
+    launch_after_install_default: u8,
+    start_at_login: u8,
+    start_at_login_default: u8,
+    data_dirs_utf8: [u8; DATA_DIRS_CAPACITY],
+}
+
+const OPTIONS_BASE_DISK_SIZE: usize = std::mem::size_of::<OptionsDiskBase>();
+const OPTIONS_EXT_DISK_SIZE: usize = std::mem::size_of::<OptionsDiskExt>();
 
 impl InstallOptions {
     /// Defaults matching what earlier SeanPak/CrucibleKit installers did:
     /// per-app folder under Program Files, Start Menu entry on, desktop
-    /// shortcut on, no file associations, no PATH entry.
+    /// shortcut on, no file associations, no PATH entry — plus the v5
+    /// extension defaults: launch-after-install offered (checked), the
+    /// start-at-login option not offered, no data directories.
     pub fn defaults_for(app_name: &str) -> Self {
         let mut options = Self {
             install_location_utf8: [0u8; 260],
@@ -129,6 +183,11 @@ impl InstallOptions {
             start_menu_shortcut: 1,
             path_entry: 0,
             reserved: [0u8; 5],
+            launch_after_install: 1,
+            launch_after_install_default: 1,
+            start_at_login: 0,
+            start_at_login_default: 0,
+            data_dirs_utf8: [0u8; DATA_DIRS_CAPACITY],
         };
         copy_str_to_fixed(
             &mut options.install_location_utf8,
@@ -136,6 +195,59 @@ impl InstallOptions {
         );
         copy_str_to_fixed(&mut options.start_menu_folder_utf8, app_name);
         options
+    }
+
+    /// The v3/v4 disk form of the base fields.
+    fn disk_base(&self) -> OptionsDiskBase {
+        OptionsDiskBase {
+            install_location_utf8: self.install_location_utf8,
+            start_menu_folder_utf8: self.start_menu_folder_utf8,
+            file_associations_utf8: self.file_associations_utf8,
+            desktop_shortcut: self.desktop_shortcut,
+            start_menu_shortcut: self.start_menu_shortcut,
+            path_entry: self.path_entry,
+            reserved: self.reserved,
+        }
+    }
+
+    /// Logical options from a v3/v4 base block: the extension fields
+    /// take the pre-v5 defaults (the same values [`Self::defaults_for`]
+    /// uses), because those packages recorded no extension.
+    fn from_disk_base(base: &OptionsDiskBase) -> Self {
+        Self {
+            install_location_utf8: base.install_location_utf8,
+            start_menu_folder_utf8: base.start_menu_folder_utf8,
+            file_associations_utf8: base.file_associations_utf8,
+            desktop_shortcut: base.desktop_shortcut,
+            start_menu_shortcut: base.start_menu_shortcut,
+            path_entry: base.path_entry,
+            reserved: base.reserved,
+            launch_after_install: 1,
+            launch_after_install_default: 1,
+            start_at_login: 0,
+            start_at_login_default: 0,
+            data_dirs_utf8: [0u8; DATA_DIRS_CAPACITY],
+        }
+    }
+
+    /// The v5 disk form of the extension fields.
+    fn disk_ext(&self) -> OptionsDiskExt {
+        OptionsDiskExt {
+            launch_after_install: self.launch_after_install,
+            launch_after_install_default: self.launch_after_install_default,
+            start_at_login: self.start_at_login,
+            start_at_login_default: self.start_at_login_default,
+            data_dirs_utf8: self.data_dirs_utf8,
+        }
+    }
+
+    /// Merges a v5 extension block read from disk into these options.
+    fn apply_disk_ext(&mut self, ext: &OptionsDiskExt) {
+        self.launch_after_install = ext.launch_after_install;
+        self.launch_after_install_default = ext.launch_after_install_default;
+        self.start_at_login = ext.start_at_login;
+        self.start_at_login_default = ext.start_at_login_default;
+        self.data_dirs_utf8 = ext.data_dirs_utf8;
     }
 
     pub fn install_location(&self) -> String {
@@ -160,6 +272,43 @@ impl InstallOptions {
 
     pub fn wants_path_entry(&self) -> bool {
         self.path_entry != 0
+    }
+
+    /// The package offers "Launch <App>" on the Finish page.
+    pub fn offers_launch_after_install(&self) -> bool {
+        self.launch_after_install != 0
+    }
+
+    /// The Finish page's launch checkbox starts checked.
+    pub fn launch_after_install_default_checked(&self) -> bool {
+        self.launch_after_install_default != 0
+    }
+
+    /// The package offers the "Start <App> at login" install option.
+    pub fn offers_start_at_login(&self) -> bool {
+        self.start_at_login != 0
+    }
+
+    /// The start-at-login option starts on (and, after the wizard's
+    /// Options page edits it in place, holds the user's final choice).
+    pub fn start_at_login_default_checked(&self) -> bool {
+        self.start_at_login_default != 0
+    }
+
+    /// The effective start-at-login choice an install applies: only an
+    /// offered option can be on.
+    pub fn start_at_login_chosen(&self) -> bool {
+        self.offers_start_at_login() && self.start_at_login_default_checked()
+    }
+
+    /// The app's recorded data directories (token paths, as written in
+    /// the manifest — resolution happens at install time).
+    pub fn data_dirs(&self) -> Vec<String> {
+        fixed_str(&self.data_dirs_utf8)
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 }
 
@@ -190,8 +339,8 @@ impl OverlayWriter {
     }
 
     /// Like [`OverlayWriter::build_from_folder`], but records explicit
-    /// install-time `options` in the package (options block, since manifest version 3) instead of
-    /// the per-app defaults.
+    /// install-time `options` in the package (options blocks, manifest
+    /// version 5) instead of the per-app defaults.
     #[allow(clippy::too_many_arguments)]
     pub fn build_from_folder_with_options(
         stub_binary_path: &Path,
@@ -262,7 +411,7 @@ impl OverlayWriter {
 
         let mut manifest = OverlayManifestHeader {
             magic: *OVERLAY_MAGIC,
-            version: 4,
+            version: 5,
             file_count: files.len() as u32,
             primary_exe_index: 0,
             total_uncompressed_bytes: 0,
@@ -278,7 +427,8 @@ impl OverlayWriter {
 
         let manifest_size = std::mem::size_of::<OverlayManifestHeader>() as u64;
         let records_total_size = (files.len() * std::mem::size_of::<FileRecordHeader>()) as u64;
-        let options_size = std::mem::size_of::<InstallOptions>() as u64;
+        // v5 options: the v3/v4 base block plus the v5 extension block.
+        let options_size = (OPTIONS_BASE_DISK_SIZE + OPTIONS_EXT_DISK_SIZE) as u64;
         let mut current_payload_offset =
             aligned_overlay_start + manifest_size + records_total_size + options_size;
 
@@ -338,14 +488,24 @@ impl OverlayWriter {
             out_file.write_all(header_bytes)?;
         }
 
-        // Write the version 3 install-options block after the record table.
-        let options_bytes = unsafe {
+        // Write the install-options blocks after the record table: the
+        // base block (the v3 layout) followed by the v5 extension.
+        let base = options.disk_base();
+        let base_bytes = unsafe {
             std::slice::from_raw_parts(
-                options as *const InstallOptions as *const u8,
-                std::mem::size_of::<InstallOptions>(),
+                &base as *const OptionsDiskBase as *const u8,
+                OPTIONS_BASE_DISK_SIZE,
             )
         };
-        out_file.write_all(options_bytes)?;
+        out_file.write_all(base_bytes)?;
+        let ext = options.disk_ext();
+        let ext_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ext as *const OptionsDiskExt as *const u8,
+                OPTIONS_EXT_DISK_SIZE,
+            )
+        };
+        out_file.write_all(ext_bytes)?;
 
         // Write the stored (possibly compressed) payloads in record order.
         for stored in &stored_payloads {
@@ -372,9 +532,11 @@ impl OverlayReader {
     }
 
     /// Like [`OverlayReader::read_manifest`], but also returns the package's
-    /// install options. Version 3 packages carry an explicit options block;
-    /// older packages (any accepted magic, manifest version 2) yield
-    /// [`InstallOptions::defaults_for`] for the recorded app name.
+    /// install options. Version 3+ packages carry an explicit options
+    /// block (v5 appends the extension block); older packages (any
+    /// accepted magic, manifest version 2) yield
+    /// [`InstallOptions::defaults_for`] for the recorded app name, and
+    /// v3/v4 packages get the extension defaults.
     pub fn read_package<R: Read + Seek>(
         mut reader: R,
     ) -> std::io::Result<Option<(OverlayManifestHeader, Vec<FileRecordHeader>, InstallOptions)>>
@@ -439,14 +601,40 @@ impl OverlayReader {
         }
 
         let options = if manifest.version >= 3 {
-            let mut options = InstallOptions::defaults_for(&manifest.app_name());
-            let options_slice = unsafe {
+            let mut base = OptionsDiskBase {
+                install_location_utf8: [0u8; 260],
+                start_menu_folder_utf8: [0u8; 128],
+                file_associations_utf8: [0u8; 128],
+                desktop_shortcut: 0,
+                start_menu_shortcut: 0,
+                path_entry: 0,
+                reserved: [0u8; 5],
+            };
+            let base_slice = unsafe {
                 std::slice::from_raw_parts_mut(
-                    &mut options as *mut InstallOptions as *mut u8,
-                    std::mem::size_of::<InstallOptions>(),
+                    &mut base as *mut OptionsDiskBase as *mut u8,
+                    OPTIONS_BASE_DISK_SIZE,
                 )
             };
-            reader.read_exact(options_slice)?;
+            reader.read_exact(base_slice)?;
+            let mut options = InstallOptions::from_disk_base(&base);
+            if manifest.version >= 5 {
+                let mut ext = OptionsDiskExt {
+                    launch_after_install: 0,
+                    launch_after_install_default: 0,
+                    start_at_login: 0,
+                    start_at_login_default: 0,
+                    data_dirs_utf8: [0u8; DATA_DIRS_CAPACITY],
+                };
+                let ext_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        &mut ext as *mut OptionsDiskExt as *mut u8,
+                        OPTIONS_EXT_DISK_SIZE,
+                    )
+                };
+                reader.read_exact(ext_slice)?;
+                options.apply_disk_ext(&ext);
+            }
             options
         } else {
             InstallOptions::defaults_for(&manifest.app_name())
@@ -741,12 +929,86 @@ mod tests {
         assert!(options.wants_desktop_shortcut());
         assert!(options.wants_start_menu_shortcut());
         assert!(!options.wants_path_entry());
+        // Pre-v5 packages get the extension defaults.
+        assert!(options.offers_launch_after_install());
+        assert!(options.launch_after_install_default_checked());
+        assert!(!options.offers_start_at_login());
+        assert!(options.data_dirs().is_empty());
 
         let dest = root.join("dest");
         let written = OverlayReader::extract(Cursor::new(bytes), &dest).unwrap();
         assert_eq!(written.len(), 1);
         assert_eq!(std::fs::read(dest.join("old.txt")).unwrap(), payload);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn version_four_packages_read_with_extension_defaults() {
+        // A hand-built v4 package: the base options block only, with the
+        // payload offset accounting for the base block alone. The reader
+        // must supply the v5 extension defaults and still find the payload.
+        let root = unique_temp("v4pkg");
+        let payload = b"v4 payload bytes";
+        let header_size = std::mem::size_of::<OverlayManifestHeader>();
+        let record_size = std::mem::size_of::<FileRecordHeader>();
+        let mut bytes = vec![0u8; SECTOR_ALIGNMENT as usize];
+        let mut manifest = OverlayManifestHeader {
+            magic: *OVERLAY_MAGIC,
+            version: 4,
+            file_count: 1,
+            primary_exe_index: 0,
+            total_uncompressed_bytes: payload.len() as u64,
+            app_name_utf8: [0u8; 128],
+            app_version_utf8: [0u8; 32],
+            publisher_utf8: [0u8; 128],
+        };
+        copy_str_to_fixed(&mut manifest.app_name_utf8, "V4 App");
+        let mut record = FileRecordHeader {
+            file_size: payload.len() as u64,
+            payload_offset: SECTOR_ALIGNMENT
+                + (header_size + record_size + OPTIONS_BASE_DISK_SIZE) as u64,
+            ..Default::default()
+        };
+        copy_str_to_fixed(&mut record.relative_path_utf8, "v4.txt");
+        let manifest_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &manifest as *const OverlayManifestHeader as *const u8,
+                header_size,
+            )
+        };
+        bytes.extend_from_slice(manifest_bytes);
+        let record_bytes = unsafe {
+            std::slice::from_raw_parts(&record as *const FileRecordHeader as *const u8, record_size)
+        };
+        bytes.extend_from_slice(record_bytes);
+        let mut options = InstallOptions::defaults_for("V4 App");
+        options.path_entry = 1;
+        let base = options.disk_base();
+        let base_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &base as *const OptionsDiskBase as *const u8,
+                OPTIONS_BASE_DISK_SIZE,
+            )
+        };
+        bytes.extend_from_slice(base_bytes);
+        bytes.extend_from_slice(payload);
+
+        let (read_back, records, read_options) =
+            OverlayReader::read_package(Cursor::new(bytes.clone()))
+                .unwrap()
+                .expect("v4 overlay must be discoverable");
+        assert_eq!(read_back.version, 4);
+        assert_eq!(records.len(), 1);
+        assert!(read_options.wants_path_entry());
+        assert!(read_options.offers_launch_after_install());
+        assert!(read_options.launch_after_install_default_checked());
+        assert!(!read_options.offers_start_at_login());
+        assert!(read_options.data_dirs().is_empty());
+
+        let dest = root.join("dest");
+        OverlayReader::extract(Cursor::new(bytes), &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("v4.txt")).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -775,6 +1037,13 @@ mod tests {
         copy_str_to_fixed(&mut options.file_associations_utf8, ".txt,.md");
         options.desktop_shortcut = 0;
         options.path_entry = 1;
+        options.launch_after_install = 0;
+        options.start_at_login = 1;
+        options.start_at_login_default = 1;
+        copy_str_to_fixed(
+            &mut options.data_dirs_utf8,
+            "%APPDATA%\\Opt App;%INSTALLDIR%\\data",
+        );
 
         OverlayWriter::build_from_folder_with_options(
             &stub,
@@ -796,7 +1065,7 @@ mod tests {
         let (manifest, records, read_back) = OverlayReader::read_package(file)
             .unwrap()
             .expect("new overlay must be discoverable");
-        assert_eq!(manifest.version, 4);
+        assert_eq!(manifest.version, 5);
         assert_eq!(manifest.app_name(), "Opt App");
         assert_eq!(records.len(), 1);
         assert_eq!(read_back.install_location(), "C:\\Apps\\Opt App");
@@ -805,6 +1074,17 @@ mod tests {
         assert!(!read_back.wants_desktop_shortcut());
         assert!(read_back.wants_start_menu_shortcut());
         assert!(read_back.wants_path_entry());
+        // The v5 extension fields round-trip too.
+        assert!(!read_back.offers_launch_after_install());
+        assert!(read_back.offers_start_at_login());
+        assert!(read_back.start_at_login_chosen());
+        assert_eq!(
+            read_back.data_dirs(),
+            vec![
+                "%APPDATA%\\Opt App".to_string(),
+                "%INSTALLDIR%\\data".to_string()
+            ]
+        );
 
         let dest = root.join("extracted");
         let written = OverlayReader::extract_file(&out, &dest).unwrap();
@@ -884,7 +1164,7 @@ mod tests {
         OverlayWriter::build_from_folder(&stub, &out, &src, "Zip App", "1.0.0", "Tester").unwrap();
         let file = File::open(&out).unwrap();
         let (manifest, records) = OverlayReader::read_manifest(file).unwrap().unwrap();
-        assert_eq!(manifest.version, 4);
+        assert_eq!(manifest.version, 5);
         let big = records
             .iter()
             .find(|r| r.relative_path() == "big.txt")

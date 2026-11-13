@@ -1,10 +1,14 @@
-//! The SeanPak Builder studio (TesselGUI Design D) — the secondary,
-//! human-facing surface over the same operations the CLI exposes.
+//! The SeanPak Builder studio (TesselGUI Design H — the IDE layout) —
+//! the secondary, human-facing surface over the same operations the
+//! CLI exposes.
 //!
-//! Layout (approved mockup `d-builder-studio`): a dominant files table
-//! on the left, an app-manifest panel on the right, and an output strip
-//! along the bottom, in the TesselGUI rev2 GitHub Dark palette. Every
-//! action calls a shared operation — pack is `pack::pack`, validate is
+//! Layout (approved mockup `h-studio-ide`): a slim toolbar strip along
+//! the top (Open / Save / Save As / Add files / Validate, with the
+//! app name · version at its right), a files-directory listing pane
+//! on the left, the dominant files detail table in the center, the
+//! app-manifest editor on the right, and an output strip along the
+//! bottom, in the TesselGUI rev2 GitHub Dark palette. Every action
+//! calls a shared operation — pack is `pack::pack`, validate is
 //! `manifest::AppManifest::from_json`, verify is `pack::verify_package`
 //! / `pack::sandbox_verify`, and the file listing is
 //! `scanner::ScannedFolder::scan` — so the studio can do nothing the
@@ -100,6 +104,71 @@ pub fn build_rows(entries: &[String], scan: Option<&ScanOutcome>) -> Vec<FileRow
                 },
             },
         )
+        .collect()
+}
+
+/// One row of the left pane's files-directory listing: a directory
+/// (label ends with `/`, `rel` is `None`) or a file (label is its base
+/// name, `rel` its package-relative path), with its indent depth.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeEntry {
+    pub label: String,
+    pub depth: usize,
+    pub rel: Option<String>,
+}
+
+/// Builds the left pane's listing from a files directory's contents
+/// (package-relative, `/`-separated): each directory appears once, at
+/// its first file, and files nest under their directories by depth.
+/// Pure, so the shape of the listing is unit-tested.
+pub fn tree_entries(all_files: &[String]) -> Vec<TreeEntry> {
+    let mut sorted: Vec<&str> = all_files.iter().map(|f| f.as_str()).collect();
+    sorted.sort_unstable();
+    let mut out: Vec<TreeEntry> = Vec::new();
+    let mut seen_dirs: Vec<String> = Vec::new();
+    for file in sorted {
+        let parts: Vec<&str> = file.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let mut prefix = String::new();
+        for (i, part) in parts.iter().enumerate().take(parts.len() - 1) {
+            if i > 0 {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if !seen_dirs.contains(&prefix) {
+                seen_dirs.push(prefix.clone());
+                out.push(TreeEntry {
+                    label: format!("{part}/"),
+                    depth: i,
+                    rel: None,
+                });
+            }
+        }
+        out.push(TreeEntry {
+            label: parts[parts.len() - 1].to_string(),
+            depth: parts.len() - 1,
+            rel: Some(file.to_string()),
+        });
+    }
+    out
+}
+
+/// The manifest panel's text form of the `dataDirs` list:
+/// semicolon-separated, the same separator the overlay block uses.
+pub fn data_dirs_text(dirs: &[String]) -> String {
+    dirs.join("; ")
+}
+
+/// Parses the panel's data-folders text back into the list: entries
+/// are split on `;`, trimmed, and empties dropped. (Validation of the
+/// entries themselves stays with the shared manifest rules, which run
+/// on Validate / Save / Build exactly as for the CLI.)
+pub fn parse_data_dirs(text: &str) -> Vec<String> {
+    text.split(';')
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
         .collect()
 }
 
@@ -480,9 +549,15 @@ mod tests {
 
     #[test]
     fn pretty_manifest_round_trips() {
-        let manifest =
-            AppManifest::from_json(r#"{"appName":"T","version":"1.0","fileAssociations":["txt"]}"#)
-                .unwrap();
+        let manifest = AppManifest::from_json(
+            r#"{"appName":"T","version":"1.0","fileAssociations":["txt"],"launchAfterInstall":{"offered":true,"defaultChecked":false},"startAtLogin":true,"dataDirs":["%APPDATA%/T"]}"#,
+        )
+        .unwrap();
+        assert!(manifest.launch_after_install_offered);
+        assert!(!manifest.launch_after_install_default);
+        assert!(manifest.start_at_login_offered);
+        assert!(manifest.start_at_login_default);
+        assert_eq!(manifest.data_dirs, vec!["%APPDATA%/T".to_string()]);
         let pretty = render_pretty(&manifest.to_json_value());
         let reparsed = AppManifest::from_json(&pretty).unwrap();
         assert_eq!(manifest, reparsed);
@@ -553,6 +628,50 @@ mod tests {
         assert!(rows[0].on_disk);
         assert!(!rows[1].on_disk);
         assert_eq!(rows[1].packed, None);
+    }
+
+    #[test]
+    fn tree_entries_nest_files_under_their_directories() {
+        let files = vec![
+            "docs/cheatsheet.pdf".to_string(),
+            "ai_md.exe".to_string(),
+            "docs/deep/x.txt".to_string(),
+            "README.md".to_string(),
+        ];
+        let tree = tree_entries(&files);
+        let shape: Vec<(&str, usize, bool)> = tree
+            .iter()
+            .map(|e| (e.label.as_str(), e.depth, e.rel.is_some()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("README.md", 0, true),
+                ("ai_md.exe", 0, true),
+                ("docs/", 0, false),
+                ("cheatsheet.pdf", 1, true),
+                ("deep/", 1, false),
+                ("x.txt", 2, true),
+            ]
+        );
+        // A file's rel is its full package path.
+        assert_eq!(tree[3].rel.as_deref(), Some("docs/cheatsheet.pdf"));
+        assert!(tree_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn data_dirs_text_round_trips() {
+        let dirs = vec![
+            "%APPDATA%/My App".to_string(),
+            "%LOCALAPPDATA%/My App/Cache".to_string(),
+        ];
+        let text = data_dirs_text(&dirs);
+        assert_eq!(parse_data_dirs(&text), dirs);
+        assert_eq!(parse_data_dirs(""), Vec::<String>::new());
+        assert_eq!(
+            parse_data_dirs(" %APPDATA%/A ;; %USERPROFILE%/B "),
+            vec!["%APPDATA%/A".to_string(), "%USERPROFILE%/B".to_string()]
+        );
     }
 
     #[test]
@@ -647,8 +766,8 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     use super::{
-        build_rows, copy_file_into, copy_folder_into, scan_package, FileRow, ScanOutcome,
-        StudioDocument, StudioSettings,
+        build_rows, copy_file_into, copy_folder_into, data_dirs_text, parse_data_dirs,
+        scan_package, tree_entries, FileRow, ScanOutcome, StudioDocument, StudioSettings,
     };
     use crate::manifest::{jstr, AppManifest, JsonValue, MANIFEST_SCHEMA_JSON};
     use crate::pack::{PackError, PackOutcome};
@@ -693,8 +812,26 @@ mod imp {
     const ID_LBL_MANIFEST_HDR: usize = 161;
     const ID_LBL_OUTPUT_HDR: usize = 162;
     const ID_LBL_FACTS: usize = 163;
-    const ID_LBL_PANEL_NOTE: usize = 164;
     const ID_LBL_PACKAGE_HDR: usize = 165;
+    // IDE layout (Design H): toolbar strip, left files pane, center
+    // totals line, and the install-options fields in the manifest pane.
+    const ID_BTN_TB_OPEN: usize = 180;
+    const ID_BTN_TB_SAVE: usize = 181;
+    const ID_BTN_TB_SAVEAS: usize = 182;
+    const ID_BTN_TB_ADDFILES: usize = 183;
+    const ID_BTN_TB_VALIDATE: usize = 184;
+    const ID_LBL_APPVER: usize = 185;
+    const ID_LBL_FILES_PANE_HDR: usize = 186;
+    const ID_TREE: usize = 187;
+    const ID_LBL_TOTALS: usize = 190;
+    const ID_CHK_LAUNCH_OFFER: usize = 191;
+    const ID_CHK_LAUNCH_DEFAULT: usize = 192;
+    const ID_CHK_LOGIN_OFFER: usize = 193;
+    const ID_CHK_LOGIN_DEFAULT: usize = 194;
+    const ID_EDT_DATA_DIRS: usize = 195;
+    const ID_LBL_LAUNCH: usize = 196;
+    const ID_LBL_LOGIN: usize = 197;
+    const ID_LBL_DATADIRS: usize = 198;
     // Field labels inside the manifest panel (colored as one group).
     const PANEL_LABELS: [usize; 9] = [170, 171, 172, 173, 174, 175, 176, 177, 178];
 
@@ -737,6 +874,11 @@ mod imp {
     const EN_CHANGE_CODE: usize = 0x0300;
     const LOGPIXELSX_INDEX: i32 = 88;
     const VK_CONTROL_KEY: i32 = 0x11;
+    // LVN_ITEMCHANGED is (-101); NMHDR.code is unsigned, compare as i32.
+    const LVN_ITEMCHANGED_I32: i32 = -101;
+    // Right-aligned static text (windows-sys keeps the SS_ styles
+    // behind a feature this crate does not enable).
+    const SS_RIGHT: u32 = 0x0002;
 
     static WIDE_SANS: &[u16] = &[
         b'S' as u16,
@@ -791,6 +933,12 @@ mod imp {
         tooltip: usize,
         /// Kept alive for the tooltip tool infos.
         tip_texts: Vec<Vec<u16>>,
+        /// Left-pane listing rows → package-relative file path
+        /// (`None` for directory rows), mirroring the tree control.
+        tree_rels: Vec<Option<String>>,
+        /// The file the totals line describes (selected in either the
+        /// center table or the left listing).
+        selected_rel: Option<String>,
     }
 
     static STATE: Mutex<Option<StudioState>> = Mutex::new(None);
@@ -863,6 +1011,8 @@ mod imp {
                 status_kind: StatusKind::Neutral,
                 tooltip: 0,
                 tip_texts: Vec::new(),
+                tree_rels: Vec::new(),
+                selected_rel: None,
             });
         }
 
@@ -1176,6 +1326,83 @@ mod imp {
             }
         };
 
+        // Toolbar strip (Design H): the everyday commands as buttons
+        // over the same handlers the menus run, plus the app · version
+        // readout at the right.
+        mk(
+            &button_class,
+            "Open…",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            ID_BTN_TB_OPEN,
+        );
+        mk(
+            &button_class,
+            "Save",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            ID_BTN_TB_SAVE,
+        );
+        mk(
+            &button_class,
+            "Save As…",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            ID_BTN_TB_SAVEAS,
+        );
+        mk(
+            &button_class,
+            "Add files…",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            ID_BTN_TB_ADDFILES,
+        );
+        mk(
+            &button_class,
+            "Validate",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            ID_BTN_TB_VALIDATE,
+        );
+        mk(&static_class, "", SS_RIGHT, ID_LBL_APPVER);
+
+        // Left pane: the files directory listing (directories and
+        // files, indented). Selecting a file here selects it in the
+        // center table too.
+        mk(&static_class, "FILES", 0, ID_LBL_FILES_PANE_HDR);
+        let tree = mk(
+            &list_class,
+            "",
+            WS_TABSTOP
+                | WS_BORDER
+                | LVS_REPORT
+                | LVS_SINGLESEL
+                | LVS_SHOWSELALWAYS
+                | LVS_NOCOLUMNHEADER,
+            ID_TREE,
+        );
+        SendMessageW(
+            tree,
+            LVM_SETEXTENDEDLISTVIEWSTYLE,
+            (LVS_EX_FULLROWSELECT) as WPARAM,
+            (LVS_EX_FULLROWSELECT) as LPARAM,
+        );
+        SendMessageW(tree, LVM_SETBKCOLOR, 0, COLOR_SURFACE as LPARAM);
+        SendMessageW(tree, LVM_SETTEXTBKCOLOR, 0, COLOR_SURFACE as LPARAM);
+        SendMessageW(tree, LVM_SETTEXTCOLOR, 0, COLOR_FG as LPARAM);
+        {
+            let mut wide: Vec<u16> = "Name".encode_utf16().chain(std::iter::once(0)).collect();
+            let col = LVCOLUMNW {
+                mask: LVCF_TEXT | LVCF_WIDTH,
+                fmt: 0,
+                cx: 240,
+                pszText: wide.as_mut_ptr(),
+                cchTextMax: 0,
+                iSubItem: 0,
+                iImage: 0,
+                iOrder: 0,
+                cxMin: 0,
+                cxDefault: 0,
+                cxIdeal: 0,
+            };
+            SendMessageW(tree, LVM_INSERTCOLUMNW, 0, &col as *const _ as LPARAM);
+        }
+
         mk(&static_class, "FILES IN PACKAGE", 0, ID_LBL_FILES_HDR);
         let list = mk(
             &list_class,
@@ -1235,6 +1462,8 @@ mod imp {
             WS_TABSTOP | (BS_PUSHBUTTON as u32),
             ID_BTN_REMOVE,
         );
+        // Totals / selection line under the center table.
+        mk(&static_class, "", 0, ID_LBL_TOTALS);
 
         // Manifest panel.
         mk(&static_class, "APP MANIFEST", 0, ID_LBL_MANIFEST_HDR);
@@ -1274,6 +1503,41 @@ mod imp {
             WS_TABSTOP | BS_AUTOCHECKBOX,
             ID_CHK_PATH,
         );
+        // The 4.4.0 install options: each offer is a pair — offer the
+        // option in the installer at all, and whether it starts on.
+        mk(&static_class, "Launch after install", 0, ID_LBL_LAUNCH);
+        mk(
+            &button_class,
+            "Offer",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            ID_CHK_LAUNCH_OFFER,
+        );
+        mk(
+            &button_class,
+            "On by default",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            ID_CHK_LAUNCH_DEFAULT,
+        );
+        mk(&static_class, "Start at login", 0, ID_LBL_LOGIN);
+        mk(
+            &button_class,
+            "Offer",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            ID_CHK_LOGIN_OFFER,
+        );
+        mk(
+            &button_class,
+            "On by default",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            ID_CHK_LOGIN_DEFAULT,
+        );
+        mk(&static_class, "Data folders", 0, ID_LBL_DATADIRS);
+        mk(
+            &edit_class,
+            "",
+            WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
+            ID_EDT_DATA_DIRS,
+        );
         mk(&static_class, "PACKAGE", 0, ID_LBL_PACKAGE_HDR);
         mk(&static_class, "Files folder", 0, PANEL_LABELS[7]);
         mk(
@@ -1300,12 +1564,6 @@ mod imp {
             "…",
             WS_TABSTOP | (BS_PUSHBUTTON as u32),
             ID_BTN_OUT_DIR,
-        );
-        mk(
-            &static_class,
-            "Every field here is the pack manifest — the same JSON `seanpak pack` reads. Associations are comma-separated (.txt, .md).",
-            0,
-            ID_LBL_PANEL_NOTE,
         );
 
         // Output strip.
@@ -1355,11 +1613,15 @@ mod imp {
     }
 
     unsafe fn create_tooltips(parent: HWND, instance: HINSTANCE) {
-        let tips: [(usize, &str); 8] = [
+        let tips: [(usize, &str); 12] = [
             (ID_LIST, "Files that will be packed. Ctrl+K jumps here; type to find a file."),
+            (ID_TREE, "Everything in the files folder, folders included. Selecting a file selects it in the table too."),
+            (ID_BTN_TB_OPEN, "Open a manifest.json — the same file `seanpak pack` reads"),
             (ID_BTN_ADD_FILES, "Copy files into the package folder and add them to the package"),
             (ID_BTN_ADD_FOLDER, "Copy a folder (with everything in it) into the package"),
             (ID_BTN_REMOVE, "Remove the selected files from the package list — the files stay in the folder"),
+            (ID_EDT_ASSOC, "Comma-separated extensions to associate with the app (.txt, .md)"),
+            (ID_EDT_DATA_DIRS, "The app's data folders, semicolon-separated token paths (%APPDATA%/My App). Uninstall asks before deleting them; the box starts unticked"),
             (ID_BTN_VALIDATE, "Check the manifest with the same rules `seanpak validate` uses"),
             (ID_BTN_VERIFY, "Prove the built Setup.exe (overlay, manifest, payloads)"),
             (ID_CHK_SANDBOX, "Verify by test-installing into a temp folder and checking for residue"),
@@ -1414,6 +1676,7 @@ mod imp {
     unsafe fn apply_fonts(hwnd: HWND) {
         let header_ids = [
             ID_LBL_FILES_HDR,
+            ID_LBL_FILES_PANE_HDR,
             ID_LBL_MANIFEST_HDR,
             ID_LBL_OUTPUT_HDR,
             ID_LBL_PACKAGE_HDR,
@@ -1424,8 +1687,17 @@ mod imp {
                 SendMessageW(ctrl, WM_SETFONT, font as WPARAM, 1);
             }
         }
-        let all_ids: [usize; 40] = [
+        let all_ids: &[usize] = &[
             ID_LIST,
+            ID_TREE,
+            ID_BTN_TB_OPEN,
+            ID_BTN_TB_SAVE,
+            ID_BTN_TB_SAVEAS,
+            ID_BTN_TB_ADDFILES,
+            ID_BTN_TB_VALIDATE,
+            ID_LBL_APPVER,
+            ID_LBL_FILES_PANE_HDR,
+            ID_LBL_TOTALS,
             ID_BTN_ADD_FILES,
             ID_BTN_ADD_FOLDER,
             ID_BTN_REMOVE,
@@ -1439,6 +1711,14 @@ mod imp {
             ID_CHK_DESKTOP,
             ID_CHK_STARTMENU,
             ID_CHK_PATH,
+            ID_CHK_LAUNCH_OFFER,
+            ID_CHK_LAUNCH_DEFAULT,
+            ID_CHK_LOGIN_OFFER,
+            ID_CHK_LOGIN_DEFAULT,
+            ID_LBL_LAUNCH,
+            ID_LBL_LOGIN,
+            ID_LBL_DATADIRS,
+            ID_EDT_DATA_DIRS,
             ID_EDT_FILES_DIR,
             ID_BTN_FILES_DIR,
             ID_EDT_OUT_DIR,
@@ -1451,7 +1731,6 @@ mod imp {
             ID_BTN_TEST,
             ID_BTN_BUILD,
             ID_LBL_FACTS,
-            ID_LBL_PANEL_NOTE,
             PANEL_LABELS[0],
             PANEL_LABELS[1],
             PANEL_LABELS[2],
@@ -1467,18 +1746,20 @@ mod imp {
             ID_LBL_PACKAGE_HDR,
         ];
         for id in all_ids {
-            let font = if header_ids.contains(&id) {
+            let font = if header_ids.contains(id) {
                 HEADER_FONT
             } else {
                 BODY_FONT
             };
-            set_font(hwnd, id, font);
+            set_font(hwnd, *id, font);
         }
     }
 
     /// Positions every control from the client size and the current
-    /// DPI scale: files table grows, manifest panel keeps its width,
-    /// output strip and footer keep their heights.
+    /// DPI scale (Design H): toolbar strip fixed at the top, output
+    /// strip and footer fixed at the bottom; between them the left
+    /// listing pane and the manifest pane keep their widths while the
+    /// center files table absorbs the slack.
     unsafe fn layout(hwnd: HWND) {
         let dpi = with_state(|s| s.dpi).unwrap_or(96);
         let s = |v: i32| scale(v, dpi);
@@ -1490,12 +1771,15 @@ mod imp {
             return;
         }
         let m = s(16);
+        let toolbar_h = s(40);
         let footer_h = s(52);
-        let strip_h = s(172);
+        let strip_h = s(150);
+        let left_w = s(250);
         let panel_w = s(404);
         let footer_top = h - footer_h;
         let strip_y = footer_top - strip_h - s(8);
-        let top_h = strip_y - m - m;
+        let main_top = toolbar_h;
+        let main_h = (strip_y - s(8) - main_top).max(s(60));
         let btn_row_h = s(30);
 
         unsafe fn mv(hwnd: HWND, id: usize, x: i32, y: i32, w: i32, h: i32) {
@@ -1505,28 +1789,62 @@ mod imp {
             }
         }
 
-        // Files table + its buttons.
-        let list_w = w - panel_w - m * 3;
-        mv(hwnd, ID_LBL_FILES_HDR, m, m, list_w, s(20));
+        // Toolbar strip.
+        let tb_y = s(6);
+        mv(hwnd, ID_BTN_TB_OPEN, m, tb_y, s(84), s(28));
+        mv(hwnd, ID_BTN_TB_SAVE, m + s(92), tb_y, s(72), s(28));
+        mv(hwnd, ID_BTN_TB_SAVEAS, m + s(172), tb_y, s(92), s(28));
+        mv(hwnd, ID_BTN_TB_ADDFILES, m + s(272), tb_y, s(104), s(28));
+        mv(hwnd, ID_BTN_TB_VALIDATE, m + s(384), tb_y, s(92), s(28));
+        mv(
+            hwnd,
+            ID_LBL_APPVER,
+            w - m - s(320),
+            tb_y + s(4),
+            s(320),
+            s(20),
+        );
+
+        // Left pane: the files directory listing.
+        mv(hwnd, ID_LBL_FILES_PANE_HDR, m, main_top, left_w, s(20));
+        mv(hwnd, ID_TREE, m, main_top + s(26), left_w, main_h - s(26));
+        let tree = GetDlgItem(hwnd, ID_TREE as i32);
+        if !tree.is_null() {
+            SendMessageW(tree, LVM_SETCOLUMNWIDTH, 0, left_w.max(s(120)) as LPARAM);
+        }
+
+        // Center: files table + its buttons + the totals line.
+        let cx = m + left_w + s(12);
+        let center_w = (w - m - panel_w - s(12) - cx).max(s(200));
+        let totals_h = s(38);
+        mv(hwnd, ID_LBL_FILES_HDR, cx, main_top, center_w, s(20));
         mv(
             hwnd,
             ID_LIST,
-            m,
-            m + s(26),
-            list_w,
-            top_h - s(26) - btn_row_h - s(8),
+            cx,
+            main_top + s(26),
+            center_w,
+            main_h - s(26) - btn_row_h - s(8) - totals_h,
         );
-        let btn_y = m + top_h - btn_row_h;
-        mv(hwnd, ID_BTN_ADD_FILES, m, btn_y, s(130), btn_row_h);
+        let btn_y = main_top + main_h - totals_h - btn_row_h;
+        mv(hwnd, ID_BTN_ADD_FILES, cx, btn_y, s(130), btn_row_h);
         mv(
             hwnd,
             ID_BTN_ADD_FOLDER,
-            m + s(138),
+            cx + s(138),
             btn_y,
             s(130),
             btn_row_h,
         );
-        mv(hwnd, ID_BTN_REMOVE, m + s(276), btn_y, s(110), btn_row_h);
+        mv(hwnd, ID_BTN_REMOVE, cx + s(276), btn_y, s(110), btn_row_h);
+        mv(
+            hwnd,
+            ID_LBL_TOTALS,
+            cx,
+            btn_y + btn_row_h + s(6),
+            center_w,
+            s(32),
+        );
         // Column widths: path column absorbs the slack.
         let list = GetDlgItem(hwnd, ID_LIST as i32);
         if !list.is_null() {
@@ -1535,20 +1853,20 @@ mod imp {
                 list,
                 LVM_SETCOLUMNWIDTH,
                 0,
-                (list_w - fixed - s(20)).max(s(120)) as LPARAM,
+                (center_w - fixed - s(20)).max(s(120)) as LPARAM,
             );
             SendMessageW(list, LVM_SETCOLUMNWIDTH, 1, s(180) as LPARAM);
             SendMessageW(list, LVM_SETCOLUMNWIDTH, 2, s(110) as LPARAM);
             SendMessageW(list, LVM_SETCOLUMNWIDTH, 3, s(120) as LPARAM);
         }
 
-        // Manifest panel.
+        // Right pane: the manifest editor.
         let px = w - m - panel_w;
         let label_w = s(124);
         let edit_x = px + label_w + s(8);
         let edit_w = panel_w - label_w - s(8);
-        mv(hwnd, ID_LBL_MANIFEST_HDR, px, m, panel_w, s(20));
-        let mut row_y = m + s(28);
+        mv(hwnd, ID_LBL_MANIFEST_HDR, px, main_top, panel_w, s(20));
+        let mut row_y = main_top + s(26);
         let edit_ids = [
             ID_EDT_NAME,
             ID_EDT_VERSION,
@@ -1559,48 +1877,74 @@ mod imp {
             ID_EDT_ASSOC,
         ];
         for (i, edit_id) in edit_ids.iter().enumerate() {
-            mv(hwnd, PANEL_LABELS[i], px, row_y + s(3), label_w, s(20));
-            mv(hwnd, *edit_id, edit_x, row_y, edit_w, s(26));
-            row_y += s(32);
+            mv(hwnd, PANEL_LABELS[i], px, row_y + s(2), label_w, s(20));
+            mv(hwnd, *edit_id, edit_x, row_y, edit_w, s(25));
+            row_y += s(29);
         }
-        mv(hwnd, ID_CHK_DESKTOP, px, row_y, panel_w / 2, s(26));
+        mv(hwnd, ID_CHK_DESKTOP, px, row_y, panel_w / 2, s(24));
         mv(
             hwnd,
             ID_CHK_STARTMENU,
             px + panel_w / 2,
             row_y,
             panel_w / 2,
-            s(26),
+            s(24),
         );
-        row_y += s(30);
-        mv(hwnd, ID_CHK_PATH, px, row_y, panel_w, s(26));
-        row_y += s(34);
+        row_y += s(27);
+        mv(hwnd, ID_CHK_PATH, px, row_y, panel_w, s(24));
+        row_y += s(27);
+        // Offer pairs: label at the left, "Offer" and "On by default"
+        // checkboxes sharing the edit column.
+        let half = edit_w / 2;
+        mv(hwnd, ID_LBL_LAUNCH, px, row_y + s(2), label_w, s(20));
+        mv(hwnd, ID_CHK_LAUNCH_OFFER, edit_x, row_y, half, s(24));
+        mv(
+            hwnd,
+            ID_CHK_LAUNCH_DEFAULT,
+            edit_x + half,
+            row_y,
+            edit_w - half,
+            s(24),
+        );
+        row_y += s(29);
+        mv(hwnd, ID_LBL_LOGIN, px, row_y + s(2), label_w, s(20));
+        mv(hwnd, ID_CHK_LOGIN_OFFER, edit_x, row_y, half, s(24));
+        mv(
+            hwnd,
+            ID_CHK_LOGIN_DEFAULT,
+            edit_x + half,
+            row_y,
+            edit_w - half,
+            s(24),
+        );
+        row_y += s(29);
+        mv(hwnd, ID_LBL_DATADIRS, px, row_y + s(2), label_w, s(20));
+        mv(hwnd, ID_EDT_DATA_DIRS, edit_x, row_y, edit_w, s(25));
+        row_y += s(31);
         mv(hwnd, ID_LBL_PACKAGE_HDR, px, row_y, panel_w, s(20));
-        row_y += s(26);
+        row_y += s(23);
         // Files folder row (+ browse button).
-        mv(hwnd, PANEL_LABELS[7], px, row_y + s(3), label_w, s(20));
-        mv(hwnd, ID_EDT_FILES_DIR, edit_x, row_y, edit_w - s(36), s(26));
+        mv(hwnd, PANEL_LABELS[7], px, row_y + s(2), label_w, s(20));
+        mv(hwnd, ID_EDT_FILES_DIR, edit_x, row_y, edit_w - s(36), s(25));
         mv(
             hwnd,
             ID_BTN_FILES_DIR,
             edit_x + edit_w - s(30),
             row_y,
             s(30),
-            s(26),
+            s(25),
         );
-        row_y += s(32);
-        mv(hwnd, PANEL_LABELS[8], px, row_y + s(3), label_w, s(20));
-        mv(hwnd, ID_EDT_OUT_DIR, edit_x, row_y, edit_w - s(36), s(26));
+        row_y += s(29);
+        mv(hwnd, PANEL_LABELS[8], px, row_y + s(2), label_w, s(20));
+        mv(hwnd, ID_EDT_OUT_DIR, edit_x, row_y, edit_w - s(36), s(25));
         mv(
             hwnd,
             ID_BTN_OUT_DIR,
             edit_x + edit_w - s(30),
             row_y,
             s(30),
-            s(26),
+            s(25),
         );
-        row_y += s(36);
-        mv(hwnd, ID_LBL_PANEL_NOTE, px, row_y, panel_w, s(56));
 
         // Output strip.
         mv(hwnd, ID_LBL_OUTPUT_HDR, m, strip_y, s(200), s(20));
@@ -1826,6 +2170,11 @@ mod imp {
         set_check(hwnd, ID_CHK_DESKTOP, m.desktop_shortcut);
         set_check(hwnd, ID_CHK_STARTMENU, m.start_menu_shortcut);
         set_check(hwnd, ID_CHK_PATH, m.path_entry);
+        set_check(hwnd, ID_CHK_LAUNCH_OFFER, m.launch_after_install_offered);
+        set_check(hwnd, ID_CHK_LAUNCH_DEFAULT, m.launch_after_install_default);
+        set_check(hwnd, ID_CHK_LOGIN_OFFER, m.start_at_login_offered);
+        set_check(hwnd, ID_CHK_LOGIN_DEFAULT, m.start_at_login_default);
+        set_text(hwnd, ID_EDT_DATA_DIRS, &data_dirs_text(&m.data_dirs));
         set_text(
             hwnd,
             ID_EDT_FILES_DIR,
@@ -1835,6 +2184,17 @@ mod imp {
         );
         set_text(hwnd, ID_EDT_OUT_DIR, &out_dir.display().to_string());
         with_state(|s| s.suppress_dirty = false);
+        refresh_appver(hwnd);
+    }
+
+    /// The toolbar strip's right-hand readout: "<app name> · <version>"
+    /// from the document (refreshed when controls are filled and after
+    /// a harvest, so it follows the Name/Version fields).
+    fn refresh_appver(hwnd: HWND) {
+        let text =
+            with_state(|s| format!("{} · {}", s.doc.manifest.app_name, s.doc.manifest.version))
+                .unwrap_or_default();
+        unsafe { set_text(hwnd, ID_LBL_APPVER, &text) };
     }
 
     /// Controls → document. Called before every operation and on
@@ -1850,6 +2210,11 @@ mod imp {
         let desktop = get_check(hwnd, ID_CHK_DESKTOP);
         let start_menu = get_check(hwnd, ID_CHK_STARTMENU);
         let path_entry = get_check(hwnd, ID_CHK_PATH);
+        let launch_offer = get_check(hwnd, ID_CHK_LAUNCH_OFFER);
+        let launch_default = get_check(hwnd, ID_CHK_LAUNCH_DEFAULT);
+        let login_offer = get_check(hwnd, ID_CHK_LOGIN_OFFER);
+        let login_default = get_check(hwnd, ID_CHK_LOGIN_DEFAULT);
+        let data_dirs_raw = get_text(hwnd, ID_EDT_DATA_DIRS);
         let files_dir = get_text(hwnd, ID_EDT_FILES_DIR);
         let out_dir = get_text(hwnd, ID_EDT_OUT_DIR);
         with_state(|s| {
@@ -1876,6 +2241,11 @@ mod imp {
             m.desktop_shortcut = desktop;
             m.start_menu_shortcut = start_menu;
             m.path_entry = path_entry;
+            m.launch_after_install_offered = launch_offer;
+            m.launch_after_install_default = launch_default;
+            m.start_at_login_offered = login_offer;
+            m.start_at_login_default = login_default;
+            m.data_dirs = parse_data_dirs(&data_dirs_raw);
             let fd = files_dir.trim().to_string();
             s.doc.files_dir = if fd.is_empty() {
                 None
@@ -1887,6 +2257,7 @@ mod imp {
                 s.doc.out_dir = PathBuf::from(od);
             }
         });
+        refresh_appver(hwnd);
     }
 
     /// Rebuilds the files table from the document entries + last scan.
@@ -1951,6 +2322,171 @@ mod imp {
                 }
             }
         }
+        fill_tree(hwnd);
+        update_totals(hwnd);
+    }
+
+    /// Rebuilds the left pane's listing from the last scan (falling
+    /// back to the document entries before the first scan lands):
+    /// the whole files directory, directories included — the center
+    /// table shows only what will be packed.
+    unsafe fn fill_tree(hwnd: HWND) {
+        let tree = GetDlgItem(hwnd, ID_TREE as i32);
+        if tree.is_null() {
+            return;
+        }
+        let entries = with_state(|s| {
+            let files = match &s.scan {
+                Some(scan) => scan.all_files.clone(),
+                None => s.doc.entries.clone(),
+            };
+            tree_entries(&files)
+        })
+        .unwrap_or_default();
+        SendMessageW(tree, LVM_DELETEALLITEMS, 0, 0);
+        let mut rels: Vec<Option<String>> = Vec::with_capacity(entries.len());
+        for (idx, entry) in entries.iter().enumerate() {
+            rels.push(entry.rel.clone());
+            let mut wide: Vec<u16> = entry
+                .label
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let item = LVITEMW {
+                mask: LVIF_TEXT | LVIF_INDENT,
+                iItem: idx as i32,
+                iSubItem: 0,
+                state: 0,
+                stateMask: 0,
+                pszText: wide.as_mut_ptr(),
+                cchTextMax: 0,
+                iImage: 0,
+                lParam: 0,
+                iIndent: entry.depth as i32,
+                iGroupId: 0,
+                cColumns: 0,
+                puColumns: std::ptr::null_mut(),
+                piColFmt: std::ptr::null_mut(),
+                iGroup: 0,
+            };
+            SendMessageW(tree, LVM_INSERTITEMW, 0, &item as *const _ as LPARAM);
+        }
+        with_state(|s| s.tree_rels = rels);
+    }
+
+    /// The two-line readout under the center table: package totals,
+    /// then either the selected file's facts or the installer stub
+    /// (this executable) the package will be built around.
+    fn update_totals(hwnd: HWND) {
+        let text = with_state(|s| {
+            let rows = build_rows(&s.doc.entries, s.scan.as_ref());
+            let total: u64 = rows.iter().map(|r| r.size).sum();
+            let packed: u64 = rows.iter().filter_map(|r| r.packed).sum();
+            let line1 = format!(
+                "{} files · {} total · packed ≈ {}",
+                rows.len(),
+                format_bytes(total),
+                format_bytes(packed)
+            );
+            let line2 = match &s.selected_rel {
+                Some(rel) => match rows.iter().find(|r| &r.rel == rel) {
+                    Some(row) => format!(
+                        "Selected: {} — {} · packed {}",
+                        row.rel.replace('/', "\\"),
+                        if row.on_disk {
+                            format_bytes(row.size)
+                        } else {
+                            "missing".to_string()
+                        },
+                        match row.packed {
+                            Some(p) => format_bytes(p),
+                            None => "—".to_string(),
+                        }
+                    ),
+                    None => format!("Selected: {}", rel.replace('/', "\\")),
+                },
+                None => {
+                    let stub = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .map(|md| format_bytes(md.len()))
+                        .unwrap_or_else(|| "—".to_string());
+                    format!("Installer stub (this executable): {stub}")
+                }
+            };
+            format!("{line1}\r\n{line2}")
+        })
+        .unwrap_or_default();
+        unsafe { set_text(hwnd, ID_LBL_TOTALS, &text) };
+    }
+
+    /// Center-table selection: remember the file so the totals line
+    /// describes it.
+    fn on_list_selection(hwnd: HWND, index: i32) {
+        if index < 0 {
+            return;
+        }
+        let rel = with_state(|s| {
+            let rows = build_rows(&s.doc.entries, s.scan.as_ref());
+            rows.get(index as usize).map(|r| r.rel.clone())
+        })
+        .flatten();
+        if let Some(rel) = rel {
+            with_state(|s| s.selected_rel = Some(rel));
+            update_totals(hwnd);
+        }
+    }
+
+    /// Left-listing selection: remember the file, mirror the
+    /// selection into the center table, and scroll it into view.
+    unsafe fn on_tree_selection(hwnd: HWND, index: i32) {
+        if index < 0 {
+            return;
+        }
+        let rel = with_state(|s| s.tree_rels.get(index as usize).cloned().flatten()).flatten();
+        let Some(rel) = rel else {
+            return; // a directory row: nothing to select in the table
+        };
+        with_state(|s| s.selected_rel = Some(rel.clone()));
+        let row = with_state(|s| {
+            let rows = build_rows(&s.doc.entries, s.scan.as_ref());
+            rows.iter().position(|r| r.rel == rel)
+        })
+        .flatten();
+        if let Some(row) = row {
+            let list = GetDlgItem(hwnd, ID_LIST as i32);
+            if !list.is_null() {
+                let clear = LVITEMW {
+                    mask: LVIF_STATE,
+                    iItem: -1,
+                    iSubItem: 0,
+                    state: 0,
+                    stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                    pszText: std::ptr::null_mut(),
+                    cchTextMax: 0,
+                    iImage: 0,
+                    lParam: 0,
+                    iIndent: 0,
+                    iGroupId: 0,
+                    cColumns: 0,
+                    puColumns: std::ptr::null_mut(),
+                    piColFmt: std::ptr::null_mut(),
+                    iGroup: 0,
+                };
+                SendMessageW(
+                    list,
+                    LVM_SETITEMSTATE,
+                    -1isize as WPARAM,
+                    &clear as *const _ as LPARAM,
+                );
+                let mut set = clear;
+                set.iItem = row as i32;
+                set.state = LVIS_SELECTED | LVIS_FOCUSED;
+                SendMessageW(list, LVM_SETITEMSTATE, row, &set as *const _ as LPARAM);
+                SendMessageW(list, LVM_ENSUREVISIBLE, row, 0);
+            }
+        }
+        update_totals(hwnd);
     }
 
     fn set_busy(hwnd: HWND, busy: bool) {
@@ -1963,6 +2499,11 @@ mod imp {
             ID_BTN_ADD_FILES,
             ID_BTN_ADD_FOLDER,
             ID_BTN_REMOVE,
+            ID_BTN_TB_OPEN,
+            ID_BTN_TB_SAVE,
+            ID_BTN_TB_SAVEAS,
+            ID_BTN_TB_ADDFILES,
+            ID_BTN_TB_VALIDATE,
         ] {
             unsafe { set_enabled(hwnd, id, !busy) };
         }
@@ -2903,11 +3444,16 @@ mod imp {
                         },
                     );
                 } else if id == ID_LBL_FILES_HDR
+                    || id == ID_LBL_FILES_PANE_HDR
                     || id == ID_LBL_MANIFEST_HDR
                     || id == ID_LBL_OUTPUT_HDR
                     || id == ID_LBL_PACKAGE_HDR
                     || id == ID_LBL_FACTS
-                    || id == ID_LBL_PANEL_NOTE
+                    || id == ID_LBL_TOTALS
+                    || id == ID_LBL_APPVER
+                    || id == ID_LBL_LAUNCH
+                    || id == ID_LBL_LOGIN
+                    || id == ID_LBL_DATADIRS
                     || PANEL_LABELS.contains(&id)
                 {
                     SetTextColor(hdc, COLOR_MUTED);
@@ -2952,6 +3498,11 @@ mod imp {
                     IDM_TOOLS_SCHEMA => on_schema(hwnd),
                     IDM_TOOLS_LOG => on_open_log(hwnd),
                     IDM_HELP_ABOUT => on_about(hwnd),
+                    ID_BTN_TB_OPEN => on_open_manifest(hwnd),
+                    ID_BTN_TB_SAVE => on_save(hwnd, false),
+                    ID_BTN_TB_SAVEAS => on_save(hwnd, true),
+                    ID_BTN_TB_ADDFILES => on_add_files(hwnd),
+                    ID_BTN_TB_VALIDATE => on_validate(hwnd),
                     ID_BTN_ADD_FILES => on_add_files(hwnd),
                     ID_BTN_ADD_FOLDER => on_add_folder(hwnd),
                     ID_BTN_REMOVE => on_remove_selected(hwnd),
@@ -2965,18 +3516,38 @@ mod imp {
                     ID_BTN_BUILD => on_pack(hwnd, false),
                     ID_EDT_NAME | ID_EDT_VERSION | ID_EDT_PUBLISHER | ID_EDT_PRIMARY
                     | ID_EDT_INSTALL_LOC | ID_EDT_SM_FOLDER | ID_EDT_ASSOC | ID_EDT_FILES_DIR
-                    | ID_EDT_OUT_DIR => {
+                    | ID_EDT_OUT_DIR | ID_EDT_DATA_DIRS => {
                         if notify == EN_CHANGE_CODE {
                             mark_dirty(hwnd);
                         }
                     }
-                    ID_CHK_DESKTOP | ID_CHK_STARTMENU | ID_CHK_PATH => {
+                    ID_CHK_DESKTOP
+                    | ID_CHK_STARTMENU
+                    | ID_CHK_PATH
+                    | ID_CHK_LAUNCH_OFFER
+                    | ID_CHK_LAUNCH_DEFAULT
+                    | ID_CHK_LOGIN_OFFER
+                    | ID_CHK_LOGIN_DEFAULT => {
                         mark_dirty(hwnd);
                     }
                     ID_CHK_SANDBOX => {
                         // A verify option, not a manifest field: no dirty.
                     }
                     _ => {}
+                }
+                0
+            }
+            WM_NOTIFY => {
+                let hdr = lparam as *const NMHDR;
+                if !hdr.is_null() && (*hdr).code as i32 == LVN_ITEMCHANGED_I32 {
+                    let nmlv = lparam as *const NMLISTVIEW;
+                    if !nmlv.is_null() && (*nmlv).uNewState & LVIS_SELECTED != 0 {
+                        match (*hdr).idFrom {
+                            ID_LIST => on_list_selection(hwnd, (*nmlv).iItem),
+                            ID_TREE => on_tree_selection(hwnd, (*nmlv).iItem),
+                            _ => {}
+                        }
+                    }
                 }
                 0
             }

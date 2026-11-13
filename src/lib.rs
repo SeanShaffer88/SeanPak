@@ -13,6 +13,7 @@ pub mod rollback;
 pub mod scanner;
 pub mod studio;
 pub mod sysinstall;
+pub mod uninstall;
 pub mod wizard;
 
 pub use backends::{

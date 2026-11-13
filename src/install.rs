@@ -17,12 +17,16 @@
 //! a failed upgrade restores the old version), reinstall, or repair.
 //! Installing an older version over a newer one is refused unless the
 //! caller forces it. [`plan_install`] computes exactly what a run would
-//! do without touching anything (the `--dry-run` report).
+//! do without touching anything (the `--dry-run` report). Before the
+//! journal starts, a writability pre-flight
+//! ([`ensure_location_writable`]) refuses destinations this per-user
+//! process cannot write, suggesting the per-user Programs folder
+//! instead — installs never elevate.
 
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use crate::hash::sha256_hex;
 use crate::overlay::{
@@ -103,6 +107,12 @@ pub struct InstallPlan {
     /// Extensions the install would associate.
     pub associations: Vec<String>,
     pub path_entry: bool,
+    /// The install would apply the start-at-login Run entry.
+    pub start_at_login: bool,
+    /// Pre-flight verdict: can this per-user process write to `dest`?
+    pub location_writable: bool,
+    /// When `dest` is not writable, the per-user folder offered instead.
+    pub suggested_location: Option<PathBuf>,
 }
 
 pub fn plan_install(
@@ -120,6 +130,11 @@ pub fn plan_install(
         .get(manifest.primary_exe_index as usize)
         .map(|r| r.relative_path());
     let artifacts = plan_artifacts(options, &manifest.app_name(), dest, primary_rel.as_deref());
+    let (location_writable, suggested_location) =
+        match location_verdict(dest, &manifest.app_name(), &options.install_location()) {
+            LocationVerdict::Writable => (true, None),
+            LocationVerdict::NotWritable { fallback, .. } => (false, Some(fallback)),
+        };
     InstallPlan {
         app_name: manifest.app_name(),
         app_version: manifest.app_version(),
@@ -140,7 +155,197 @@ pub fn plan_install(
             .collect(),
         associations: artifacts.associations.clone(),
         path_entry: artifacts.path_dir.is_some(),
+        start_at_login: artifacts.start_at_login,
+        location_writable,
+        suggested_location,
     }
+}
+
+/// Stable machine-readable reason for an install refused because the
+/// destination is not writable, carried in the `--json` install report
+/// (the exit code stays 5, install failure).
+pub const REASON_LOCATION_NOT_WRITABLE: &str = "location_not_writable";
+
+/// Pre-flight verdict for an install destination: can this per-user
+/// process write there? SeanPak installs never elevate, so a folder
+/// that needs administrator access (the classic `C:\Program Files`
+/// case, field-proven with the ai.md 0.6.0 package) must be caught
+/// *before* the install starts — not midway through extraction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocationVerdict {
+    Writable,
+    NotWritable {
+        /// The per-user folder offered instead of the refused one.
+        fallback: PathBuf,
+        /// OS-level detail of the failed probe (for messages and logs).
+        detail: String,
+    },
+}
+
+/// The folder name a fallback install uses: the last component of the
+/// package's recorded install location (`C:\Program Files\ai.md` →
+/// `ai.md`), or the sanitized app name when the location names no
+/// folder (empty, or a bare drive root). Separator handling accepts
+/// both `\` and `/` on any platform, so the logic is host-testable.
+pub fn install_folder_name(app_name: &str, recorded_location: &str) -> String {
+    let loc = recorded_location.trim().trim_end_matches(['\\', '/']);
+    let last = loc.rsplit(['\\', '/']).next().unwrap_or("").trim();
+    if !last.is_empty() && !last.ends_with(':') {
+        last.to_string()
+    } else {
+        crate::wizard::sanitize_name(app_name)
+    }
+}
+
+/// The per-user Programs root's parent on this machine: `%LOCALAPPDATA%`
+/// on Windows; `$XDG_DATA_HOME` or `~/.local/share` elsewhere (the
+/// fallback only has a user-facing role on Windows, but the path stays
+/// sane everywhere so host tests can exercise it).
+pub fn local_app_data_dir() -> PathBuf {
+    if let Some(v) = std::env::var_os("LOCALAPPDATA") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(v) = std::env::var_os("USERPROFILE") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join("AppData").join("Local");
+        }
+    }
+    if let Some(v) = std::env::var_os("XDG_DATA_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    if let Some(v) = std::env::var_os("HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join(".local").join("share");
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// The standard per-user install location — `%LOCALAPPDATA%\Programs\
+/// <AppFolder>` (the VS Code / Discord pattern) — built from an explicit
+/// local-app-data root so the shape is unit-testable anywhere.
+pub fn per_user_fallback_from(
+    local_app_data: &Path,
+    app_name: &str,
+    recorded_location: &str,
+) -> PathBuf {
+    local_app_data
+        .join("Programs")
+        .join(install_folder_name(app_name, recorded_location))
+}
+
+/// [`per_user_fallback_from`] against this machine's local app data dir.
+/// The one derivation the CLI error, the dry-run plan, and the wizard
+/// all share — no divergent copies.
+pub fn per_user_fallback_dir(app_name: &str, recorded_location: &str) -> PathBuf {
+    per_user_fallback_from(&local_app_data_dir(), app_name, recorded_location)
+}
+
+/// The nearest ancestor of `path` that exists (possibly `path` itself).
+fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    let mut cur = path;
+    loop {
+        if cur.exists() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
+            _ => return cur.to_path_buf(),
+        }
+    }
+}
+
+/// Probes `dir` for writability with a uniquely named temporary file
+/// (create + write + delete). Ok only when a file could really be
+/// created, written, and removed again.
+fn probe_dir_writable(dir: &Path) -> Result<(), String> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let probe = dir.join(format!(
+        ".seanpak-write-probe-{}-{nanos}-{seq}",
+        std::process::id()
+    ));
+    let attempt = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        std::io::Write::write_all(&mut file, b"seanpak")?;
+        drop(file);
+        std::fs::remove_file(&probe)
+    })();
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&probe);
+            Err(format!("cannot write in {}: {e}", dir.display()))
+        }
+    }
+}
+
+/// Non-destructive writability verdict for `dest`: probes the nearest
+/// existing ancestor (creating nothing), so the wizard's Review page,
+/// the `--dry-run` plan, and the CLI pre-check can all ask before
+/// anything is touched. [`ensure_location_writable`] is the
+/// authoritative gate the install operation itself runs.
+pub fn location_verdict(dest: &Path, app_name: &str, recorded_location: &str) -> LocationVerdict {
+    let fallback = per_user_fallback_dir(app_name, recorded_location);
+    let not_writable = |detail: String| LocationVerdict::NotWritable { fallback, detail };
+    let ancestor = nearest_existing_ancestor(dest);
+    if !ancestor.is_dir() {
+        return not_writable(format!("{} exists and is not a folder", ancestor.display()));
+    }
+    match probe_dir_writable(&ancestor) {
+        Ok(()) => LocationVerdict::Writable,
+        Err(detail) => not_writable(detail),
+    }
+}
+
+/// The plain-language refusal shared by every surface: names the
+/// folder, says it needs administrator access while this installer runs
+/// per user, confirms nothing was changed, and names the per-user
+/// fallback.
+pub fn location_not_writable_message(dest: &Path, fallback: &Path, detail: &str) -> String {
+    format!(
+        "Install stopped before anything was changed: {} is not writable by your user account ({detail}). \
+         That location needs administrator access, and this installer runs per user. \
+         Suggested per-user location: {}",
+        dest.display(),
+        fallback.display()
+    )
+}
+
+/// The install operation's own pre-flight, run before the rollback
+/// journal, extraction, or any registry/shortcut change: the shared
+/// verdict first, then the destination is created (as extraction would
+/// anyway) and probed from inside. Any failure is the
+/// location-not-writable refusal — nothing has been changed yet at
+/// this point beyond, at most, the empty destination folder itself.
+pub fn ensure_location_writable(
+    dest: &Path,
+    app_name: &str,
+    recorded_location: &str,
+) -> Result<(), String> {
+    if let LocationVerdict::NotWritable { fallback, detail } =
+        location_verdict(dest, app_name, recorded_location)
+    {
+        return Err(location_not_writable_message(dest, &fallback, &detail));
+    }
+    let fallback = per_user_fallback_dir(app_name, recorded_location);
+    std::fs::create_dir_all(dest).map_err(|e| {
+        location_not_writable_message(dest, &fallback, &format!("cannot create the folder: {e}"))
+    })?;
+    probe_dir_writable(dest)
+        .map_err(|detail| location_not_writable_message(dest, &fallback, &detail))
 }
 
 /// Caller choices for an install run.
@@ -154,6 +359,13 @@ pub struct InstallRequest {
     /// Same-version installs verify + restore damaged files and report
     /// the run as a repair.
     pub repair: bool,
+    /// Explicit start-at-login choice for this run (the CLI's
+    /// `--start-at-login` / `--no-start-at-login`): `Some` forces the
+    /// option on (offered, with this default) or off, overriding the
+    /// package's recorded default. `None` keeps the package's choice —
+    /// the wizard passes `None` and carries the user's choice in
+    /// `options_override` instead.
+    pub start_at_login: Option<bool>,
 }
 
 /// One progress update during extraction.
@@ -184,6 +396,9 @@ pub struct InstallOutcome {
     pub shortcuts_created: usize,
     pub associations_applied: usize,
     pub path_entry_added: bool,
+    /// The start-at-login Run entry was applied (journaled in the
+    /// receipt; Windows only — always false off Windows).
+    pub start_at_login_applied: bool,
 }
 
 /// Performs the install described by the module docs with default
@@ -210,7 +425,14 @@ pub fn perform_install_with(
     let (manifest, records, package_options) = OverlayReader::read_package(file)
         .map_err(|e| format!("cannot read package: {e}"))?
         .ok_or_else(|| "this executable carries no SeanPak overlay".to_string())?;
-    let options = request.options_override.unwrap_or(package_options);
+    let mut options = request.options_override.unwrap_or(package_options);
+    // A caller's explicit start-at-login choice wins over the package's
+    // recorded default (it can only force an entry on when the package
+    // has a primary exe to point at — the plan enforces that).
+    if let Some(choice) = request.start_at_login {
+        options.start_at_login = 1;
+        options.start_at_login_default = choice as u8;
+    }
 
     // Mode decision, made before anything is touched.
     let detected = detect_existing(dest, &manifest);
@@ -250,6 +472,12 @@ pub fn perform_install_with(
             }
         }
     }
+
+    // Pre-flight writability gate: before the journal, extraction, or
+    // any system change. A per-user installer cannot use a folder that
+    // needs administrator access, and the refusal must land before
+    // anything is touched — never midway through extraction.
+    ensure_location_writable(dest, &manifest.app_name(), &options.install_location())?;
 
     let mut tx =
         TransactionRollbackLog::new().map_err(|e| format!("cannot start rollback journal: {e}"))?;
@@ -350,7 +578,12 @@ pub fn perform_install_with(
     let shortcuts_created = applied.shortcuts.len();
     let associations_applied = applied.associations.len();
     let path_entry_added = applied.path_segment_added.is_some();
-    if !applied.shortcuts.is_empty() || !applied.associations.is_empty() || path_entry_added {
+    let start_at_login_applied = applied.start_at_login.is_some();
+    if !applied.shortcuts.is_empty()
+        || !applied.associations.is_empty()
+        || path_entry_added
+        || start_at_login_applied
+    {
         let journal = applied.clone();
         tx.record_rollback_hook(move || remove_artifacts(&journal));
     }
@@ -378,6 +611,13 @@ pub fn perform_install_with(
         start_menu_folder: options.start_menu_folder(),
         path_entry: options.wants_path_entry(),
         file_associations: crate::sysinstall::parse_extensions(&options.file_associations()),
+        launch_after_install_offered: options.offers_launch_after_install(),
+        launch_after_install_default: options.launch_after_install_default_checked(),
+        start_at_login: options.start_at_login_chosen(),
+        data_dirs: crate::uninstall::resolve_data_dirs(&options.data_dirs(), dest)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
         artifacts: applied,
     };
     let receipt_path = match receipt.write_to(dest) {
@@ -403,6 +643,16 @@ pub fn perform_install_with(
             ),
         ],
     );
+    if let Some(run) = &receipt.artifacts.start_at_login {
+        crate::diag::record(
+            "autostart-applied",
+            vec![
+                ("app", crate::manifest::jstr(receipt.app.clone())),
+                ("name", crate::manifest::jstr(run.name.clone())),
+                ("command", crate::manifest::jstr(run.command.clone())),
+            ],
+        );
+    }
     tx.commit()
         .map_err(|e| format!("cannot commit install journal: {e}"))?;
     Ok(InstallOutcome {
@@ -416,7 +666,33 @@ pub fn perform_install_with(
         shortcuts_created,
         associations_applied,
         path_entry_added,
+        start_at_login_applied,
     })
+}
+
+/// Starts an installed program detached: no console, no inherited
+/// stdio, working directory = the executable's folder. Shared by the
+/// wizard's Finish-page "Launch <App>" checkbox and the CLI's
+/// `--launch`. A failure is reported to the caller, which treats it
+/// as a warning — never as an install failure.
+pub fn launch_program(exe: &Path) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = exe.parent() {
+        cmd.current_dir(dir);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the launched app
+        // must not share (or hold open) the installer's console.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    cmd.spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("could not start {}: {e}", exe.display()))
 }
 
 /// SHA-256 of every payload's *original* bytes, in record order.
@@ -693,6 +969,134 @@ mod tests {
         assert!(perform_install(&missing, &dest).is_err());
         assert_eq!(std::fs::read(dest.join("app.exe")).unwrap(), b"pe-v1");
         assert_eq!(read_receipt(&dest).unwrap().version, "1.0.0");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fallback_path_shape_and_folder_derivation() {
+        let root = Path::new("/machine/AppData/Local");
+        assert_eq!(
+            per_user_fallback_from(root, "ai.md", "C:\\Program Files\\ai.md"),
+            root.join("Programs").join("ai.md")
+        );
+        // Trailing separators and forward slashes derive the same folder.
+        assert_eq!(install_folder_name("Any", "D:\\Apps\\My App\\"), "My App");
+        assert_eq!(install_folder_name("Any", "C:/Program Files/Tool"), "Tool");
+        // A bare drive root or empty location falls back to the app name.
+        assert_eq!(install_folder_name("My App", "C:\\"), "My App");
+        assert_eq!(install_folder_name("My App", ""), "My App");
+        assert_eq!(
+            per_user_fallback_from(root, "My App", ""),
+            root.join("Programs").join("My App")
+        );
+    }
+
+    #[test]
+    fn writable_temp_dir_passes_the_verdict() {
+        let root = unique_temp("writable");
+        std::fs::create_dir_all(&root).unwrap();
+        let verdict = location_verdict(&root.join("app"), "Life App", "C:\\Apps\\Life App");
+        assert_eq!(verdict, LocationVerdict::Writable);
+        // A not-yet-existing destination under a writable parent is fine,
+        // and the verdict created nothing.
+        assert!(!root.join("app").exists());
+        // The operation's gate creates + probes the destination itself.
+        ensure_location_writable(&root.join("app"), "Life App", "C:\\Apps\\Life App").unwrap();
+        assert!(root.join("app").is_dir());
+        // The probe file never lingers.
+        let leftovers: Vec<_> = std::fs::read_dir(root.join("app"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn path_under_a_file_is_not_writable() {
+        let root = unique_temp("underfile");
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("blocker.bin");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let dest = blocker.join("sub");
+        match location_verdict(&dest, "Life App", "C:\\Program Files\\Life App") {
+            LocationVerdict::NotWritable { fallback, .. } => {
+                assert!(fallback.ends_with("Life App"), "{}", fallback.display());
+                assert!(fallback
+                    .parent()
+                    .map(|p| p.ends_with("Programs"))
+                    .unwrap_or(false));
+            }
+            LocationVerdict::Writable => panic!("a path under a file cannot be writable"),
+        }
+        let err =
+            ensure_location_writable(&dest, "Life App", "C:\\Program Files\\Life App").unwrap_err();
+        assert!(err.contains("not writable"), "{err}");
+        assert!(err.contains("administrator"), "{err}");
+        assert!(err.contains("Life App"), "{err}");
+        assert!(
+            !dest.exists(),
+            "the refusal must not create the destination"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_dir_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = unique_temp("readonly");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A privileged process (root) can write anyway; the read-only
+        // expectation only holds where the permission actually bites.
+        let privileged = std::fs::File::create(root.join(".privilege-check")).is_ok();
+        if privileged {
+            let _ = std::fs::remove_file(root.join(".privilege-check"));
+        } else {
+            match location_verdict(&root, "Life App", "C:\\Apps\\Life App") {
+                LocationVerdict::NotWritable { .. } => {}
+                LocationVerdict::Writable => {
+                    panic!("a read-only dir must not pass the verdict")
+                }
+            }
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_and_install_refuse_an_unwritable_location() {
+        let root = unique_temp("planrefuse");
+        std::fs::create_dir_all(&root).unwrap();
+        let setup = pack_version(&root, "1.0.0", b"pe-v1");
+        let (manifest, records, options) = read_own_package(&setup).unwrap();
+
+        // A writable destination plans clean, with no suggestion.
+        let good_dest = root.join("installed");
+        let plan = plan_install(&manifest, &records, &options, &good_dest);
+        assert!(plan.location_writable);
+        assert!(plan.suggested_location.is_none());
+
+        // A destination under a file: the plan carries the verdict and
+        // the per-user suggestion, and the install itself refuses
+        // before creating anything.
+        let blocker = root.join("blocker.bin");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad_dest = blocker.join("sub");
+        let plan = plan_install(&manifest, &records, &options, &bad_dest);
+        assert!(!plan.location_writable);
+        let suggestion = plan.suggested_location.expect("a suggestion is offered");
+        assert!(suggestion.ends_with("Life App"), "{}", suggestion.display());
+
+        let err = perform_install(&setup, &bad_dest).unwrap_err();
+        assert!(err.contains("not writable"), "{err}");
+        assert!(err.contains(&suggestion.display().to_string()), "{err}");
+        assert!(!bad_dest.exists(), "nothing may be created on refusal");
+        assert!(read_receipt(&bad_dest).is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }

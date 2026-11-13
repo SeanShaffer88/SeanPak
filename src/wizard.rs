@@ -1,16 +1,24 @@
-//! SeanPak installer wizard (TesselGUI Design C — the ledger review).
+//! SeanPak installer wizard (TesselGUI Design E — the Rail layout).
 //!
 //! When a built SeanPak installer (this executable plus a payload overlay)
 //! is run with no arguments, this wizard opens instead of the packager GUI.
-//! Four pages in the Design C language:
+//! A fixed left rail carries the app's identity (monogram tile, name,
+//! version, publisher), the four steps (Review, Options, Installing,
+//! Done — current step accented, completed steps checked), and the disk
+//! space the install needs and finds. The content area holds four pages:
 //!
 //! 1. **Review** — every install decision in a gridded table
 //!    (Item / Value / Change). Values come from the package's overlay
 //!    manifest and its version 3+ install-options block (defaults for
 //!    older packages). A row whose Change column offers an action routes
-//!    to the Options page.
+//!    to the Options page. The page also runs the shared writability
+//!    pre-flight (`install::location_verdict`): a location this per-user
+//!    installer cannot write is flagged in its row, its Change action
+//!    becomes the one-click switch to the per-user folder, and Install
+//!    stays disabled until the location is usable.
 //! 2. **Options** — edit the install location (folder picker or typed),
-//!    toggle the desktop / Start Menu / PATH rows, edit the Start Menu
+//!    toggle the desktop / Start Menu / PATH rows and — when the
+//!    package offers it — "Start <App> at login", edit the Start Menu
 //!    folder and the file associations.
 //! 3. **Progress** — the shared install operation runs on a worker
 //!    thread with live per-file progress; Cancel asks it to stop, the
@@ -18,7 +26,14 @@
 //!    its honest "cancelled, nothing kept" state.
 //! 4. **Finish** — what was installed, where, and the receipt path; or,
 //!    when the install failed, the plain-language reason and the fact
-//!    that every change was rolled back.
+//!    that every change was rolled back. On success, a package that
+//!    offers it shows a "Launch <App>" checkbox (checked per the
+//!    package's default); closing with it checked starts the app.
+//!
+//! The module also hosts [`confirm_uninstall`]: the small native
+//! confirmation window an interactive uninstall opens — what will be
+//! removed, plus the opt-in data-deletion checkbox — in the same
+//! visual language.
 //!
 //! Install itself is `crate::install::perform_install_with` — the exact
 //! operation the CLI's `--install` runs — including shortcuts, file
@@ -31,16 +46,21 @@
 use std::path::PathBuf;
 
 use crate::overlay::{FileRecordHeader, InstallOptions, OverlayManifestHeader};
-use crate::scanner::format_bytes;
 
-/// Builds the Design C review rows (Item / Value / Change) for a package.
+/// Builds the Rail review rows (Item / Value / Change) for a package.
 /// Pure and platform-independent so the table content is unit-tested.
+/// (Disk space is not a row: the rail reports it, under the step list.)
+///
+/// When the install location fails the shared writability pre-flight
+/// (`location_writable` false), the location row says so in its Value
+/// and its Change action becomes the one-click offer to switch to the
+/// per-user folder instead of the usual route to the Options page.
 pub fn review_rows(
     manifest: &OverlayManifestHeader,
     options: &InstallOptions,
     records: &[FileRecordHeader],
     install_dir_display: &str,
-    free_bytes: Option<u64>,
+    location_writable: bool,
 ) -> Vec<[String; 3]> {
     let primary = records
         .get(manifest.primary_exe_index as usize)
@@ -63,24 +83,22 @@ pub fn review_rows(
     } else {
         associations
     };
-    let disk = match free_bytes {
-        Some(free) => format!(
-            "{} of {} free",
-            format_bytes(manifest.total_uncompressed_bytes),
-            format_bytes(free)
-        ),
-        None => format!(
-            "{} required",
-            format_bytes(manifest.total_uncompressed_bytes)
-        ),
-    };
     let yes_no = |on: bool| if on { "Yes" } else { "No" }.to_string();
-    vec![
+    let location_row = if location_writable {
         [
             "Install location".to_string(),
             install_dir_display.to_string(),
             "Browse…".to_string(),
-        ],
+        ]
+    } else {
+        [
+            "Install location".to_string(),
+            format!("{install_dir_display} — needs administrator access"),
+            "Use per-user folder".to_string(),
+        ]
+    };
+    let mut rows = vec![
+        location_row,
         ["Components".to_string(), components, "Choose…".to_string()],
         [
             "Start Menu folder".to_string(),
@@ -102,8 +120,17 @@ pub fn review_rows(
             yes_no(options.wants_path_entry()),
             "Toggle".to_string(),
         ],
-        ["Disk space".to_string(), disk, "—".to_string()],
-    ]
+    ];
+    // The start-at-login row exists only when the package offers the
+    // option; it stays last.
+    if options.offers_start_at_login() {
+        rows.push([
+            "Start at login".to_string(),
+            yes_no(options.start_at_login_chosen()),
+            "Toggle".to_string(),
+        ]);
+    }
+    rows
 }
 
 /// The install directory proposed by a package: its recorded install
@@ -164,7 +191,33 @@ pub fn delete_uninstall_entry(app_name: &str) {
 #[cfg(not(windows))]
 pub fn delete_uninstall_entry(_app_name: &str) {}
 
-/// The Design C installer wizard for one overlay package.
+/// The uninstall confirmation window, in the wizard's visual language:
+/// names what uninstall removes and — when the install recorded data
+/// directories — offers a checkbox (default UNCHECKED) to delete the
+/// app's data files too, listing the exact folders and warning that
+/// deleted data cannot be recovered.
+///
+/// Returns `Some(purge_data)` when the user confirms (the checkbox
+/// state), or `None` when the window is cancelled or closed — the
+/// caller must then remove nothing. The window is a view over the
+/// shared uninstall operation ([`crate::uninstall::perform_uninstall`]);
+/// it decides nothing else.
+///
+/// Off Windows there is no native window; the function proceeds with
+/// the safe default (uninstall, keep data).
+#[cfg(windows)]
+pub fn confirm_uninstall(app_name: &str, data_dirs: &[PathBuf]) -> Option<bool> {
+    imp::confirm_uninstall(app_name, data_dirs)
+}
+
+/// Off Windows there is no native window; proceeds with the safe
+/// default (uninstall, keep data). See the Windows form.
+#[cfg(not(windows))]
+pub fn confirm_uninstall(_app_name: &str, _data_dirs: &[PathBuf]) -> Option<bool> {
+    Some(false)
+}
+
+/// The Rail-layout installer wizard for one overlay package.
 pub struct InstallWizard {
     manifest: OverlayManifestHeader,
     records: Vec<FileRecordHeader>,
@@ -233,14 +286,32 @@ mod imp {
     use super::{default_install_dir, review_rows, InstallOptions};
     use crate::install::{InstallOutcome, ProgressEvent};
     use crate::overlay::{FileRecordHeader, OverlayManifestHeader};
+    use crate::scanner::format_bytes;
 
     // TesselGUI rev2 GitHub Dark palette (COLORREF is 0x00BBGGRR).
     const COLOR_BG: u32 = 0x0017_110D; // #0D1117
     const COLOR_SURFACE: u32 = 0x001D_1612; // #12161D
+    const COLOR_RAIL: u32 = 0x0009_0401; // #010409 (the rail, darkest panel)
+    const COLOR_DEEP: u32 = 0x003C_2615; // #15263C (info box fill)
     const COLOR_FG: u32 = 0x00FC_F6F0; // #F0F6FC
     const COLOR_MUTED: u32 = 0x00A1_9891; // #9198A1
     const COLOR_BLUE: u32 = 0x00F7_812F; // #2F81F7
     const COLOR_GREEN: u32 = 0x0037_7F1A; // #1A7F37
+    const COLOR_OK: u32 = 0x0050_B93F; // #3FB950 (completed-step check)
+
+    // The rail: fixed left panel, its step list, and its disk block.
+    const RAIL_W: i32 = 150;
+    const ID_RAIL_BG: usize = 340;
+    const ID_LBL_APPNAME: usize = 341;
+    const ID_LBL_APPVER: usize = 342;
+    const ID_LBL_APPPUB: usize = 343;
+    const ID_LBL_DISKCAP: usize = 344;
+    const ID_LBL_DISKNEED: usize = 345;
+    const ID_LBL_DISKFREE: usize = 346;
+    const STEP_NAMES: [&str; 4] = ["Review", "Options", "Installing", "Done"];
+    const ID_STEP_ACCENTS: [usize; 4] = [350, 351, 352, 353];
+    const ID_STEP_NUMS: [usize; 4] = [354, 355, 356, 357];
+    const ID_STEP_NAMES: [usize; 4] = [358, 359, 360, 361];
 
     const ID_TILE: usize = 400;
     const ID_LBL_HEADER: usize = 401;
@@ -248,6 +319,7 @@ mod imp {
     const ID_LBL_INFO: usize = 403;
     const ID_LBL_HINT: usize = 404;
     const ID_LBL_STATUS: usize = 405;
+    const ID_LBL_SUBTITLE: usize = 406;
     const ID_LIST: usize = 410;
     const ID_BTN_CANCEL: usize = 301;
     const ID_BTN_INSTALL: usize = 302;
@@ -264,19 +336,30 @@ mod imp {
     const ID_LBL_ASSOC: usize = 435;
     const ID_EDT_ASSOC: usize = 436;
     const ID_LBL_OPTNOTE: usize = 437;
+    const ID_CHK_LOGIN: usize = 438;
     // Progress page (page 3).
     const ID_LBL_PROGFILE: usize = 440;
     const ID_PROGRESS: usize = 441;
     // Finish page (page 4).
     const ID_LBL_FINISH: usize = 450;
+    const ID_CHK_LAUNCH: usize = 451;
+    // Uninstall confirmation window (its own window + state).
+    const ID_LBL_CONFIRM_TITLE: usize = 460;
+    const ID_LBL_CONFIRM_BODY: usize = 461;
+    const ID_CHK_PURGE: usize = 462;
+    const ID_LBL_CONFIRM_DIRS: usize = 463;
+    const ID_LBL_CONFIRM_WARN: usize = 464;
+    const ID_BTN_CONFIRM: usize = 465;
+    const ID_BTN_CONFIRM_CANCEL: usize = 466;
 
-    const OPTION_CONTROLS: [usize; 11] = [
+    const OPTION_CONTROLS: [usize; 12] = [
         ID_LBL_LOC,
         ID_EDT_LOCATION,
         ID_BTN_BROWSE,
         ID_CHK_DESKTOP,
         ID_CHK_STARTMENU,
         ID_CHK_PATH,
+        ID_CHK_LOGIN,
         ID_LBL_SMFOLDER,
         ID_EDT_SMFOLDER,
         ID_LBL_ASSOC,
@@ -312,6 +395,7 @@ mod imp {
     const SS_CENTER: u32 = 0x0001;
     const SS_RIGHT: u32 = 0x0002;
     const SS_ETCHEDHORZ: u32 = 0x0010;
+    const SS_ETCHEDVERT: u32 = 0x0011;
     // Edit / checkbox styles, likewise defined locally.
     const ES_AUTOHSCROLL: u32 = 0x0080;
     const BS_AUTOCHECKBOX: u32 = 0x0003;
@@ -319,12 +403,23 @@ mod imp {
     // NM_DBLCLK is (-3); NMHDR.code is unsigned, so compare as i32.
     const NM_DBLCLK_I32: i32 = -3;
 
+    // EN_CHANGE notification code (high word of WM_COMMAND's wparam).
+    const EN_CHANGE_CODE: usize = 0x0300;
+
+    const READY_INFO_TEXT: &str = "Ready to install. Nothing is downloaded and nothing is sent anywhere — this installer works fully offline and can be undone from Windows Settings → Apps.";
+    const UNWRITABLE_INFO_TEXT: &str = "That install folder needs administrator access, and this installer runs per user — it cannot use it. Switch to the per-user folder with the Install location row's Change action (no administrator rights needed), or choose a different location on the Options page.";
+
     struct WizardState {
         manifest: OverlayManifestHeader,
         records: Vec<FileRecordHeader>,
         options: InstallOptions,
         exe_path: PathBuf,
         install_dir: PathBuf,
+        /// Latest writability pre-flight verdict for `install_dir`
+        /// (see `refresh_location_state`); starts optimistic and is
+        /// recomputed whenever the Review/Options pages are shown or
+        /// the location changes.
+        location_ok: bool,
         /// Current page: 1 Review, 2 Options, 3 Progress, 4 Finish.
         page: u8,
         installing: bool,
@@ -337,6 +432,10 @@ mod imp {
         /// The finished install's outcome, handed from the worker thread
         /// to the UI thread (taken when the Finish page is shown).
         finish: Option<Result<InstallOutcome, String>>,
+        /// The primary executable's installed path, set when the Finish
+        /// page is armed with a working "Launch <App>" checkbox (the
+        /// package offers it and the install succeeded).
+        launch_path: Option<PathBuf>,
     }
 
     static STATE: Mutex<Option<WizardState>> = Mutex::new(None);
@@ -344,8 +443,11 @@ mod imp {
     static mut BG_BRUSH: HBRUSH = std::ptr::null_mut();
     static mut SURFACE_BRUSH: HBRUSH = std::ptr::null_mut();
     static mut GREEN_BRUSH: HBRUSH = std::ptr::null_mut();
+    static mut RAIL_BRUSH: HBRUSH = std::ptr::null_mut();
+    static mut DEEP_BRUSH: HBRUSH = std::ptr::null_mut();
     static mut HEADER_FONT: HFONT = std::ptr::null_mut();
     static mut TILE_FONT: HFONT = std::ptr::null_mut();
+    static mut NAME_FONT: HFONT = std::ptr::null_mut();
 
     pub fn run(
         manifest: OverlayManifestHeader,
@@ -361,12 +463,14 @@ mod imp {
                 options,
                 exe_path,
                 install_dir,
+                location_ok: true,
                 page: 1,
                 installing: false,
                 installed: false,
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: Arc::new(Mutex::new((0, 0, String::new()))),
                 finish: None,
+                launch_path: None,
             });
         }
         unsafe {
@@ -391,6 +495,24 @@ mod imp {
             BG_BRUSH = CreateSolidBrush(COLOR_BG);
             SURFACE_BRUSH = CreateSolidBrush(COLOR_SURFACE);
             GREEN_BRUSH = CreateSolidBrush(COLOR_GREEN);
+            RAIL_BRUSH = CreateSolidBrush(COLOR_RAIL);
+            DEEP_BRUSH = CreateSolidBrush(COLOR_DEEP);
+            NAME_FONT = CreateFontW(
+                -15,
+                0,
+                0,
+                0,
+                FW_SEMIBOLD as i32,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                WIDE_SANS.as_ptr(),
+            );
             HEADER_FONT = CreateFontW(
                 -20,
                 0,
@@ -507,14 +629,19 @@ mod imp {
         let edit_class: Vec<u16> = "EDIT\0".encode_utf16().collect();
         let progress_class: Vec<u16> = "msctls_progress32\0".encode_utf16().collect();
 
-        let (app_name, app_version) = STATE
+        let (app_name, app_version, app_publisher) = STATE
             .lock()
             .ok()
             .and_then(|g| {
-                g.as_ref()
-                    .map(|s| (s.manifest.app_name(), s.manifest.app_version()))
+                g.as_ref().map(|s| {
+                    (
+                        s.manifest.app_name(),
+                        s.manifest.app_version(),
+                        s.manifest.publisher(),
+                    )
+                })
             })
-            .unwrap_or_else(|| ("App".to_string(), String::new()));
+            .unwrap_or_else(|| ("App".to_string(), String::new(), String::new()));
 
         let mk =
             |class: &[u16], text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: usize| {
@@ -537,30 +664,100 @@ mod imp {
                 }
             };
 
-        // Header: the packaged app's monogram tile (app-green), then
-        // the app name/version. No external assets — the tile is a
-        // static control whose initial is drawn from the app name.
+        // The rail (Design E): a fixed left panel in the darkest
+        // surface color. Its background is an empty static painted
+        // with the rail brush (see WM_CTLCOLORSTATIC); everything else
+        // on the rail is a static laid over it. The rail carries the
+        // app's identity, the step list, and the disk figures — the
+        // content area to its right holds the pages.
+        mk(&static_class, "", 0, 0, 0, RAIL_W, 542, ID_RAIL_BG);
+        mk(&static_class, "", SS_ETCHEDVERT, RAIL_W - 1, 0, 2, 542, 0);
+
+        // Identity: the packaged app's monogram tile (app-green), then
+        // the app name, version, and publisher. No external assets —
+        // the tile is a static whose initial is drawn from the name.
         let monogram = app_name
             .chars()
             .find(|c| c.is_alphanumeric())
             .map(|c| c.to_uppercase().collect::<String>())
             .unwrap_or_else(|| "?".to_string());
-        let tile = mk(&static_class, &monogram, SS_CENTER, 16, 8, 40, 40, ID_TILE);
+        let tile = mk(&static_class, &monogram, SS_CENTER, 20, 16, 48, 48, ID_TILE);
         SendMessageW(tile, WM_SETFONT, TILE_FONT as WPARAM, 1);
-        let header = mk(
+        let name_lbl = mk(&static_class, &app_name, 0, 20, 76, 118, 22, ID_LBL_APPNAME);
+        SendMessageW(name_lbl, WM_SETFONT, NAME_FONT as WPARAM, 1);
+        mk(
             &static_class,
-            &format!("{app_name} {app_version}"),
+            &format!("Version {app_version}"),
             0,
-            68,
-            14,
-            468,
-            26,
-            ID_LBL_HEADER,
+            20,
+            100,
+            118,
+            18,
+            ID_LBL_APPVER,
         );
+        mk(
+            &static_class,
+            &app_publisher,
+            0,
+            20,
+            118,
+            118,
+            18,
+            ID_LBL_APPPUB,
+        );
+
+        // Steps: an accent bar at the rail's left edge (green only for
+        // the current step), the step's number — a green check once
+        // the step is complete — and its name. Texts/colors refresh in
+        // show_page / WM_CTLCOLORSTATIC from the state's page.
+        for i in 0..4 {
+            let y = 158 + (i as i32) * 40;
+            mk(&static_class, "", 0, 0, y + 2, 4, 26, ID_STEP_ACCENTS[i]);
+            mk(
+                &static_class,
+                &(i + 1).to_string(),
+                SS_CENTER,
+                16,
+                y + 3,
+                24,
+                24,
+                ID_STEP_NUMS[i],
+            );
+            mk(
+                &static_class,
+                STEP_NAMES[i],
+                0,
+                48,
+                y + 5,
+                96,
+                20,
+                ID_STEP_NAMES[i],
+            );
+        }
+
+        // Disk figures, pinned to the rail's bottom.
+        mk(&static_class, "", SS_ETCHEDHORZ, 16, 452, 118, 2, 0);
+        mk(
+            &static_class,
+            "DISK SPACE",
+            0,
+            16,
+            462,
+            118,
+            14,
+            ID_LBL_DISKCAP,
+        );
+        mk(&static_class, "", 0, 16, 480, 118, 18, ID_LBL_DISKNEED);
+        mk(&static_class, "", 0, 16, 500, 118, 18, ID_LBL_DISKFREE);
+        set_disk_labels(parent);
+
+        // Content header: page title left, step counter right, a
+        // subtitle under the title, then the separator.
+        let header = mk(&static_class, "Review", 0, 174, 14, 360, 26, ID_LBL_HEADER);
         SendMessageW(header, WM_SETFONT, HEADER_FONT as WPARAM, 1);
         mk(
             &static_class,
-            "Step 1 of 4 — Review",
+            "Step 1 of 4",
             SS_RIGHT,
             548,
             18,
@@ -568,16 +765,17 @@ mod imp {
             22,
             ID_LBL_STEP,
         );
-        mk(&static_class, "", SS_ETCHEDHORZ, 0, 48, 864, 2, 0);
+        mk(&static_class, "", 0, 174, 44, 674, 20, ID_LBL_SUBTITLE);
+        mk(&static_class, "", SS_ETCHEDHORZ, 174, 70, 674, 2, 0);
 
         let list = mk(
             &list_class,
             "",
             WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL,
-            16,
-            60,
-            832,
-            296,
+            174,
+            82,
+            674,
+            272,
             ID_LIST,
         );
         SendMessageW(
@@ -593,18 +791,23 @@ mod imp {
 
         mk(
             &static_class,
-            "Ready to install. Nothing is downloaded and nothing is sent anywhere — this installer works fully offline and can be undone from Windows Settings → Apps.",
-            0, 16, 368, 832, 44, ID_LBL_INFO,
+            READY_INFO_TEXT,
+            0,
+            174,
+            366,
+            674,
+            46,
+            ID_LBL_INFO,
         );
-        mk(&static_class, "", 0, 16, 424, 832, 22, ID_LBL_STATUS);
-        mk(&static_class, "", SS_ETCHEDHORZ, 0, 486, 864, 2, 0);
+        mk(&static_class, "", 0, 174, 458, 674, 22, ID_LBL_STATUS);
+        mk(&static_class, "", SS_ETCHEDHORZ, RAIL_W, 486, 714, 2, 0);
         mk(
             &static_class,
             "↑↓ navigate · Enter edit · Ctrl+K palette",
             0,
-            16,
+            174,
             502,
-            480,
+            420,
             20,
             ID_LBL_HINT,
         );
@@ -644,8 +847,8 @@ mod imp {
             &static_class,
             "Install location",
             0,
-            16,
-            64,
+            174,
+            88,
             400,
             20,
             ID_LBL_LOC,
@@ -654,9 +857,9 @@ mod imp {
             &edit_class,
             "",
             WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            16,
-            88,
-            700,
+            174,
+            112,
+            548,
             26,
             ID_EDT_LOCATION,
         );
@@ -664,9 +867,9 @@ mod imp {
             &button_class,
             "Browse…",
             WS_TABSTOP | (BS_PUSHBUTTON as u32),
-            724,
-            88,
-            124,
+            730,
+            112,
+            118,
             26,
             ID_BTN_BROWSE,
         );
@@ -674,9 +877,9 @@ mod imp {
             &button_class,
             "Desktop shortcut",
             WS_TABSTOP | BS_AUTOCHECKBOX,
-            16,
-            132,
-            400,
+            174,
+            154,
+            500,
             24,
             ID_CHK_DESKTOP,
         );
@@ -684,9 +887,9 @@ mod imp {
             &button_class,
             "Start Menu shortcuts",
             WS_TABSTOP | BS_AUTOCHECKBOX,
-            16,
-            162,
-            400,
+            174,
+            184,
+            500,
             24,
             ID_CHK_STARTMENU,
         );
@@ -694,18 +897,30 @@ mod imp {
             &button_class,
             "Add the install folder to PATH",
             WS_TABSTOP | BS_AUTOCHECKBOX,
-            16,
-            192,
-            400,
+            174,
+            214,
+            500,
             24,
             ID_CHK_PATH,
+        );
+        // Shown (and labelled with the app name) only when the package
+        // offers the start-at-login option — see show_page/fill.
+        mk(
+            &button_class,
+            "Start at login",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            174,
+            244,
+            500,
+            24,
+            ID_CHK_LOGIN,
         );
         mk(
             &static_class,
             "Start Menu folder",
             0,
-            16,
-            228,
+            174,
+            280,
             400,
             20,
             ID_LBL_SMFOLDER,
@@ -714,9 +929,9 @@ mod imp {
             &edit_class,
             "",
             WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            16,
-            252,
-            400,
+            174,
+            304,
+            420,
             26,
             ID_EDT_SMFOLDER,
         );
@@ -724,9 +939,9 @@ mod imp {
             &static_class,
             "File associations (comma-separated, for example .txt, .md)",
             0,
-            16,
-            292,
-            700,
+            174,
+            340,
+            674,
             20,
             ID_LBL_ASSOC,
         );
@@ -734,16 +949,16 @@ mod imp {
             &edit_class,
             "",
             WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            16,
-            316,
-            400,
+            174,
+            364,
+            420,
             26,
             ID_EDT_ASSOC,
         );
         mk(
             &static_class,
-            "Shortcuts, associations, and the PATH entry are created for your user account only — no administrator rights needed — and uninstall removes exactly what install created.",
-            0, 16, 360, 832, 44, ID_LBL_OPTNOTE,
+            "Shortcuts, associations, the PATH entry, and the login entry are created for your user account only — no administrator rights needed — and uninstall removes exactly what install created.",
+            0, 174, 404, 674, 48, ID_LBL_OPTNOTE,
         );
 
         // ---- Page 3: Progress ----
@@ -751,9 +966,9 @@ mod imp {
             &static_class,
             "Waiting to start…",
             0,
-            16,
-            150,
-            832,
+            174,
+            196,
+            674,
             22,
             ID_LBL_PROGFILE,
         );
@@ -761,15 +976,28 @@ mod imp {
             &progress_class,
             "",
             WS_TABSTOP,
-            16,
-            184,
-            832,
+            174,
+            228,
+            674,
             28,
             ID_PROGRESS,
         );
 
         // ---- Page 4: Finish ----
-        mk(&static_class, "", 0, 16, 64, 832, 380, ID_LBL_FINISH);
+        mk(&static_class, "", 0, 174, 82, 674, 330, ID_LBL_FINISH);
+        // The launch checkbox sits below the Finish text; its label
+        // and state are set when a successful install arms it (and it
+        // stays hidden otherwise) — see on_done_message / show_page.
+        mk(
+            &button_class,
+            "Launch",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            174,
+            424,
+            674,
+            24,
+            ID_CHK_LAUNCH,
+        );
 
         show_page(parent, 1);
     }
@@ -795,11 +1023,27 @@ mod imp {
         for id in OPTION_CONTROLS {
             show(id, page == 2);
         }
+        // The login checkbox joins page 2 only when the package offers
+        // the option.
+        let login_offered = STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.options.offers_start_at_login()))
+            .unwrap_or(false);
+        show(ID_CHK_LOGIN, page == 2 && login_offered);
         // Progress group.
         show(ID_LBL_PROGFILE, page == 3);
         show(ID_PROGRESS, page == 3);
         // Finish group.
         show(ID_LBL_FINISH, page == 4);
+        // The launch checkbox joins page 4 only when a successful
+        // install armed it.
+        let launch_armed = STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.launch_path.is_some()))
+            .unwrap_or(false);
+        show(ID_CHK_LAUNCH, page == 4 && launch_armed);
         // The status line serves pages 1–2 (transient messages).
         show(ID_LBL_STATUS, page == 1 || page == 2);
         // Footer buttons per page.
@@ -824,14 +1068,38 @@ mod imp {
             hwnd,
             ID_LBL_STEP,
             match page {
-                2 => "Step 2 of 4 — Options",
-                3 => "Step 3 of 4 — Installing",
-                4 => "Step 4 of 4 — Finish",
-                _ => "Step 1 of 4 — Review",
+                2 => "Step 2 of 4",
+                3 => "Step 3 of 4",
+                4 => "Step 4 of 4",
+                _ => "Step 1 of 4",
             },
         );
+        set_text(
+            hwnd,
+            ID_LBL_HEADER,
+            match page {
+                2 => "Options",
+                3 => "Installing",
+                4 => "Finish",
+                _ => "Review",
+            },
+        );
+        set_text(
+            hwnd,
+            ID_LBL_SUBTITLE,
+            match page {
+                2 => "Change any option — install uses exactly these choices.",
+                3 => "Installing — cancelling rolls back every change.",
+                4 => "The install has finished.",
+                _ => "Check the install options — change anything before you install.",
+            },
+        );
+        update_rail(hwnd, page);
         if page == 2 {
             fill_options_controls(hwnd);
+        }
+        if page == 1 || page == 2 {
+            refresh_location_state(hwnd);
         }
         let focus_id = match page {
             1 => ID_LIST,
@@ -843,6 +1111,129 @@ mod imp {
         if !focus.is_null() {
             SetFocus(focus);
         }
+    }
+
+    /// Refreshes the rail's step list for `page`: steps before it get
+    /// a green check in place of their number, the current step keeps
+    /// its number (its accent bar and green fill come from
+    /// WM_CTLCOLORSTATIC), later steps stay numbered and dim. The
+    /// statics are invalidated so the color handler repaints them.
+    unsafe fn update_rail(hwnd: HWND, page: u8) {
+        for i in 0..4usize {
+            let step = (i + 1) as u8;
+            if page > step {
+                set_text(hwnd, ID_STEP_NUMS[i], "\u{2713}");
+            } else {
+                set_text(hwnd, ID_STEP_NUMS[i], &step.to_string());
+            }
+            for id in [ID_STEP_ACCENTS[i], ID_STEP_NUMS[i], ID_STEP_NAMES[i]] {
+                let ctrl = GetDlgItem(hwnd, id as i32);
+                if !ctrl.is_null() {
+                    InvalidateRect(ctrl, std::ptr::null(), 1);
+                }
+            }
+        }
+    }
+
+    /// Refreshes the rail's disk block: what the package needs, and
+    /// what the current install location's drive reports free. Called
+    /// at creation and whenever the location verdict refreshes (the
+    /// free figure follows the chosen folder's drive).
+    unsafe fn set_disk_labels(hwnd: HWND) {
+        let snapshot = STATE.lock().ok().and_then(|g| {
+            g.as_ref()
+                .map(|s| (s.manifest.total_uncompressed_bytes, s.install_dir.clone()))
+        });
+        let Some((needed, dir)) = snapshot else {
+            return;
+        };
+        set_text(
+            hwnd,
+            ID_LBL_DISKNEED,
+            &format!("{} needed", format_bytes(needed)),
+        );
+        let free_text = match free_bytes_for(&dir) {
+            Some(free) => format!("{} free", format_bytes(free)),
+            None => String::new(),
+        };
+        set_text(hwnd, ID_LBL_DISKFREE, &free_text);
+    }
+
+    /// Runs the shared writability verdict for the current install
+    /// directory and brings the page furniture in line with it: the
+    /// state flag (a Review list refill when the verdict changed, so
+    /// the location row's marker and Change action update), the
+    /// explanation lines, and the Install button — disabled while the
+    /// location cannot be used, so an install never starts into a
+    /// folder that would only fail midway. (The operation's own
+    /// pre-flight remains the backstop if permissions change between
+    /// pages.) Called when the Review/Options pages are shown and
+    /// whenever the location changes.
+    unsafe fn refresh_location_state(hwnd: HWND) {
+        let snapshot = STATE.lock().ok().and_then(|g| {
+            g.as_ref().map(|s| {
+                (
+                    s.install_dir.clone(),
+                    s.manifest.app_name(),
+                    s.options.install_location(),
+                    s.location_ok,
+                    s.page,
+                )
+            })
+        });
+        let Some((dir, app_name, recorded, was_ok, page)) = snapshot else {
+            return;
+        };
+        let (ok, fallback) = match crate::install::location_verdict(&dir, &app_name, &recorded) {
+            crate::install::LocationVerdict::Writable => (true, None),
+            crate::install::LocationVerdict::NotWritable { fallback, .. } => {
+                (false, Some(fallback))
+            }
+        };
+        if let Ok(mut g) = STATE.lock() {
+            if let Some(s) = g.as_mut() {
+                s.location_ok = ok;
+            }
+        }
+        if ok != was_ok && page == 1 {
+            let list = GetDlgItem(hwnd, ID_LIST as i32);
+            if !list.is_null() {
+                fill_list(list);
+            }
+        }
+        if ok {
+            set_text(hwnd, ID_LBL_INFO, READY_INFO_TEXT);
+            set_text(hwnd, ID_LBL_STATUS, "");
+        } else if let Some(fallback) = &fallback {
+            set_text(hwnd, ID_LBL_INFO, UNWRITABLE_INFO_TEXT);
+            set_text(
+                hwnd,
+                ID_LBL_STATUS,
+                &format!("Per-user folder: {}", fallback.display()),
+            );
+        }
+        // On the Finish page the same button is "Close" and must stay
+        // enabled; on Progress it is hidden. Elsewhere it follows the
+        // verdict.
+        set_enabled(hwnd, ID_BTN_INSTALL, ok || page >= 3);
+        // The rail's free-space figure follows the location's drive.
+        set_disk_labels(hwnd);
+    }
+
+    /// The Options page location edit changed: keep the state's install
+    /// directory in sync and re-run the verdict, so the explanation and
+    /// the Install button track what the user is typing.
+    unsafe fn on_location_edited(hwnd: HWND) {
+        let text = get_text(hwnd, ID_EDT_LOCATION);
+        if let Ok(mut g) = STATE.lock() {
+            if let Some(s) = g.as_mut() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    s.install_dir = PathBuf::from(trimmed);
+                }
+            }
+        }
+        refresh_location_state(hwnd);
     }
 
     /// Writes fixed-size UTF-8 into an install-options field.
@@ -892,17 +1283,19 @@ mod imp {
 
     /// Page 2 controls ← current state (called when the page opens).
     unsafe fn fill_options_controls(hwnd: HWND) {
-        let snapshot = STATE
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|s| (s.install_dir.clone(), s.options)));
-        let Some((dir, options)) = snapshot else {
+        let snapshot = STATE.lock().ok().and_then(|g| {
+            g.as_ref()
+                .map(|s| (s.install_dir.clone(), s.options, s.manifest.app_name()))
+        });
+        let Some((dir, options, app_name)) = snapshot else {
             return;
         };
         set_text(hwnd, ID_EDT_LOCATION, &dir.to_string_lossy());
         set_check(hwnd, ID_CHK_DESKTOP, options.wants_desktop_shortcut());
         set_check(hwnd, ID_CHK_STARTMENU, options.wants_start_menu_shortcut());
         set_check(hwnd, ID_CHK_PATH, options.wants_path_entry());
+        set_text(hwnd, ID_CHK_LOGIN, &format!("Start {app_name} at login"));
+        set_check(hwnd, ID_CHK_LOGIN, options.start_at_login_default_checked());
         set_text(hwnd, ID_EDT_SMFOLDER, &options.start_menu_folder());
         set_text(hwnd, ID_EDT_ASSOC, &options.file_associations());
     }
@@ -914,6 +1307,7 @@ mod imp {
         let desktop = get_check(hwnd, ID_CHK_DESKTOP);
         let start_menu = get_check(hwnd, ID_CHK_STARTMENU);
         let path_entry = get_check(hwnd, ID_CHK_PATH);
+        let login = get_check(hwnd, ID_CHK_LOGIN);
         let sm_folder = get_text(hwnd, ID_EDT_SMFOLDER);
         let associations = get_text(hwnd, ID_EDT_ASSOC);
         if let Ok(mut g) = STATE.lock() {
@@ -924,6 +1318,14 @@ mod imp {
                 s.options.desktop_shortcut = desktop as u8;
                 s.options.start_menu_shortcut = start_menu as u8;
                 s.options.path_entry = path_entry as u8;
+                // The login choice edits the option's default in place
+                // (like the other toggles), so the shared operation
+                // sees the user's final choice. Only when offered —
+                // the checkbox is hidden otherwise and its state is
+                // meaningless.
+                if s.options.offers_start_at_login() {
+                    s.options.start_at_login_default = login as u8;
+                }
                 set_fixed_str(&mut s.options.start_menu_folder_utf8, sm_folder.trim());
                 set_fixed_str(&mut s.options.file_associations_utf8, associations.trim());
             }
@@ -936,7 +1338,7 @@ mod imp {
         static COLUMNS_DONE: Mutex<bool> = Mutex::new(false);
         let mut columns_done = COLUMNS_DONE.lock().map(|g| *g).unwrap_or(false);
         if !columns_done {
-            for (idx, (title, width)) in [("Item", 250), ("Value", 400), ("Change", 160)]
+            for (idx, (title, width)) in [("Item", 210), ("Value", 320), ("Change", 124)]
                 .iter()
                 .enumerate()
             {
@@ -966,13 +1368,12 @@ mod imp {
 
         let rows = STATE.lock().ok().and_then(|g| {
             g.as_ref().map(|s| {
-                let free = free_bytes_for(&s.install_dir);
                 review_rows(
                     &s.manifest,
                     &s.options,
                     &s.records,
                     &s.install_dir.to_string_lossy(),
-                    free,
+                    s.location_ok,
                 )
             })
         });
@@ -1064,11 +1465,11 @@ mod imp {
                 let hdc = wparam as HDC;
                 let ctrl = lparam as HWND;
                 let id = GetWindowLongW(ctrl, GWL_ID) as usize;
-                let installed = STATE
+                let (installed, page) = STATE
                     .lock()
                     .ok()
-                    .and_then(|g| g.as_ref().map(|s| s.installed))
-                    .unwrap_or(false);
+                    .and_then(|g| g.as_ref().map(|s| (s.installed, s.page)))
+                    .unwrap_or((false, 1));
                 if id == ID_TILE {
                     // The monogram tile: app-green block, light initial.
                     SetBkMode(hdc, OPAQUE as i32);
@@ -1076,13 +1477,83 @@ mod imp {
                     SetTextColor(hdc, COLOR_FG);
                     return GREEN_BRUSH as LRESULT;
                 }
+                if id == ID_RAIL_BG {
+                    // The rail's own background: solid darkest panel.
+                    SetBkMode(hdc, OPAQUE as i32);
+                    SetBkColor(hdc, COLOR_RAIL);
+                    return RAIL_BRUSH as LRESULT;
+                }
+                if let Some(i) = ID_STEP_ACCENTS.iter().position(|a| *a == id) {
+                    // Accent bar: green for the current step, rail
+                    // color (invisible) for the rest.
+                    SetBkMode(hdc, OPAQUE as i32);
+                    if page == (i + 1) as u8 {
+                        SetBkColor(hdc, COLOR_GREEN);
+                        return GREEN_BRUSH as LRESULT;
+                    }
+                    SetBkColor(hdc, COLOR_RAIL);
+                    return RAIL_BRUSH as LRESULT;
+                }
+                if let Some(i) = ID_STEP_NUMS.iter().position(|a| *a == id) {
+                    // Step number: green-filled while current, a green
+                    // check once complete, dim while still ahead.
+                    let step = (i + 1) as u8;
+                    if page == step {
+                        SetBkMode(hdc, OPAQUE as i32);
+                        SetBkColor(hdc, COLOR_GREEN);
+                        SetTextColor(hdc, COLOR_FG);
+                        return GREEN_BRUSH as LRESULT;
+                    }
+                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(hdc, if page > step { COLOR_OK } else { COLOR_MUTED });
+                    return RAIL_BRUSH as LRESULT;
+                }
+                if let Some(i) = ID_STEP_NAMES.iter().position(|a| *a == id) {
+                    // Step name: bright for the current and completed
+                    // steps, dim for the ones still ahead.
+                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(
+                        hdc,
+                        if page >= (i + 1) as u8 {
+                            COLOR_FG
+                        } else {
+                            COLOR_MUTED
+                        },
+                    );
+                    return RAIL_BRUSH as LRESULT;
+                }
+                if id == ID_LBL_APPNAME || id == ID_LBL_DISKNEED {
+                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(hdc, COLOR_FG);
+                    return RAIL_BRUSH as LRESULT;
+                }
+                if id == ID_LBL_APPVER
+                    || id == ID_LBL_APPPUB
+                    || id == ID_LBL_DISKCAP
+                    || id == ID_LBL_DISKFREE
+                {
+                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(hdc, COLOR_MUTED);
+                    return RAIL_BRUSH as LRESULT;
+                }
+                if id == ID_LBL_INFO {
+                    // The info box: light text on the deep-blue fill.
+                    SetBkMode(hdc, OPAQUE as i32);
+                    SetBkColor(hdc, COLOR_DEEP);
+                    SetTextColor(hdc, COLOR_FG);
+                    return DEEP_BRUSH as LRESULT;
+                }
                 SetBkMode(hdc, TRANSPARENT as i32);
                 if (id == ID_LBL_STATUS || id == ID_LBL_FINISH) && installed {
                     // Success green, always paired with the status text.
                     SetTextColor(hdc, COLOR_GREEN);
-                } else if id == ID_LBL_STEP || id == ID_LBL_HINT || id == ID_LBL_STATUS {
+                } else if id == ID_LBL_STEP
+                    || id == ID_LBL_HINT
+                    || id == ID_LBL_STATUS
+                    || id == ID_LBL_SUBTITLE
+                {
                     SetTextColor(hdc, COLOR_MUTED);
-                } else if id == ID_LBL_INFO || id == ID_LBL_OPTNOTE {
+                } else if id == ID_LBL_OPTNOTE {
                     SetTextColor(hdc, COLOR_BLUE);
                 } else {
                     SetTextColor(hdc, COLOR_FG);
@@ -1091,6 +1562,10 @@ mod imp {
             }
             WM_COMMAND => {
                 let control_id = wparam & 0xFFFF;
+                let notify_code = (wparam >> 16) & 0xFFFF;
+                if control_id == ID_EDT_LOCATION && notify_code == EN_CHANGE_CODE {
+                    on_location_edited(hwnd);
+                }
                 match control_id {
                     ID_BTN_CANCEL => on_cancel_click(hwnd),
                     ID_BTN_BACK => {
@@ -1250,14 +1725,46 @@ mod imp {
                     );
                 }
                 text += &format!(
-                    "\r\nReceipt: {}\r\nShortcuts created: {} · File associations applied: {} · PATH entry: {}",
+                    "\r\nReceipt: {}\r\nShortcuts created: {} · File associations applied: {} · PATH entry: {} · Start at login: {}",
                     outcome.receipt_path.display(),
                     outcome.shortcuts_created,
                     outcome.associations_applied,
                     if outcome.path_entry_added { "added" } else { "not added" },
+                    if outcome.start_at_login_applied { "on" } else { "off" },
                 );
                 text += "\r\n\r\nRemove it any time from Windows Settings \u{2192} Apps, or by running Uninstall.exe in the install folder.";
                 set_text(hwnd, ID_LBL_FINISH, &text);
+                // Arm the launch checkbox when the package offers it
+                // and the install produced the primary executable:
+                // labelled for the app, checked per the package's
+                // recorded default. Closing with it checked starts the
+                // app (see on_install_click).
+                let launch = STATE.lock().ok().and_then(|g| {
+                    g.as_ref().and_then(|s| {
+                        if !s.options.offers_launch_after_install() {
+                            return None;
+                        }
+                        let record = s.records.get(s.manifest.primary_exe_index as usize)?;
+                        let rel = record.relative_path();
+                        if rel.is_empty() {
+                            return None;
+                        }
+                        Some((
+                            outcome.dest.join(rel.replace('\\', "/")),
+                            s.options.launch_after_install_default_checked(),
+                            s.manifest.app_name(),
+                        ))
+                    })
+                });
+                if let Some((path, checked, app)) = launch {
+                    if let Ok(mut g) = STATE.lock() {
+                        if let Some(s) = g.as_mut() {
+                            s.launch_path = Some(path);
+                        }
+                    }
+                    set_text(hwnd, ID_CHK_LAUNCH, &format!("Launch {app}"));
+                    set_check(hwnd, ID_CHK_LAUNCH, checked);
+                }
             }
             Err(e) => {
                 crate::diag::log("wizard", &format!("install failed: {e}"));
@@ -1275,11 +1782,20 @@ mod imp {
     }
 
     unsafe fn on_row_activate(hwnd: HWND) {
-        let (busy, installed, page) = STATE
+        let (busy, installed, page, login_offered) = STATE
             .lock()
             .ok()
-            .and_then(|g| g.as_ref().map(|s| (s.installing, s.installed, s.page)))
-            .unwrap_or((true, true, 1));
+            .and_then(|g| {
+                g.as_ref().map(|s| {
+                    (
+                        s.installing,
+                        s.installed,
+                        s.page,
+                        s.options.offers_start_at_login(),
+                    )
+                })
+            })
+            .unwrap_or((true, true, 1, false));
         if busy || installed || page != 1 {
             return;
         }
@@ -1293,16 +1809,50 @@ mod imp {
         if selected < 0 {
             return;
         }
+        // The location row is special while its folder is unwritable:
+        // its Change action is the one-click switch to the per-user
+        // folder, applied in place (no trip to the Options page).
+        if selected == 0 {
+            let swap = STATE.lock().ok().and_then(|mut g| {
+                g.as_mut().and_then(|s| {
+                    if s.location_ok {
+                        None
+                    } else {
+                        let fallback = crate::install::per_user_fallback_dir(
+                            &s.manifest.app_name(),
+                            &s.options.install_location(),
+                        );
+                        s.install_dir = fallback.clone();
+                        Some(fallback)
+                    }
+                })
+            });
+            if let Some(fallback) = swap {
+                fill_list(list);
+                refresh_location_state(hwnd);
+                set_text(
+                    hwnd,
+                    ID_LBL_STATUS,
+                    &format!(
+                        "Install location switched to the per-user folder: {}",
+                        fallback.display()
+                    ),
+                );
+                return;
+            }
+        }
         // Rows with a real Change action route to the Options page:
         // 0 location, 2 Start Menu folder, 3 desktop shortcut,
-        // 4 associations, 5 PATH. Components (1) and Disk space (6)
-        // are informational.
+        // 4 associations, 5 PATH, and 6 Start at login when the
+        // package offers it. Components (1) is informational.
+        let login_row: Option<isize> = if login_offered { Some(6) } else { None };
         match selected {
             0 | 2 | 3 | 4 | 5 => show_page(hwnd, 2),
+            sel if Some(sel) == login_row => show_page(hwnd, 2),
             _ => set_text(
                 hwnd,
                 ID_LBL_STATUS,
-                "That row is informational — the package decides its components, and the disk row reports free space.",
+                "That row is informational — the package decides its components.",
             ),
         }
     }
@@ -1316,7 +1866,30 @@ mod imp {
             Err(_) => return,
         };
         if page == 4 || installed {
-            // The footer button reads "Close" on the Finish page.
+            // The footer button reads "Close" on the Finish page. The
+            // launch checkbox is the user's last choice on that page:
+            // honor it on the way out. A launch failure is a warning
+            // shown in place — the install itself already succeeded,
+            // so it never turns into an install failure.
+            if page == 4 && get_check(hwnd, ID_CHK_LAUNCH) {
+                let target = STATE
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().and_then(|s| s.launch_path.clone()));
+                if let Some(path) = target {
+                    if let Err(e) = crate::install::launch_program(&path) {
+                        set_text(
+                            hwnd,
+                            ID_LBL_FINISH,
+                            &format!(
+                                "Installed, but the program could not be started.\r\n\r\n{e}\r\n\r\nYou can start it from the install folder instead."
+                            ),
+                        );
+                        set_check(hwnd, ID_CHK_LAUNCH, false);
+                        return;
+                    }
+                }
+            }
             DestroyWindow(hwnd);
             return;
         }
@@ -1326,6 +1899,28 @@ mod imp {
         if page == 2 {
             // Leaving Options for the install: take the edited values.
             harvest_options(hwnd);
+        }
+        // Backstop: never start into an unwritable location. The
+        // Install button is disabled in that state, but if any path
+        // reaches here anyway (permissions changed after the last
+        // refresh), land back on the Review page, which explains the
+        // problem and offers the per-user folder.
+        let snapshot = STATE.lock().ok().and_then(|g| {
+            g.as_ref().map(|s| {
+                (
+                    s.install_dir.clone(),
+                    s.manifest.app_name(),
+                    s.options.install_location(),
+                )
+            })
+        });
+        if let Some((dir, app_name, recorded)) = snapshot {
+            if let crate::install::LocationVerdict::NotWritable { .. } =
+                crate::install::location_verdict(&dir, &app_name, &recorded)
+            {
+                show_page(hwnd, 1);
+                return;
+            }
         }
         start_install(hwnd);
     }
@@ -1368,6 +1963,7 @@ mod imp {
                 options_override: Some(options),
                 force: false,
                 repair: false,
+                start_at_login: None,
             };
             let progress_slot = progress.clone();
             let mut on_progress = move |ev: &ProgressEvent| {
@@ -1394,6 +1990,295 @@ mod imp {
                 PostMessageW(hwnd_value as HWND, WM_APP_DONE, 0, 0);
             }
         });
+    }
+
+    // ---- Uninstall confirmation window --------------------------------
+    //
+    // A small standalone window in the wizard's palette and language
+    // (its own class and state — the wizard's STATE belongs to
+    // installs). See [`super::confirm_uninstall`] for the contract.
+
+    struct ConfirmState {
+        app_name: String,
+        data_dirs: Vec<String>,
+        /// None until the user confirms; Cancel/close leaves it None.
+        result: Option<bool>,
+    }
+
+    static CONFIRM_STATE: Mutex<Option<ConfirmState>> = Mutex::new(None);
+
+    pub fn confirm_uninstall(app_name: &str, data_dirs: &[PathBuf]) -> Option<bool> {
+        if let Ok(mut g) = CONFIRM_STATE.lock() {
+            *g = Some(ConfirmState {
+                app_name: app_name.to_string(),
+                data_dirs: data_dirs
+                    .iter()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .collect(),
+                result: None,
+            });
+        }
+        unsafe {
+            // The palette statics are normally created by the wizard's
+            // run(); an uninstall confirmation runs in a process where
+            // the wizard never opened, so create them on demand.
+            if BG_BRUSH.is_null() {
+                BG_BRUSH = CreateSolidBrush(COLOR_BG);
+            }
+            if HEADER_FONT.is_null() {
+                HEADER_FONT = CreateFontW(
+                    -20,
+                    0,
+                    0,
+                    0,
+                    FW_SEMIBOLD as i32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    WIDE_SANS.as_ptr(),
+                );
+            }
+            let instance =
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+            let class_name: Vec<u16> = "SeanPakUninstallWindowClass\0".encode_utf16().collect();
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(confirm_wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: instance,
+                hIcon: LoadIconW(std::ptr::null_mut(), IDI_APPLICATION),
+                hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+                hbrBackground: BG_BRUSH,
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+                hIconSm: std::ptr::null_mut(),
+            };
+            if RegisterClassExW(&wc) == 0 {
+                let err = GetLastError();
+                if err != 1410 {
+                    // 1410 = class already registered: not fatal.
+                    crate::diag::log(
+                        "wizard",
+                        &format!("uninstall confirm RegisterClassExW failed: error {err}"),
+                    );
+                    return None;
+                }
+            }
+            let title: Vec<u16> = format!("Uninstall {app_name}\0").encode_utf16().collect();
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                640,
+                400,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            );
+            if hwnd.is_null() {
+                crate::diag::log("wizard", "uninstall confirm window creation failed");
+                return None;
+            }
+            create_confirm_controls(hwnd, instance);
+            ShowWindow(hwnd, SW_SHOWDEFAULT);
+            UpdateWindow(hwnd);
+            let mut msg: MSG = std::mem::zeroed();
+            loop {
+                let result = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                if result <= 0 {
+                    break;
+                }
+                if IsDialogMessageW(hwnd, &msg) == 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+        CONFIRM_STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s.result))
+    }
+
+    unsafe fn create_confirm_controls(parent: HWND, instance: HINSTANCE) {
+        let static_class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let button_class: Vec<u16> = "BUTTON\0".encode_utf16().collect();
+        let (app_name, data_dirs) = CONFIRM_STATE
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|s| (s.app_name.clone(), s.data_dirs.clone()))
+            })
+            .unwrap_or_else(|| ("App".to_string(), Vec::new()));
+        let mk =
+            |class: &[u16], text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: usize| {
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                unsafe {
+                    CreateWindowExW(
+                        0,
+                        class.as_ptr(),
+                        wide.as_ptr(),
+                        WS_CHILD | WS_VISIBLE | style,
+                        x,
+                        y,
+                        w,
+                        h,
+                        parent,
+                        id as HMENU,
+                        instance,
+                        std::ptr::null_mut(),
+                    )
+                }
+            };
+        let title = mk(
+            &static_class,
+            &format!("Uninstall {app_name}"),
+            0,
+            16,
+            14,
+            590,
+            26,
+            ID_LBL_CONFIRM_TITLE,
+        );
+        SendMessageW(title, WM_SETFONT, HEADER_FONT as WPARAM, 1);
+        mk(&static_class, "", SS_ETCHEDHORZ, 0, 48, 624, 2, 0);
+        let body = if data_dirs.is_empty() {
+            format!(
+                "This removes {app_name}'s program files and the entries its install created (shortcuts, file associations, PATH and login entries)."
+            )
+        } else {
+            format!(
+                "This removes {app_name}'s program files and the entries its install created (shortcuts, file associations, PATH and login entries). Its data files are kept unless you tick the box below."
+            )
+        };
+        mk(
+            &static_class,
+            &body,
+            0,
+            16,
+            60,
+            590,
+            44,
+            ID_LBL_CONFIRM_BODY,
+        );
+        if !data_dirs.is_empty() {
+            mk(
+                &button_class,
+                &format!("Also delete {app_name}'s data files"),
+                WS_TABSTOP | BS_AUTOCHECKBOX,
+                16,
+                116,
+                590,
+                24,
+                ID_CHK_PURGE,
+            );
+            mk(
+                &static_class,
+                &data_dirs.join("\r\n"),
+                0,
+                32,
+                144,
+                560,
+                80,
+                ID_LBL_CONFIRM_DIRS,
+            );
+            mk(
+                &static_class,
+                "Deleted data cannot be recovered. If you might reinstall later, leave the box unticked — a reinstall finds the data again.",
+                0,
+                16,
+                232,
+                590,
+                40,
+                ID_LBL_CONFIRM_WARN,
+            );
+        }
+        mk(
+            &button_class,
+            "Cancel",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            470,
+            310,
+            120,
+            30,
+            ID_BTN_CONFIRM_CANCEL,
+        );
+        mk(
+            &button_class,
+            "Uninstall",
+            WS_TABSTOP | (BS_DEFPUSHBUTTON as u32),
+            338,
+            310,
+            120,
+            30,
+            ID_BTN_CONFIRM,
+        );
+    }
+
+    unsafe extern "system" fn confirm_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_CTLCOLORSTATIC => {
+                let hdc = wparam as HDC;
+                let ctrl = lparam as HWND;
+                let id = GetWindowLongW(ctrl, GWL_ID) as usize;
+                SetBkMode(hdc, TRANSPARENT as i32);
+                if id == ID_LBL_CONFIRM_WARN || id == ID_LBL_CONFIRM_BODY {
+                    SetTextColor(hdc, COLOR_BLUE);
+                } else if id == ID_LBL_CONFIRM_DIRS {
+                    SetTextColor(hdc, COLOR_MUTED);
+                } else {
+                    SetTextColor(hdc, COLOR_FG);
+                }
+                BG_BRUSH as LRESULT
+            }
+            WM_COMMAND => {
+                match wparam & 0xFFFF {
+                    ID_BTN_CONFIRM => {
+                        let purge = get_check(hwnd, ID_CHK_PURGE);
+                        if let Ok(mut g) = CONFIRM_STATE.lock() {
+                            if let Some(s) = g.as_mut() {
+                                s.result = Some(purge);
+                            }
+                        }
+                        DestroyWindow(hwnd);
+                    }
+                    ID_BTN_CONFIRM_CANCEL => {
+                        DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+                0
+            }
+            WM_KEYDOWN => {
+                if wparam == VK_ESCAPE_KEY {
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
     }
 }
 
@@ -1441,32 +2326,64 @@ mod tests {
         options.desktop_shortcut = 0;
         options.path_entry = 1;
         set_fixed(&mut options.file_associations_utf8, ".txt");
-        let rows = review_rows(
-            &manifest,
-            &options,
-            &records,
-            "C:\\Apps\\Test App",
-            Some(212_000_000_000),
-        );
-        assert_eq!(rows.len(), 7);
+        let rows = review_rows(&manifest, &options, &records, "C:\\Apps\\Test App", true);
+        // Six rows: disk space lives in the rail, not the table.
+        assert_eq!(rows.len(), 6);
         assert_eq!(rows[0][0], "Install location");
         assert_eq!(rows[0][1], "C:\\Apps\\Test App");
+        assert_eq!(rows[0][2], "Browse…");
         assert_eq!(rows[1][1], "app.exe + 1 more files");
         assert_eq!(rows[2][1], "Test App");
         assert_eq!(rows[3][1], "No");
         assert_eq!(rows[4][1], ".txt");
         assert_eq!(rows[5][1], "Yes");
-        assert!(rows[6][1].contains("free"));
     }
 
     #[test]
-    fn review_rows_without_free_space_or_files() {
+    fn review_rows_without_files() {
         let (manifest, records) = manifest_with(&[], 0);
         let options = InstallOptions::defaults_for("Empty");
-        let rows = review_rows(&manifest, &options, &records, "D:\\Empty", None);
+        let rows = review_rows(&manifest, &options, &records, "D:\\Empty", true);
         assert_eq!(rows[1][1], "No files");
-        assert!(rows[6][1].contains("required"));
         assert_eq!(rows[4][1], "None");
+    }
+
+    #[test]
+    fn review_rows_include_start_at_login_only_when_offered() {
+        let (manifest, records) = manifest_with(&["app.exe"], 100);
+        let mut options = InstallOptions::defaults_for("Test App");
+        options.start_at_login = 1;
+        options.start_at_login_default = 1;
+        let rows = review_rows(&manifest, &options, &records, "C:\\Apps\\Test App", true);
+        assert_eq!(rows.len(), 7);
+        assert_eq!(rows[6][0], "Start at login");
+        assert_eq!(rows[6][1], "Yes");
+        assert_eq!(rows[6][2], "Toggle");
+        // Offered but off reads "No".
+        options.start_at_login_default = 0;
+        let rows = review_rows(&manifest, &options, &records, "C:\\Apps\\Test App", true);
+        assert_eq!(rows[6][1], "No");
+    }
+
+    #[test]
+    fn review_rows_flag_an_unwritable_location() {
+        let (manifest, records) = manifest_with(&["app.exe"], 100);
+        let options = InstallOptions::defaults_for("Test App");
+        let rows = review_rows(
+            &manifest,
+            &options,
+            &records,
+            "C:\\Program Files\\Test App",
+            false,
+        );
+        assert_eq!(
+            rows[0][1],
+            "C:\\Program Files\\Test App — needs administrator access"
+        );
+        assert_eq!(rows[0][2], "Use per-user folder");
+        // Every other row is untouched by the verdict.
+        assert_eq!(rows[1][1], "app.exe");
+        assert_eq!(rows[5][0], "PATH entry");
     }
 
     #[test]

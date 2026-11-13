@@ -12,7 +12,7 @@
 //! The JSON parser is hand-rolled: SeanPak's dependency rule is
 //! windows-sys only, so serde is not an option.
 
-use crate::overlay::{copy_str_to_fixed_pub, InstallOptions};
+use crate::overlay::{copy_str_to_fixed_pub, InstallOptions, DATA_DIRS_CAPACITY};
 
 /// The JSON Schema (draft 2020-12) for the app manifest. This exact text
 /// is what `seanpak schema` prints.
@@ -71,6 +71,28 @@ pub const MANIFEST_SCHEMA_JSON: &str = r##"{
       "type": "boolean",
       "default": false,
       "description": "Install option: add the install folder to the per-user PATH at install time (appended only if absent; uninstall removes exactly that segment)."
+    },
+    "launchAfterInstall": {
+      "anyOf": [
+        { "type": "boolean" },
+        { "type": "object", "properties": { "offered": { "type": "boolean" }, "defaultChecked": { "type": "boolean" } }, "additionalProperties": false }
+      ],
+      "default": { "offered": true, "defaultChecked": true },
+      "description": "Whether the installer's Finish page offers a \"Launch <appName>\" checkbox, and whether that checkbox starts checked. A plain boolean is shorthand: true = offered and checked, false = not offered. Only shown when the package has a primary executable."
+    },
+    "startAtLogin": {
+      "anyOf": [
+        { "type": "boolean" },
+        { "type": "object", "properties": { "offered": { "type": "boolean" }, "defaultChecked": { "type": "boolean" } }, "additionalProperties": false }
+      ],
+      "default": { "offered": false, "defaultChecked": false },
+      "description": "Whether the installer offers \"Start <appName> at login\": a per-user HKCU Run entry pointing at the primary executable, journaled like the other artifacts and removed by uninstall (only while it still points at this app). A plain boolean is shorthand: true = offered and on, false = not offered."
+    },
+    "dataDirs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "The app's data folders, recorded (resolved to absolute paths) in the install receipt. The interactive uninstall offers a checkbox to delete them; a silent uninstall never deletes them without an explicit --purge-data. Each entry starts with %APPDATA%, %LOCALAPPDATA%, %USERPROFILE% or %INSTALLDIR%, or is a path relative to the install folder; each must name a folder below its root and must not contain '..' or ';'."
     },
     "files": {
       "type": "array",
@@ -434,6 +456,9 @@ const KNOWN_KEYS: &[&str] = &[
     "startMenuShortcut",
     "fileAssociations",
     "pathEntry",
+    "launchAfterInstall",
+    "startAtLogin",
+    "dataDirs",
     "files",
 ];
 
@@ -449,6 +474,16 @@ pub struct AppManifest {
     pub start_menu_shortcut: bool,
     pub file_associations: Vec<String>,
     pub path_entry: bool,
+    /// The Finish page offers "Launch <appName>"…
+    pub launch_after_install_offered: bool,
+    /// …and the checkbox starts checked.
+    pub launch_after_install_default: bool,
+    /// The installer offers "Start <appName> at login"…
+    pub start_at_login_offered: bool,
+    /// …and the option starts on.
+    pub start_at_login_default: bool,
+    /// The app's data folders (token paths), recorded into the receipt.
+    pub data_dirs: Vec<String>,
     pub files: Vec<String>,
 }
 
@@ -622,6 +657,37 @@ impl AppManifest {
             }
         }
 
+        let (launch_after_install_offered, launch_after_install_default) =
+            parse_offer_spec(&root, "launchAfterInstall", true, true, &mut errors);
+        let (start_at_login_offered, start_at_login_default) =
+            parse_offer_spec(&root, "startAtLogin", false, false, &mut errors);
+
+        let mut data_dirs: Vec<String> = Vec::new();
+        if let Some(v) = root.get("dataDirs") {
+            match v {
+                JsonValue::Array(items) => {
+                    for item in items {
+                        match item.as_str() {
+                            Some(entry) => match validate_data_dir(entry) {
+                                Ok(()) => data_dirs.push(entry.trim().to_string()),
+                                Err(problem) => errors.push(problem),
+                            },
+                            None => errors.push("\"dataDirs\" entries must be strings".to_string()),
+                        }
+                    }
+                }
+                _ => errors.push("\"dataDirs\" must be an array of strings".to_string()),
+            }
+        }
+        let joined_dirs = data_dirs.join(";");
+        if joined_dirs.len() >= DATA_DIRS_CAPACITY {
+            errors.push(format!(
+                "\"dataDirs\" entries total {} characters; the limit is {}",
+                joined_dirs.len(),
+                DATA_DIRS_CAPACITY - 1
+            ));
+        }
+
         let desktop_shortcut = get_bool("desktopShortcut", true, &mut errors);
         let start_menu_shortcut = get_bool("startMenuShortcut", true, &mut errors);
         let path_entry = get_bool("pathEntry", false, &mut errors);
@@ -640,6 +706,11 @@ impl AppManifest {
             start_menu_shortcut,
             file_associations: associations,
             path_entry,
+            launch_after_install_offered,
+            launch_after_install_default,
+            start_at_login_offered,
+            start_at_login_default,
+            data_dirs,
             files,
         })
     }
@@ -691,6 +762,13 @@ impl AppManifest {
         options.desktop_shortcut = if self.desktop_shortcut { 1 } else { 0 };
         options.start_menu_shortcut = if self.start_menu_shortcut { 1 } else { 0 };
         options.path_entry = if self.path_entry { 1 } else { 0 };
+        options.launch_after_install = self.launch_after_install_offered as u8;
+        options.launch_after_install_default = self.launch_after_install_default as u8;
+        options.start_at_login = self.start_at_login_offered as u8;
+        options.start_at_login_default = self.start_at_login_default as u8;
+        if !self.data_dirs.is_empty() {
+            copy_str_to_fixed_pub(&mut options.data_dirs_utf8, &self.data_dirs.join(";"));
+        }
         options
     }
 
@@ -726,6 +804,21 @@ impl AppManifest {
             ),
         ));
         pairs.push(("pathEntry", JsonValue::Bool(self.path_entry)));
+        pairs.push((
+            "launchAfterInstall",
+            offer_json_value(
+                self.launch_after_install_offered,
+                self.launch_after_install_default,
+            ),
+        ));
+        pairs.push((
+            "startAtLogin",
+            offer_json_value(self.start_at_login_offered, self.start_at_login_default),
+        ));
+        pairs.push((
+            "dataDirs",
+            JsonValue::Array(self.data_dirs.iter().map(|d| jstr(d.clone())).collect()),
+        ));
         if !self.files.is_empty() {
             pairs.push((
                 "files",
@@ -734,6 +827,114 @@ impl AppManifest {
         }
         jobj(pairs)
     }
+}
+
+/// Parses an "offer" field (`launchAfterInstall`, `startAtLogin`): a
+/// plain boolean (true = offered with the default on, false = not
+/// offered) or an object `{"offered": bool, "defaultChecked": bool}`
+/// with either key omittable. Returns (offered, default_checked).
+fn parse_offer_spec(
+    root: &JsonValue,
+    key: &str,
+    default_offered: bool,
+    default_checked: bool,
+    errors: &mut Vec<String>,
+) -> (bool, bool) {
+    match root.get(key) {
+        None => (default_offered, default_checked),
+        Some(JsonValue::Bool(b)) => (*b, *b),
+        Some(obj @ JsonValue::Object(_)) => {
+            let mut field = |name: &str, fallback: bool| -> bool {
+                match obj.get(name) {
+                    None => fallback,
+                    Some(v) => match v.as_bool() {
+                        Some(b) => b,
+                        None => {
+                            errors.push(format!("\"{key}.{name}\" must be true or false"));
+                            fallback
+                        }
+                    },
+                }
+            };
+            (
+                field("offered", default_offered),
+                field("defaultChecked", default_checked),
+            )
+        }
+        Some(_) => {
+            errors.push(format!(
+                "\"{key}\" must be true, false, or an object with \"offered\" and \"defaultChecked\""
+            ));
+            (default_offered, default_checked)
+        }
+    }
+}
+
+/// The JSON form of an offer field — always the object form, so a
+/// rendered manifest re-parses to the same value.
+fn offer_json_value(offered: bool, default_checked: bool) -> JsonValue {
+    jobj(vec![
+        ("offered", JsonValue::Bool(offered)),
+        ("defaultChecked", JsonValue::Bool(default_checked)),
+    ])
+}
+
+/// Validates one `dataDirs` entry. Entries are token paths: one of the
+/// `%APPDATA%` / `%LOCALAPPDATA%` / `%USERPROFILE%` / `%INSTALLDIR%`
+/// roots followed by at least one folder below it, an absolute Windows
+/// path at least two folders below its root, or a path relative to the
+/// install folder. `..` and `;` are rejected everywhere: these folders
+/// are what an uninstall may delete, so a manifest must never be able
+/// to name a root itself (or something outside its root via `..`).
+fn validate_data_dir(entry: &str) -> Result<(), String> {
+    let e = entry.trim();
+    if e.is_empty() {
+        return Err("\"dataDirs\" entries must not be empty".to_string());
+    }
+    if e.contains(';') {
+        return Err(format!("dataDirs entry \"{entry}\" must not contain ';'"));
+    }
+    const TOKENS: [&str; 4] = [
+        "%APPDATA%",
+        "%LOCALAPPDATA%",
+        "%USERPROFILE%",
+        "%INSTALLDIR%",
+    ];
+    let upper = e.to_uppercase();
+    for token in TOKENS {
+        if upper.starts_with(token) {
+            let rest = e[token.len()..].trim_start_matches(['\\', '/']);
+            if rest.is_empty() {
+                return Err(format!(
+                    "dataDirs entry \"{entry}\" must name a folder below {token}, not {token} itself"
+                ));
+            }
+            if rest.split(['\\', '/']).any(|part| part == "..") {
+                return Err(format!("dataDirs entry \"{entry}\" must not contain '..'"));
+            }
+            return Ok(());
+        }
+    }
+    if e.split(['\\', '/']).any(|part| part == "..") {
+        return Err(format!("dataDirs entry \"{entry}\" must not contain '..'"));
+    }
+    let drive_absolute = e.chars().nth(1) == Some(':');
+    let rooted = drive_absolute || e.starts_with(['\\', '/']);
+    if rooted {
+        let parts: Vec<&str> = e.split(['\\', '/']).filter(|p| !p.is_empty()).collect();
+        // For a drive path the first part is the drive ("C:") itself.
+        let below_root = if drive_absolute {
+            parts.len().saturating_sub(1)
+        } else {
+            parts.len()
+        };
+        if below_root < 2 {
+            return Err(format!(
+                "dataDirs entry \"{entry}\" is too broad: name a folder at least two levels below the root"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_extension(raw: &str) -> Option<String> {
@@ -791,6 +992,76 @@ mod tests {
         );
         let options = m.to_install_options();
         assert_eq!(options.file_associations(), ".txt,.md");
+    }
+
+    #[test]
+    fn offer_fields_and_data_dirs_parse_and_carry_through() {
+        // Defaults: launch offered + checked, login not offered, no data.
+        let m = AppManifest::from_json(r#"{"appName":"X","version":"1.0"}"#).unwrap();
+        assert!(m.launch_after_install_offered);
+        assert!(m.launch_after_install_default);
+        assert!(!m.start_at_login_offered);
+        assert!(!m.start_at_login_default);
+        assert!(m.data_dirs.is_empty());
+        let options = m.to_install_options();
+        assert!(options.offers_launch_after_install());
+        assert!(options.launch_after_install_default_checked());
+        assert!(!options.offers_start_at_login());
+
+        // Object + boolean forms, and data dirs landing in the options.
+        let m = AppManifest::from_json(
+            r#"{"appName":"X","version":"1.0",
+                "launchAfterInstall":{"offered":true,"defaultChecked":false},
+                "startAtLogin":true,
+                "dataDirs":["%APPDATA%\\X","%INSTALLDIR%\\data","cache"]}"#,
+        )
+        .unwrap();
+        assert!(m.launch_after_install_offered);
+        assert!(!m.launch_after_install_default);
+        assert!(m.start_at_login_offered);
+        assert!(m.start_at_login_default);
+        let options = m.to_install_options();
+        assert!(options.offers_launch_after_install());
+        assert!(!options.launch_after_install_default_checked());
+        assert!(options.start_at_login_chosen());
+        assert_eq!(
+            options.data_dirs(),
+            vec![
+                "%APPDATA%\\X".to_string(),
+                "%INSTALLDIR%\\data".to_string(),
+                "cache".to_string()
+            ]
+        );
+
+        // The rendered manifest re-parses to the same new fields.
+        let rendered = m.to_json_value().render();
+        let m2 = AppManifest::from_json(&rendered).unwrap();
+        assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn data_dirs_validation_rejects_roots_and_escapes() {
+        for bad in [
+            r#"{"appName":"X","version":"1.0","dataDirs":["%APPDATA%"]}"#,
+            r#"{"appName":"X","version":"1.0","dataDirs":["%APPDATA%\\..\\evil"]}"#,
+            r#"{"appName":"X","version":"1.0","dataDirs":["a;b"]}"#,
+            r#"{"appName":"X","version":"1.0","dataDirs":["C:\\OnlyOne"]}"#,
+            r#"{"appName":"X","version":"1.0","dataDirs":["..\\up"]}"#,
+            r#"{"appName":"X","version":"1.0","dataDirs":[""]}"#,
+        ] {
+            let errors = AppManifest::from_json(bad).unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.contains("dataDirs")),
+                "{bad} -> {errors:?}"
+            );
+        }
+        let errors =
+            AppManifest::from_json(r#"{"appName":"X","version":"1.0","startAtLogin":"yes"}"#)
+                .unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("startAtLogin")),
+            "{errors:?}"
+        );
     }
 
     #[test]

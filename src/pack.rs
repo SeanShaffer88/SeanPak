@@ -418,7 +418,7 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
         sane = false;
         sane_notes.push("primary exe index is out of range".to_string());
     }
-    if !(2..=4).contains(&manifest.version) {
+    if !(2..=5).contains(&manifest.version) {
         sane = false;
         sane_notes.push(format!("unsupported manifest version {}", manifest.version));
     }
