@@ -172,6 +172,35 @@ pub fn parse_data_dirs(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The manifest panel's text form of the v6 power blocks: the whole
+/// power object (components, hooks, registryWrites, envWrites,
+/// shortcuts) as one pretty-printed JSON document — the same
+/// encoding the manifest file and the package's v6 block use, so
+/// what the pane shows is byte-for-byte what a hand-edited manifest
+/// would carry. One editor for all five blocks is deliberate: the
+/// blocks are heterogeneous (nested objects, enums, lists of files),
+/// and five structured mini-editors would not fit the pane; the JSON
+/// is the project's one hand-rolled model, validated by the same
+/// parser the CLI's manifest reader uses.
+pub fn power_blocks_text(power: &crate::overlay::PowerSpec) -> String {
+    render_pretty(&power.to_json_value())
+}
+
+/// Parses the pane's power-blocks text back into a [`PowerSpec`].
+/// Empty text means "no power blocks". Anything else must be valid
+/// JSON carrying only the five known blocks — the same strictness
+/// the manifest reader applies (unknown keys and bad shapes are
+/// errors naming the field).
+pub fn parse_power_blocks(text: &str) -> Result<crate::overlay::PowerSpec, Vec<String>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(crate::overlay::PowerSpec::default());
+    }
+    let value = crate::manifest::parse_json(trimmed)
+        .map_err(|e| vec![format!("power blocks are not valid JSON: {e}")])?;
+    crate::manifest::power_spec_from_json(&value)
+}
+
 /// Pretty-prints a manifest JSON value (2-space indent) so a saved
 /// manifest stays pleasant for a human or an AI to read and edit.
 pub fn render_pretty(value: &JsonValue) -> String {
@@ -660,6 +689,39 @@ mod tests {
     }
 
     #[test]
+    fn power_blocks_text_round_trips() {
+        let manifest = AppManifest::from_json(
+            r#"{
+                "appName": "Power App",
+                "version": "1.0.0",
+                "components": [
+                    {"id": "extras", "name": "Extras", "files": ["extras.dll"], "defaultSelected": true}
+                ],
+                "hooks": {"postInstall": [{"command": "app.exe", "args": ["--setup"], "onFailure": "continue"}]},
+                "registryWrites": [
+                    {"key": "Software\\Power App", "name": "Mode", "type": "sz", "value": "on"}
+                ],
+                "envWrites": [{"name": "POWER_APP_HOME", "value": "%INSTALLDIR%"}],
+                "shortcuts": [
+                    {"name": "Power App", "target": "app.exe", "location": "desktop", "pin": true}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let power = manifest.to_power_spec();
+        let text = power_blocks_text(&power);
+        let parsed = parse_power_blocks(&text).unwrap();
+        assert_eq!(parsed, power);
+        // Empty text is the empty spec; unknown blocks are errors.
+        assert_eq!(
+            parse_power_blocks("  ").unwrap(),
+            crate::overlay::PowerSpec::default()
+        );
+        assert!(parse_power_blocks(r#"{"componentz": []}"#).is_err());
+        assert!(parse_power_blocks("{not json").is_err());
+    }
+
+    #[test]
     fn data_dirs_text_round_trips() {
         let dirs = vec![
             "%APPDATA%/My App".to_string(),
@@ -767,7 +829,8 @@ mod imp {
 
     use super::{
         build_rows, copy_file_into, copy_folder_into, data_dirs_text, parse_data_dirs,
-        scan_package, tree_entries, FileRow, ScanOutcome, StudioDocument, StudioSettings,
+        parse_power_blocks, power_blocks_text, scan_package, tree_entries, FileRow, ScanOutcome,
+        StudioDocument, StudioSettings,
     };
     use crate::manifest::{jstr, AppManifest, JsonValue, MANIFEST_SCHEMA_JSON};
     use crate::pack::{PackError, PackOutcome};
@@ -832,6 +895,8 @@ mod imp {
     const ID_LBL_LAUNCH: usize = 196;
     const ID_LBL_LOGIN: usize = 197;
     const ID_LBL_DATADIRS: usize = 198;
+    const ID_EDT_POWER: usize = 199;
+    const ID_LBL_POWER: usize = 200;
     // Field labels inside the manifest panel (colored as one group).
     const PANEL_LABELS: [usize; 9] = [170, 171, 172, 173, 174, 175, 176, 177, 178];
 
@@ -939,6 +1004,10 @@ mod imp {
         /// The file the totals line describes (selected in either the
         /// center table or the left listing).
         selected_rel: Option<String>,
+        /// The power-blocks parse error last reported to the output
+        /// strip, so a harvest that runs on every operation does not
+        /// repeat the same complaint; cleared when the text parses.
+        power_error_reported: Option<String>,
     }
 
     static STATE: Mutex<Option<StudioState>> = Mutex::new(None);
@@ -1013,6 +1082,7 @@ mod imp {
                 tip_texts: Vec::new(),
                 tree_rels: Vec::new(),
                 selected_rel: None,
+                power_error_reported: None,
             });
         }
 
@@ -1538,6 +1608,15 @@ mod imp {
             WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
             ID_EDT_DATA_DIRS,
         );
+        // The v6 power blocks as one JSON editor (see
+        // power_blocks_text for why one editor, not five grids).
+        mk(&static_class, "Power blocks", 0, ID_LBL_POWER);
+        mk(
+            &edit_class,
+            "",
+            WS_TABSTOP | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
+            ID_EDT_POWER,
+        );
         mk(&static_class, "PACKAGE", 0, ID_LBL_PACKAGE_HDR);
         mk(&static_class, "Files folder", 0, PANEL_LABELS[7]);
         mk(
@@ -1613,7 +1692,7 @@ mod imp {
     }
 
     unsafe fn create_tooltips(parent: HWND, instance: HINSTANCE) {
-        let tips: [(usize, &str); 12] = [
+        let tips: [(usize, &str); 13] = [
             (ID_LIST, "Files that will be packed. Ctrl+K jumps here; type to find a file."),
             (ID_TREE, "Everything in the files folder, folders included. Selecting a file selects it in the table too."),
             (ID_BTN_TB_OPEN, "Open a manifest.json — the same file `seanpak pack` reads"),
@@ -1622,6 +1701,7 @@ mod imp {
             (ID_BTN_REMOVE, "Remove the selected files from the package list — the files stay in the folder"),
             (ID_EDT_ASSOC, "Comma-separated extensions to associate with the app (.txt, .md)"),
             (ID_EDT_DATA_DIRS, "The app's data folders, semicolon-separated token paths (%APPDATA%/My App). Uninstall asks before deleting them; the box starts unticked"),
+            (ID_EDT_POWER, "The package's power blocks as one JSON object: components, hooks, registryWrites, envWrites, shortcuts — the same shape as the manifest file. Invalid JSON is reported in the output strip and the previous value is kept"),
             (ID_BTN_VALIDATE, "Check the manifest with the same rules `seanpak validate` uses"),
             (ID_BTN_VERIFY, "Prove the built Setup.exe (overlay, manifest, payloads)"),
             (ID_CHK_SANDBOX, "Verify by test-installing into a temp folder and checking for residue"),
@@ -1719,6 +1799,8 @@ mod imp {
             ID_LBL_LOGIN,
             ID_LBL_DATADIRS,
             ID_EDT_DATA_DIRS,
+            ID_LBL_POWER,
+            ID_EDT_POWER,
             ID_EDT_FILES_DIR,
             ID_BTN_FILES_DIR,
             ID_EDT_OUT_DIR,
@@ -1921,6 +2003,9 @@ mod imp {
         mv(hwnd, ID_LBL_DATADIRS, px, row_y + s(2), label_w, s(20));
         mv(hwnd, ID_EDT_DATA_DIRS, edit_x, row_y, edit_w, s(25));
         row_y += s(31);
+        mv(hwnd, ID_LBL_POWER, px, row_y + s(2), label_w, s(20));
+        mv(hwnd, ID_EDT_POWER, edit_x, row_y, edit_w, s(84));
+        row_y += s(90);
         mv(hwnd, ID_LBL_PACKAGE_HDR, px, row_y, panel_w, s(20));
         row_y += s(23);
         // Files folder row (+ browse button).
@@ -2175,6 +2260,13 @@ mod imp {
         set_check(hwnd, ID_CHK_LOGIN_OFFER, m.start_at_login_offered);
         set_check(hwnd, ID_CHK_LOGIN_DEFAULT, m.start_at_login_default);
         set_text(hwnd, ID_EDT_DATA_DIRS, &data_dirs_text(&m.data_dirs));
+        // The power editor shows the blocks as pretty JSON; a
+        // multiline edit control wants CRLF line breaks.
+        set_text(
+            hwnd,
+            ID_EDT_POWER,
+            &power_blocks_text(&m.to_power_spec()).replace('\n', "\r\n"),
+        );
         set_text(
             hwnd,
             ID_EDT_FILES_DIR,
@@ -2215,8 +2307,39 @@ mod imp {
         let login_offer = get_check(hwnd, ID_CHK_LOGIN_OFFER);
         let login_default = get_check(hwnd, ID_CHK_LOGIN_DEFAULT);
         let data_dirs_raw = get_text(hwnd, ID_EDT_DATA_DIRS);
+        let power_raw = get_text(hwnd, ID_EDT_POWER);
         let files_dir = get_text(hwnd, ID_EDT_FILES_DIR);
         let out_dir = get_text(hwnd, ID_EDT_OUT_DIR);
+        // The power blocks: parse first. On success the five typed
+        // fields are replaced wholesale (the pane edits the same
+        // model the manifest file carries). On failure the document
+        // keeps its previous blocks and the error is reported to the
+        // output strip once per distinct error — harvest runs before
+        // every operation, so a standing typo must not spam it.
+        let power_result = parse_power_blocks(&power_raw);
+        match &power_result {
+            Ok(_) => {
+                with_state(|s| s.power_error_reported = None);
+            }
+            Err(errors) => {
+                let message = format!(
+                    "Power blocks not applied (previous value kept): {}",
+                    errors.join("; ")
+                );
+                let fresh = with_state(|s| {
+                    if s.power_error_reported.as_deref() == Some(message.as_str()) {
+                        false
+                    } else {
+                        s.power_error_reported = Some(message.clone());
+                        true
+                    }
+                })
+                .unwrap_or(false);
+                if fresh {
+                    append_output(hwnd, &message);
+                }
+            }
+        }
         with_state(|s| {
             let m = &mut s.doc.manifest;
             m.app_name = name.trim().to_string();
@@ -2246,6 +2369,14 @@ mod imp {
             m.start_at_login_offered = login_offer;
             m.start_at_login_default = login_default;
             m.data_dirs = parse_data_dirs(&data_dirs_raw);
+            if let Ok(spec) = &power_result {
+                m.components = spec.components.clone();
+                m.pre_hooks = spec.pre_hooks.clone();
+                m.post_hooks = spec.post_hooks.clone();
+                m.registry_writes = spec.registry_writes.clone();
+                m.env_writes = spec.env_writes.clone();
+                m.shortcuts = spec.shortcuts.clone();
+            }
             let fd = files_dir.trim().to_string();
             s.doc.files_dir = if fd.is_empty() {
                 None
@@ -3516,7 +3647,7 @@ mod imp {
                     ID_BTN_BUILD => on_pack(hwnd, false),
                     ID_EDT_NAME | ID_EDT_VERSION | ID_EDT_PUBLISHER | ID_EDT_PRIMARY
                     | ID_EDT_INSTALL_LOC | ID_EDT_SM_FOLDER | ID_EDT_ASSOC | ID_EDT_FILES_DIR
-                    | ID_EDT_OUT_DIR | ID_EDT_DATA_DIRS => {
+                    | ID_EDT_OUT_DIR | ID_EDT_DATA_DIRS | ID_EDT_POWER => {
                         if notify == EN_CHANGE_CODE {
                             mark_dirty(hwnd);
                         }

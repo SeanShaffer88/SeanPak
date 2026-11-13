@@ -312,6 +312,634 @@ impl InstallOptions {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The v6 power block: components, install hooks, registry/environment
+// writes, and rich shortcuts — the "power bundle" a manifest can declare.
+//
+// Unlike the fixed-layout options blocks, this block is variable-length,
+// so it is stored as a u32 length prefix plus a JSON document (rendered
+// and parsed with the crate's hand-rolled JSON in `crate::manifest`),
+// written immediately after the v5 options extension. Readers of
+// pre-v6 packages get an empty [`PowerSpec`] — every file belongs to
+// the implicit `core` component and nothing else applies — so old
+// packages install exactly as they always did.
+
+/// The implicit component every unclaimed file belongs to. Always
+/// installed; manifests may not declare it.
+pub const CORE_COMPONENT_ID: &str = "core";
+
+/// What a failing install hook does to the install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookFailurePolicy {
+    /// The install fails and rolls back (exit 5).
+    Abort,
+    /// A warning is recorded and the install proceeds.
+    Continue,
+}
+
+impl HookFailurePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HookFailurePolicy::Abort => "abort",
+            HookFailurePolicy::Continue => "continue",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "abort" => Some(HookFailurePolicy::Abort),
+            "continue" => Some(HookFailurePolicy::Continue),
+            _ => None,
+        }
+    }
+}
+
+/// One pre/post install command declared by the manifest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub on_failure: HookFailurePolicy,
+}
+
+/// The registry value kinds a manifest write can declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegValueKind {
+    Sz,
+    Dword,
+}
+
+impl RegValueKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RegValueKind::Sz => "sz",
+            RegValueKind::Dword => "dword",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sz" => Some(RegValueKind::Sz),
+            "dword" => Some(RegValueKind::Dword),
+            _ => None,
+        }
+    }
+}
+
+/// One HKCU registry write declared by the manifest. `key` is relative
+/// to HKEY_CURRENT_USER; `name` is the value name ("" = the key's
+/// default value); `value` is the string form (for `dword`, the
+/// canonical decimal rendering of the number).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegWriteSpec {
+    pub key: String,
+    pub name: String,
+    pub kind: RegValueKind,
+    pub value: String,
+}
+
+/// One per-user environment-variable write (HKCU\Environment).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvWriteSpec {
+    pub name: String,
+    pub value: String,
+}
+
+/// Where a rich shortcut's link file lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutLocation {
+    Desktop,
+    StartMenu,
+    Both,
+}
+
+impl ShortcutLocation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ShortcutLocation::Desktop => "desktop",
+            ShortcutLocation::StartMenu => "startMenu",
+            ShortcutLocation::Both => "both",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "desktop" => Some(ShortcutLocation::Desktop),
+            "startMenu" => Some(ShortcutLocation::StartMenu),
+            "both" => Some(ShortcutLocation::Both),
+            _ => None,
+        }
+    }
+
+    pub fn wants_desktop(&self) -> bool {
+        matches!(self, ShortcutLocation::Desktop | ShortcutLocation::Both)
+    }
+
+    pub fn wants_start_menu(&self) -> bool {
+        matches!(self, ShortcutLocation::StartMenu | ShortcutLocation::Both)
+    }
+}
+
+/// One rich shortcut declared by the manifest: a `.lnk` with explicit
+/// target/arguments/icon, beyond the automatic primary-exe shortcuts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RichShortcutSpec {
+    pub name: String,
+    /// Install-relative path of the target file.
+    pub target: String,
+    pub arguments: String,
+    /// Install-relative icon file (defaults to the target itself).
+    pub icon: Option<String>,
+    pub icon_index: i32,
+    pub description: String,
+    pub location: ShortcutLocation,
+    /// Best-effort pin to taskbar (recorded, never fatal).
+    pub pin: bool,
+}
+
+/// One optional (or required) component: a named subset of the
+/// package's files the user can include or skip at install time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Files (package-relative) this component claims.
+    pub files: Vec<String>,
+    pub required: bool,
+    pub default_selected: bool,
+    /// Packed (stored, post-compression) size of the component's
+    /// files, computed by the packer with its own codec. Zero in a
+    /// manifest; filled in the package's power block.
+    pub packed_size: u64,
+}
+
+/// Everything the v6 power block declares. An empty spec (the default,
+/// and what every pre-v6 package reads as) changes nothing about an
+/// install.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PowerSpec {
+    pub components: Vec<ComponentSpec>,
+    pub pre_hooks: Vec<HookSpec>,
+    pub post_hooks: Vec<HookSpec>,
+    pub registry_writes: Vec<RegWriteSpec>,
+    pub env_writes: Vec<EnvWriteSpec>,
+    pub shortcuts: Vec<RichShortcutSpec>,
+}
+
+/// Normalizes a package-relative path for component bookkeeping.
+fn normalize_rel(rel: &str) -> String {
+    rel.replace('\\', "/")
+}
+
+impl PowerSpec {
+    pub fn is_empty(&self) -> bool {
+        self.components.is_empty()
+            && self.pre_hooks.is_empty()
+            && self.post_hooks.is_empty()
+            && self.registry_writes.is_empty()
+            && self.env_writes.is_empty()
+            && self.shortcuts.is_empty()
+    }
+
+    pub fn component(&self, id: &str) -> Option<&ComponentSpec> {
+        self.components.iter().find(|c| c.id == id)
+    }
+
+    /// The component that claims `rel` (a package-relative path), or
+    /// [`CORE_COMPONENT_ID`] when no component claims it.
+    pub fn component_id_for_file(&self, rel: &str) -> String {
+        let rel = normalize_rel(rel);
+        for c in &self.components {
+            if c.files.iter().any(|f| normalize_rel(f) == rel) {
+                return c.id.clone();
+            }
+        }
+        CORE_COMPONENT_ID.to_string()
+    }
+
+    /// True when the package has files no component claims (a real
+    /// `core` part exists).
+    pub fn has_core_files(&self, records: &[FileRecordHeader]) -> bool {
+        records
+            .iter()
+            .any(|r| self.component_id_for_file(&r.relative_path()) == CORE_COMPONENT_ID)
+    }
+
+    /// Total packed (stored) size of the payloads the implicit
+    /// `core` component owns, derived from the record offsets the
+    /// same way payload reads measure them.
+    pub fn core_packed_size(&self, records: &[FileRecordHeader], stream_len: u64) -> u64 {
+        records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| self.component_id_for_file(&r.relative_path()) == CORE_COMPONENT_ID)
+            .map(|(idx, _)| OverlayReader::stored_len(records, idx, stream_len))
+            .sum()
+    }
+
+    /// Every selectable part id, in stable order: `core` first (when
+    /// `include_core`), then the declared components in order.
+    pub fn part_ids(&self, include_core: bool) -> Vec<String> {
+        let mut ids = Vec::new();
+        if include_core {
+            ids.push(CORE_COMPONENT_ID.to_string());
+        }
+        ids.extend(self.components.iter().map(|c| c.id.clone()));
+        ids
+    }
+
+    /// The selection an install uses when nothing overrides it:
+    /// required components always; with a previous install's record
+    /// (`previous_installed` + `previous_known` — the ids the previous
+    /// package offered), components the previous package knew keep
+    /// their previous in/out state and brand-new components take
+    /// their manifest default; without a previous record, manifest
+    /// defaults rule. `core` is included when `include_core` (the
+    /// package has unclaimed files).
+    pub fn default_selection(
+        &self,
+        previous: Option<(&[String], &[String])>,
+        include_core: bool,
+    ) -> Vec<String> {
+        let mut selected: Vec<String> = Vec::new();
+        if include_core {
+            selected.push(CORE_COMPONENT_ID.to_string());
+        }
+        for c in &self.components {
+            let on = if c.required {
+                true
+            } else if let Some((installed, known)) = previous {
+                if known.iter().any(|k| k == &c.id) {
+                    installed.iter().any(|i| i == &c.id)
+                } else {
+                    c.default_selected
+                }
+            } else {
+                c.default_selected
+            };
+            if on {
+                selected.push(c.id.clone());
+            }
+        }
+        selected
+    }
+
+    /// Resolves the effective component selection for one install.
+    ///
+    /// - `explicit`: a caller's full selection (CLI `--components`,
+    ///   the wizard's checkboxes). Every id must name a declared
+    ///   component (or `core`).
+    /// - `without`: ids to remove from the resolved selection (CLI
+    ///   `--without`); removing a required component, the primary
+    ///   executable's component, or an unknown id is an error.
+    /// - `previous`: the previous install's (installed, known) ids,
+    ///   feeding [`PowerSpec::default_selection`].
+    ///
+    /// Required components, `core` (when the package has unclaimed
+    /// files), and the component holding the primary executable are
+    /// always in the result — an install never strands its own
+    /// primary exe. The result is in part order (core first, then
+    /// manifest order).
+    pub fn resolve_selection(
+        &self,
+        explicit: Option<&[String]>,
+        without: &[String],
+        previous: Option<(&[String], &[String])>,
+        records: &[FileRecordHeader],
+        primary_rel: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let include_core = self.has_core_files(records);
+        let mut chosen: Vec<String> = match explicit {
+            Some(ids) => {
+                let mut out: Vec<String> = Vec::new();
+                for id in ids {
+                    if id == CORE_COMPONENT_ID {
+                        if include_core && !out.iter().any(|o| o == CORE_COMPONENT_ID) {
+                            out.push(CORE_COMPONENT_ID.to_string());
+                        }
+                        continue;
+                    }
+                    match self.component(id) {
+                        Some(_) => {
+                            if !out.contains(id) {
+                                out.push(id.clone());
+                            }
+                        }
+                        None => {
+                            return Err(format!(
+                                "unknown component \"{id}\" (this package offers: {})",
+                                self.part_ids(true).join(", ")
+                            ))
+                        }
+                    }
+                }
+                out
+            }
+            None => self.default_selection(previous, include_core),
+        };
+        // Required parts are never out.
+        if include_core && !chosen.iter().any(|c| c == CORE_COMPONENT_ID) {
+            chosen.push(CORE_COMPONENT_ID.to_string());
+        }
+        for c in &self.components {
+            if c.required && !chosen.contains(&c.id) {
+                chosen.push(c.id.clone());
+            }
+        }
+        // The primary executable's component is always installed.
+        let primary_component = primary_rel.map(|rel| self.component_id_for_file(rel));
+        if let Some(pc) = &primary_component {
+            if !chosen.contains(pc) {
+                chosen.push(pc.clone());
+            }
+        }
+        for id in without {
+            if id == CORE_COMPONENT_ID {
+                return Err(
+                    "the core component cannot be removed — it holds the package's unclaimed files"
+                        .to_string(),
+                );
+            }
+            let Some(component) = self.component(id) else {
+                return Err(format!(
+                    "unknown component \"{id}\" (this package offers: {})",
+                    self.part_ids(true).join(", ")
+                ));
+            };
+            if component.required {
+                return Err(format!(
+                    "component \"{id}\" is required and cannot be removed"
+                ));
+            }
+            if primary_component.as_deref() == Some(id.as_str()) {
+                return Err(format!(
+                    "component \"{id}\" holds the app's main executable and cannot be removed"
+                ));
+            }
+            chosen.retain(|c| c != id);
+        }
+        // Stable part order in the result.
+        Ok(self
+            .part_ids(include_core)
+            .into_iter()
+            .filter(|id| chosen.contains(id))
+            .collect())
+    }
+
+    /// The JSON document stored in the v6 power block (and the shape
+    /// the manifest's power fields render to — one encoding, two
+    /// homes).
+    pub fn to_json_value(&self) -> crate::manifest::JsonValue {
+        use crate::manifest::{jobj, jstr, JsonValue};
+        let hook_json = |h: &HookSpec| {
+            jobj(vec![
+                ("command", jstr(h.command.clone())),
+                (
+                    "args",
+                    JsonValue::Array(h.args.iter().map(|a| jstr(a.clone())).collect()),
+                ),
+                ("onFailure", jstr(h.on_failure.as_str())),
+            ])
+        };
+        let mut pairs: Vec<(&str, JsonValue)> = Vec::new();
+        if !self.components.is_empty() {
+            pairs.push((
+                "components",
+                JsonValue::Array(
+                    self.components
+                        .iter()
+                        .map(|c| {
+                            jobj(vec![
+                                ("id", jstr(c.id.clone())),
+                                ("name", jstr(c.name.clone())),
+                                ("description", jstr(c.description.clone())),
+                                (
+                                    "files",
+                                    JsonValue::Array(
+                                        c.files.iter().map(|f| jstr(f.clone())).collect(),
+                                    ),
+                                ),
+                                ("required", JsonValue::Bool(c.required)),
+                                ("defaultSelected", JsonValue::Bool(c.default_selected)),
+                                ("packedSize", JsonValue::Number(c.packed_size as f64)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        if !self.pre_hooks.is_empty() || !self.post_hooks.is_empty() {
+            pairs.push((
+                "hooks",
+                jobj(vec![
+                    (
+                        "preInstall",
+                        JsonValue::Array(self.pre_hooks.iter().map(hook_json).collect()),
+                    ),
+                    (
+                        "postInstall",
+                        JsonValue::Array(self.post_hooks.iter().map(hook_json).collect()),
+                    ),
+                ]),
+            ));
+        }
+        if !self.registry_writes.is_empty() {
+            pairs.push((
+                "registryWrites",
+                JsonValue::Array(
+                    self.registry_writes
+                        .iter()
+                        .map(|w| {
+                            jobj(vec![
+                                ("key", jstr(w.key.clone())),
+                                ("name", jstr(w.name.clone())),
+                                ("type", jstr(w.kind.as_str())),
+                                ("value", jstr(w.value.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        if !self.env_writes.is_empty() {
+            pairs.push((
+                "envWrites",
+                JsonValue::Array(
+                    self.env_writes
+                        .iter()
+                        .map(|w| {
+                            jobj(vec![
+                                ("name", jstr(w.name.clone())),
+                                ("value", jstr(w.value.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        if !self.shortcuts.is_empty() {
+            pairs.push((
+                "shortcuts",
+                JsonValue::Array(
+                    self.shortcuts
+                        .iter()
+                        .map(|s| {
+                            let mut fields: Vec<(&str, JsonValue)> = vec![
+                                ("name", jstr(s.name.clone())),
+                                ("target", jstr(s.target.clone())),
+                                ("arguments", jstr(s.arguments.clone())),
+                            ];
+                            if let Some(icon) = &s.icon {
+                                fields.push(("icon", jstr(icon.clone())));
+                            }
+                            fields.push(("iconIndex", JsonValue::Number(s.icon_index as f64)));
+                            fields.push(("description", jstr(s.description.clone())));
+                            fields.push(("location", jstr(s.location.as_str())));
+                            fields.push(("pin", JsonValue::Bool(s.pin)));
+                            jobj(fields)
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        jobj(pairs)
+    }
+
+    /// Parses a power-block JSON document. Lenient by design (a
+    /// package in the field must stay installable): unknown or
+    /// malformed entries are skipped, never fatal.
+    pub fn from_json_value(root: &crate::manifest::JsonValue) -> PowerSpec {
+        use crate::manifest::JsonValue;
+        let str_list = |v: Option<&JsonValue>| -> Vec<String> {
+            match v {
+                Some(JsonValue::Array(items)) => items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let get_s = |v: &JsonValue, key: &str| -> String {
+            v.get(key)
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_b = |v: &JsonValue, key: &str, default: bool| -> bool {
+            v.get(key).and_then(|x| x.as_bool()).unwrap_or(default)
+        };
+        let parse_hooks = |v: Option<&JsonValue>| -> Vec<HookSpec> {
+            match v {
+                Some(JsonValue::Array(items)) => items
+                    .iter()
+                    .filter_map(|item| {
+                        let command = get_s(item, "command");
+                        if command.is_empty() {
+                            return None;
+                        }
+                        Some(HookSpec {
+                            command,
+                            args: str_list(item.get("args")),
+                            on_failure: item
+                                .get("onFailure")
+                                .and_then(|x| x.as_str())
+                                .and_then(HookFailurePolicy::parse)
+                                .unwrap_or(HookFailurePolicy::Abort),
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let mut spec = PowerSpec::default();
+        if let Some(JsonValue::Array(items)) = root.get("components") {
+            for item in items {
+                let id = get_s(item, "id");
+                if id.is_empty() || id == CORE_COMPONENT_ID {
+                    continue;
+                }
+                spec.components.push(ComponentSpec {
+                    id,
+                    name: get_s(item, "name"),
+                    description: get_s(item, "description"),
+                    files: str_list(item.get("files")),
+                    required: get_b(item, "required", false),
+                    default_selected: get_b(item, "defaultSelected", true),
+                    packed_size: match item.get("packedSize") {
+                        Some(JsonValue::Number(n)) => *n as u64,
+                        _ => 0,
+                    },
+                });
+            }
+        }
+        if let Some(hooks) = root.get("hooks") {
+            spec.pre_hooks = parse_hooks(hooks.get("preInstall"));
+            spec.post_hooks = parse_hooks(hooks.get("postInstall"));
+        }
+        if let Some(JsonValue::Array(items)) = root.get("registryWrites") {
+            for item in items {
+                let key = get_s(item, "key");
+                if key.is_empty() {
+                    continue;
+                }
+                spec.registry_writes.push(RegWriteSpec {
+                    key,
+                    name: get_s(item, "name"),
+                    kind: item
+                        .get("type")
+                        .and_then(|x| x.as_str())
+                        .and_then(RegValueKind::parse)
+                        .unwrap_or(RegValueKind::Sz),
+                    value: get_s(item, "value"),
+                });
+            }
+        }
+        if let Some(JsonValue::Array(items)) = root.get("envWrites") {
+            for item in items {
+                let name = get_s(item, "name");
+                if name.is_empty() {
+                    continue;
+                }
+                spec.env_writes.push(EnvWriteSpec {
+                    name,
+                    value: get_s(item, "value"),
+                });
+            }
+        }
+        if let Some(JsonValue::Array(items)) = root.get("shortcuts") {
+            for item in items {
+                let name = get_s(item, "name");
+                let target = get_s(item, "target");
+                if name.is_empty() || target.is_empty() {
+                    continue;
+                }
+                spec.shortcuts.push(RichShortcutSpec {
+                    name,
+                    target,
+                    arguments: get_s(item, "arguments"),
+                    icon: item
+                        .get("icon")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                    icon_index: match item.get("iconIndex") {
+                        Some(JsonValue::Number(n)) => *n as i32,
+                        _ => 0,
+                    },
+                    description: get_s(item, "description"),
+                    location: item
+                        .get("location")
+                        .and_then(|x| x.as_str())
+                        .and_then(ShortcutLocation::parse)
+                        .unwrap_or(ShortcutLocation::StartMenu),
+                    pin: get_b(item, "pin", false),
+                });
+            }
+        }
+        spec
+    }
+}
+
 pub struct OverlayWriter;
 
 impl OverlayWriter {
@@ -340,7 +968,7 @@ impl OverlayWriter {
 
     /// Like [`OverlayWriter::build_from_folder`], but records explicit
     /// install-time `options` in the package (options blocks, manifest
-    /// version 5) instead of the per-app defaults.
+    /// version 6) instead of the per-app defaults.
     #[allow(clippy::too_many_arguments)]
     pub fn build_from_folder_with_options(
         stub_binary_path: &Path,
@@ -382,13 +1010,45 @@ impl OverlayWriter {
     pub fn build_overlay(
         stub_binary_path: &Path,
         output_exe_path: &Path,
-        _source_dir: &Path,
+        source_dir: &Path,
         files: &[(PathBuf, String, bool)], // (absolute_path, relative_path, is_primary)
         app_name: &str,
         version: &str,
         publisher: &str,
         options: &InstallOptions,
     ) -> std::io::Result<u64> {
+        let (total, _power) = Self::build_overlay_with_power(
+            stub_binary_path,
+            output_exe_path,
+            source_dir,
+            files,
+            app_name,
+            version,
+            publisher,
+            options,
+            &PowerSpec::default(),
+        )?;
+        Ok(total)
+    }
+
+    /// Like [`OverlayWriter::build_overlay`], but also records the
+    /// package's [`PowerSpec`] in the v6 power block. Returns the
+    /// total written size and the power spec as stored — identical to
+    /// the input except each component's `packed_size` is filled with
+    /// the stored (post-compression) size the packer's own codec
+    /// produced for that component's files.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_overlay_with_power(
+        stub_binary_path: &Path,
+        output_exe_path: &Path,
+        _source_dir: &Path,
+        files: &[(PathBuf, String, bool)], // (absolute_path, relative_path, is_primary)
+        app_name: &str,
+        version: &str,
+        publisher: &str,
+        options: &InstallOptions,
+        power: &PowerSpec,
+    ) -> std::io::Result<(u64, PowerSpec)> {
         // Copy host stub executable to target output path
         std::fs::copy(stub_binary_path, output_exe_path)?;
 
@@ -411,7 +1071,7 @@ impl OverlayWriter {
 
         let mut manifest = OverlayManifestHeader {
             magic: *OVERLAY_MAGIC,
-            version: 5,
+            version: 6,
             file_count: files.len() as u32,
             primary_exe_index: 0,
             total_uncompressed_bytes: 0,
@@ -425,20 +1085,16 @@ impl OverlayWriter {
         copy_str_to_fixed(&mut manifest.app_version_utf8, version);
         copy_str_to_fixed(&mut manifest.publisher_utf8, publisher);
 
-        let manifest_size = std::mem::size_of::<OverlayManifestHeader>() as u64;
-        let records_total_size = (files.len() * std::mem::size_of::<FileRecordHeader>()) as u64;
-        // v5 options: the v3/v4 base block plus the v5 extension block.
-        let options_size = (OPTIONS_BASE_DISK_SIZE + OPTIONS_EXT_DISK_SIZE) as u64;
-        let mut current_payload_offset =
-            aligned_overlay_start + manifest_size + records_total_size + options_size;
-
         let mut record_headers = Vec::with_capacity(files.len());
         let mut total_bytes: u64 = 0;
         // Stored payloads, in record order. Payloads are compressed per
         // file (manifest v4), so each file is buffered once at pack time;
         // `file_size` in the record stays the ORIGINAL size and the stored
         // length is recoverable from the next record's offset (payloads
-        // are laid out contiguously, as they always have been).
+        // are laid out contiguously, as they always have been). Payload
+        // offsets are assigned after this loop: the v6 power block's
+        // length depends on the per-component packed sizes, which only
+        // exist once every file is compressed.
         let mut stored_payloads: Vec<Vec<u8>> = Vec::with_capacity(files.len());
 
         for (idx, (abs_path, rel_path, is_primary)) in files.iter().enumerate() {
@@ -449,8 +1105,8 @@ impl OverlayWriter {
 
             let mut header = FileRecordHeader {
                 file_size,
-                payload_offset: current_payload_offset,
-                attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+                payload_offset: 0, // assigned below, once sizes are known
+                attributes: 0x80,  // FILE_ATTRIBUTE_NORMAL
                 is_executable: if *is_primary { 1 } else { 0 },
                 ..Default::default()
             };
@@ -462,11 +1118,40 @@ impl OverlayWriter {
             }
 
             record_headers.push(header);
-            current_payload_offset += stored.len() as u64;
             stored_payloads.push(stored);
         }
 
         manifest.total_uncompressed_bytes = total_bytes;
+
+        // The stored power block: the declared spec with each
+        // component's packed size filled from the stored payloads.
+        let mut computed_power = power.clone();
+        for component in &mut computed_power.components {
+            component.packed_size = 0;
+        }
+        for ((_abs, rel_path, _primary), stored) in files.iter().zip(&stored_payloads) {
+            let id = computed_power.component_id_for_file(rel_path);
+            if let Some(component) = computed_power.components.iter_mut().find(|c| c.id == id) {
+                component.packed_size += stored.len() as u64;
+            }
+        }
+        let power_json = computed_power.to_json_value().render();
+        let power_block_size = 4 + power_json.len() as u64;
+
+        let manifest_size = std::mem::size_of::<OverlayManifestHeader>() as u64;
+        let records_total_size = (files.len() * std::mem::size_of::<FileRecordHeader>()) as u64;
+        // v5 options: the v3/v4 base block plus the v5 extension block,
+        // then the v6 power block.
+        let options_size = (OPTIONS_BASE_DISK_SIZE + OPTIONS_EXT_DISK_SIZE) as u64;
+        let mut current_payload_offset = aligned_overlay_start
+            + manifest_size
+            + records_total_size
+            + options_size
+            + power_block_size;
+        for (header, stored) in record_headers.iter_mut().zip(&stored_payloads) {
+            header.payload_offset = current_payload_offset;
+            current_payload_offset += stored.len() as u64;
+        }
 
         // Write manifest header
         let manifest_bytes = unsafe {
@@ -507,6 +1192,11 @@ impl OverlayWriter {
         };
         out_file.write_all(ext_bytes)?;
 
+        // Write the v6 power block: a u32 length prefix + the JSON
+        // document, immediately after the v5 extension block.
+        out_file.write_all(&(power_json.len() as u32).to_le_bytes())?;
+        out_file.write_all(power_json.as_bytes())?;
+
         // Write the stored (possibly compressed) payloads in record order.
         for stored in &stored_payloads {
             out_file.write_all(stored)?;
@@ -514,11 +1204,21 @@ impl OverlayWriter {
 
         out_file.flush()?;
         let total_written = out_file.seek(SeekFrom::End(0))?;
-        Ok(total_written)
+        Ok((total_written, computed_power))
     }
 }
 
 pub struct OverlayReader;
+
+/// A fully read package: the manifest header, the file records, the
+/// install options, and the v6 power block (empty for older
+/// packages) — what [`OverlayReader::read_package_full`] returns.
+pub type PackageFull = (
+    OverlayManifestHeader,
+    Vec<FileRecordHeader>,
+    InstallOptions,
+    PowerSpec,
+);
 
 impl OverlayReader {
     /// Discovers and validates the direct overlay table within the host executable.
@@ -538,9 +1238,21 @@ impl OverlayReader {
     /// [`InstallOptions::defaults_for`] for the recorded app name, and
     /// v3/v4 packages get the extension defaults.
     pub fn read_package<R: Read + Seek>(
-        mut reader: R,
+        reader: R,
     ) -> std::io::Result<Option<(OverlayManifestHeader, Vec<FileRecordHeader>, InstallOptions)>>
     {
+        match Self::read_package_full(reader)? {
+            Some((manifest, records, options, _power)) => Ok(Some((manifest, records, options))),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`OverlayReader::read_package`], but also returns the
+    /// package's v6 [`PowerSpec`] (components, hooks, writes, rich
+    /// shortcuts). Pre-v6 packages read as an empty spec.
+    pub fn read_package_full<R: Read + Seek>(
+        mut reader: R,
+    ) -> std::io::Result<Option<PackageFull>> {
         let stream_len = reader.seek(SeekFrom::End(0))?;
         let manifest_size = std::mem::size_of::<OverlayManifestHeader>() as u64;
 
@@ -640,7 +1352,41 @@ impl OverlayReader {
             InstallOptions::defaults_for(&manifest.app_name())
         };
 
-        Ok(Some((manifest, records, options)))
+        // The v6 power block follows the options blocks: a u32 length
+        // prefix + a JSON document. Anything malformed is an honest
+        // read error — a v6 package whose power block cannot be read
+        // must not silently install as if it had none.
+        let power = if manifest.version >= 6 {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf) as u64;
+            let here = reader.stream_position()?;
+            if len > 64 * 1024 * 1024 || here + len > stream_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("power block length {len} is out of bounds"),
+                ));
+            }
+            let mut buf = vec![0u8; len as usize];
+            reader.read_exact(&mut buf)?;
+            let text = String::from_utf8(buf).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "power block is not valid UTF-8",
+                )
+            })?;
+            let value = crate::manifest::parse_json(&text).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("power block is not valid JSON: {e}"),
+                )
+            })?;
+            PowerSpec::from_json_value(&value)
+        } else {
+            PowerSpec::default()
+        };
+
+        Ok(Some((manifest, records, options, power)))
     }
 
     /// The stored (on-disk) length of `records[index]`'s payload.
@@ -695,6 +1441,20 @@ impl OverlayReader {
         dest_dir: &Path,
         control: &mut ExtractControl<'_>,
     ) -> std::io::Result<Vec<PathBuf>> {
+        Self::extract_selected_with_control(reader, dest_dir, &|_| true, control)
+    }
+
+    /// Like [`OverlayReader::extract_with_control`], but writes only
+    /// the records `include` accepts — the component-selective install
+    /// path. The progress callback's `(index, total)` counts the
+    /// *selected* files, so progress stays honest about what this run
+    /// actually writes.
+    pub fn extract_selected_with_control<R: Read + Seek>(
+        reader: R,
+        dest_dir: &Path,
+        include: &dyn Fn(&FileRecordHeader) -> bool,
+        control: &mut ExtractControl<'_>,
+    ) -> std::io::Result<Vec<PathBuf>> {
         let mut reader = reader;
         let (_manifest, records) = Self::read_manifest(&mut reader)?.ok_or_else(|| {
             std::io::Error::new(
@@ -703,10 +1463,18 @@ impl OverlayReader {
             )
         })?;
         let stream_len = reader.seek(SeekFrom::End(0))?;
+        let selected: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| include(record))
+            .map(|(idx, _)| idx)
+            .collect();
+        let total = selected.len();
 
         std::fs::create_dir_all(dest_dir)?;
-        let mut written = Vec::with_capacity(records.len());
-        for (idx, record) in records.iter().enumerate() {
+        let mut written = Vec::with_capacity(total);
+        for (seq, idx) in selected.into_iter().enumerate() {
+            let record = &records[idx];
             if let Some(cancel) = control.cancel {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(std::io::Error::new(
@@ -717,7 +1485,7 @@ impl OverlayReader {
             }
             let rel = record.relative_path();
             if let Some(on_file) = control.on_file.as_deref_mut() {
-                on_file(idx, records.len(), &rel);
+                on_file(seq, total, &rel);
             }
             let target = safe_join(dest_dir, &rel)?;
             if let Some(parent) = target.parent() {
@@ -1065,7 +1833,7 @@ mod tests {
         let (manifest, records, read_back) = OverlayReader::read_package(file)
             .unwrap()
             .expect("new overlay must be discoverable");
-        assert_eq!(manifest.version, 5);
+        assert_eq!(manifest.version, 6);
         assert_eq!(manifest.app_name(), "Opt App");
         assert_eq!(records.len(), 1);
         assert_eq!(read_back.install_location(), "C:\\Apps\\Opt App");
@@ -1164,7 +1932,7 @@ mod tests {
         OverlayWriter::build_from_folder(&stub, &out, &src, "Zip App", "1.0.0", "Tester").unwrap();
         let file = File::open(&out).unwrap();
         let (manifest, records) = OverlayReader::read_manifest(file).unwrap().unwrap();
-        assert_eq!(manifest.version, 5);
+        assert_eq!(manifest.version, 6);
         let big = records
             .iter()
             .find(|r| r.relative_path() == "big.txt")
@@ -1183,6 +1951,324 @@ mod tests {
             b"\x01\x02\x03"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn record_named(rel: &str, size: u64) -> FileRecordHeader {
+        let mut record = FileRecordHeader {
+            file_size: size,
+            ..Default::default()
+        };
+        copy_str_to_fixed(&mut record.relative_path_utf8, rel);
+        record
+    }
+
+    fn sample_power() -> PowerSpec {
+        PowerSpec {
+            components: vec![
+                ComponentSpec {
+                    id: "extras".to_string(),
+                    name: "Extras".to_string(),
+                    description: "Optional extras".to_string(),
+                    files: vec!["extras/big.bin".to_string()],
+                    required: false,
+                    default_selected: false,
+                    packed_size: 0,
+                },
+                ComponentSpec {
+                    id: "engine".to_string(),
+                    name: "Engine".to_string(),
+                    description: String::new(),
+                    files: vec!["engine.dll".to_string()],
+                    required: true,
+                    default_selected: true,
+                    packed_size: 0,
+                },
+            ],
+            pre_hooks: vec![HookSpec {
+                command: "prep.exe".to_string(),
+                args: vec!["--go".to_string()],
+                on_failure: HookFailurePolicy::Continue,
+            }],
+            post_hooks: vec![HookSpec {
+                command: "finish.exe".to_string(),
+                args: Vec::new(),
+                on_failure: HookFailurePolicy::Abort,
+            }],
+            registry_writes: vec![RegWriteSpec {
+                key: "Software\\Power App".to_string(),
+                name: "Mode".to_string(),
+                kind: RegValueKind::Dword,
+                value: "7".to_string(),
+            }],
+            env_writes: vec![EnvWriteSpec {
+                name: "POWER_APP_HOME".to_string(),
+                value: "C:\\Power".to_string(),
+            }],
+            shortcuts: vec![RichShortcutSpec {
+                name: "Power Console".to_string(),
+                target: "app.exe".to_string(),
+                arguments: "--console".to_string(),
+                icon: None,
+                icon_index: 0,
+                description: "Opens the console".to_string(),
+                location: ShortcutLocation::Both,
+                pin: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn power_block_round_trips_with_packed_sizes() {
+        let root = unique_temp("power");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("extras")).unwrap();
+        std::fs::write(src.join("app.exe"), b"fake-pe-bytes").unwrap();
+        std::fs::write(src.join("engine.dll"), b"engine-bytes").unwrap();
+        std::fs::write(src.join("extras/big.bin"), vec![9u8; 20_000]).unwrap();
+        let stub = root.join("stub.exe");
+        std::fs::write(&stub, vec![0xAAu8; 5000]).unwrap();
+        let out = root.join("Setup.exe");
+
+        let options = InstallOptions::defaults_for("Power App");
+        let files: Vec<(PathBuf, String, bool)> = vec![
+            (src.join("app.exe"), "app.exe".to_string(), true),
+            (src.join("engine.dll"), "engine.dll".to_string(), false),
+            (
+                src.join("extras/big.bin"),
+                "extras/big.bin".to_string(),
+                false,
+            ),
+        ];
+        let (_total, stored_power) = OverlayWriter::build_overlay_with_power(
+            &stub,
+            &out,
+            &src,
+            &files,
+            "Power App",
+            "3.0.0",
+            "Tester",
+            &options,
+            &sample_power(),
+        )
+        .unwrap();
+        // Packed sizes are filled by the packer's own codec: big.bin is
+        // highly compressible, so its packed size is far below 20,000.
+        let extras = stored_power.component("extras").unwrap();
+        assert!(extras.packed_size > 0 && extras.packed_size < 20_000);
+        assert_eq!(
+            stored_power.component("engine").unwrap().packed_size,
+            12 // "engine-bytes" stores uncompressed or near it
+        );
+
+        let file = File::open(&out).unwrap();
+        let (manifest, records, _options, power) = OverlayReader::read_package_full(file)
+            .unwrap()
+            .expect("v6 overlay must be discoverable");
+        assert_eq!(manifest.version, 6);
+        assert_eq!(records.len(), 3);
+        assert_eq!(power, stored_power);
+        assert_eq!(power.component_id_for_file("app.exe"), "core");
+        assert_eq!(power.component_id_for_file("engine.dll"), "engine");
+        assert_eq!(
+            power.component_id_for_file("extras\\big.bin"),
+            "extras",
+            "backslash paths resolve too"
+        );
+
+        // Payloads still extract byte-for-byte past the power block.
+        let dest = root.join("extracted");
+        let written = OverlayReader::extract_file(&out, &dest).unwrap();
+        assert_eq!(written.len(), 3);
+        assert_eq!(
+            std::fs::read(dest.join("extras/big.bin")).unwrap(),
+            vec![9u8; 20_000]
+        );
+
+        // Selective extraction writes only the chosen component's files.
+        let dest2 = root.join("selected");
+        let mut control = ExtractControl::default();
+        let only_extras =
+            |r: &FileRecordHeader| power.component_id_for_file(&r.relative_path()) == "extras";
+        let written = OverlayReader::extract_selected_with_control(
+            File::open(&out).unwrap(),
+            &dest2,
+            &only_extras,
+            &mut control,
+        )
+        .unwrap();
+        assert_eq!(written.len(), 1);
+        assert!(dest2.join("extras/big.bin").exists());
+        assert!(!dest2.join("app.exe").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn version_five_packages_read_with_empty_power() {
+        // A hand-built v5 package: base + extension options blocks, no
+        // power block. The reader must supply an empty power spec and
+        // still find the payload.
+        let root = unique_temp("v5pkg");
+        let payload = b"v5 payload bytes";
+        let header_size = std::mem::size_of::<OverlayManifestHeader>();
+        let record_size = std::mem::size_of::<FileRecordHeader>();
+        let mut bytes = vec![0u8; SECTOR_ALIGNMENT as usize];
+        let mut manifest = OverlayManifestHeader {
+            magic: *OVERLAY_MAGIC,
+            version: 5,
+            file_count: 1,
+            primary_exe_index: 0,
+            total_uncompressed_bytes: payload.len() as u64,
+            app_name_utf8: [0u8; 128],
+            app_version_utf8: [0u8; 32],
+            publisher_utf8: [0u8; 128],
+        };
+        copy_str_to_fixed(&mut manifest.app_name_utf8, "V5 App");
+        let mut record = FileRecordHeader {
+            file_size: payload.len() as u64,
+            payload_offset: SECTOR_ALIGNMENT
+                + (header_size + record_size + OPTIONS_BASE_DISK_SIZE + OPTIONS_EXT_DISK_SIZE)
+                    as u64,
+            ..Default::default()
+        };
+        copy_str_to_fixed(&mut record.relative_path_utf8, "v5.txt");
+        let manifest_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &manifest as *const OverlayManifestHeader as *const u8,
+                header_size,
+            )
+        };
+        bytes.extend_from_slice(manifest_bytes);
+        let record_bytes = unsafe {
+            std::slice::from_raw_parts(&record as *const FileRecordHeader as *const u8, record_size)
+        };
+        bytes.extend_from_slice(record_bytes);
+        let options = InstallOptions::defaults_for("V5 App");
+        let base = options.disk_base();
+        let base_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &base as *const OptionsDiskBase as *const u8,
+                OPTIONS_BASE_DISK_SIZE,
+            )
+        };
+        bytes.extend_from_slice(base_bytes);
+        let ext = options.disk_ext();
+        let ext_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ext as *const OptionsDiskExt as *const u8,
+                OPTIONS_EXT_DISK_SIZE,
+            )
+        };
+        bytes.extend_from_slice(ext_bytes);
+        bytes.extend_from_slice(payload);
+
+        let (read_back, records, _opts, power) =
+            OverlayReader::read_package_full(Cursor::new(bytes.clone()))
+                .unwrap()
+                .expect("v5 overlay must be discoverable");
+        assert_eq!(read_back.version, 5);
+        assert_eq!(records.len(), 1);
+        assert!(power.is_empty());
+
+        let dest = root.join("dest");
+        OverlayReader::extract(Cursor::new(bytes), &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("v5.txt")).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn selection_resolution_rules() {
+        let power = sample_power();
+        let records = vec![
+            record_named("app.exe", 10),
+            record_named("engine.dll", 10),
+            record_named("extras/big.bin", 10),
+        ];
+        let primary = Some("app.exe");
+
+        // Defaults: core + required engine; extras defaults off.
+        let sel = power
+            .resolve_selection(None, &[], None, &records, primary)
+            .unwrap();
+        assert_eq!(sel, vec!["core".to_string(), "engine".to_string()]);
+
+        // Explicit selection adds extras; unknown ids are errors.
+        let sel = power
+            .resolve_selection(Some(&["extras".to_string()]), &[], None, &records, primary)
+            .unwrap();
+        assert_eq!(
+            sel,
+            vec![
+                "core".to_string(),
+                "extras".to_string(),
+                "engine".to_string()
+            ]
+        );
+        assert!(power
+            .resolve_selection(Some(&["nope".to_string()]), &[], None, &records, primary)
+            .is_err());
+
+        // --without: a default-on optional would drop; required, the
+        // primary's component, and core refuse.
+        let mut power2 = sample_power();
+        power2.components[0].default_selected = true;
+        let sel = power2
+            .resolve_selection(None, &["extras".to_string()], None, &records, primary)
+            .unwrap();
+        assert_eq!(sel, vec!["core".to_string(), "engine".to_string()]);
+        assert!(power2
+            .resolve_selection(None, &["engine".to_string()], None, &records, primary)
+            .is_err());
+        assert!(power2
+            .resolve_selection(None, &["core".to_string()], None, &records, primary)
+            .is_err());
+
+        // The primary executable's component is force-included even
+        // when it is optional and unselected.
+        let mut power3 = PowerSpec::default();
+        power3.components.push(ComponentSpec {
+            id: "main".to_string(),
+            name: "Main".to_string(),
+            description: String::new(),
+            files: vec!["app.exe".to_string()],
+            required: false,
+            default_selected: false,
+            packed_size: 0,
+        });
+        let records3 = vec![record_named("app.exe", 10), record_named("loose.txt", 10)];
+        let sel = power3
+            .resolve_selection(None, &[], None, &records3, primary)
+            .unwrap();
+        assert_eq!(sel, vec!["core".to_string(), "main".to_string()]);
+        assert!(power3
+            .resolve_selection(None, &["main".to_string()], None, &records3, primary)
+            .is_err());
+
+        // Upgrade: a component the previous package knew keeps its
+        // in/out state; a brand-new one takes its manifest default.
+        let installed = vec!["core".to_string(), "engine".to_string()];
+        let known = vec![
+            "core".to_string(),
+            "engine".to_string(),
+            "extras".to_string(),
+        ];
+        let sel = power
+            .resolve_selection(None, &[], Some((&installed, &known)), &records, primary)
+            .unwrap();
+        assert_eq!(sel, vec!["core".to_string(), "engine".to_string()]);
+        let known_without_extras = vec!["core".to_string(), "engine".to_string()];
+        let mut power4 = sample_power();
+        power4.components[0].default_selected = true;
+        let sel = power4
+            .resolve_selection(
+                None,
+                &[],
+                Some((&installed, &known_without_extras)),
+                &records,
+                primary,
+            )
+            .unwrap();
+        assert!(sel.contains(&"extras".to_string()));
     }
 
     #[test]

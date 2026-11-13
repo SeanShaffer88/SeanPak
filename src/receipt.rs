@@ -58,6 +58,50 @@ pub struct RunRecord {
     pub prior_value: Option<String>,
 }
 
+/// One registry value an install wrote (v6 `registryWrites`), with the
+/// state it replaced — uninstall restores the prior value exactly, or
+/// deletes the value (and the key, when the install created it and it
+/// is now empty) when there was none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegWriteRecord {
+    /// HKCU-relative key path.
+    pub key: String,
+    /// Value name ("" = the key's default value).
+    pub name: String,
+    /// The prior value's kind: "sz" (REG_SZ), "expand"
+    /// (REG_EXPAND_SZ), or "dword" — `None` when the value was absent.
+    pub prior_kind: Option<String>,
+    /// The prior value in string form (decimal for a dword).
+    pub prior_value: Option<String>,
+    /// True when the install created the key itself.
+    pub created_key: bool,
+}
+
+/// One environment variable an install wrote (v6 `envWrites`), with
+/// the state it replaced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvWriteRecord {
+    pub name: String,
+    /// The prior value — `None` when the variable was absent.
+    pub prior_value: Option<String>,
+    /// The prior value's registry type (REG_SZ / REG_EXPAND_SZ), so a
+    /// restore writes back the same type. 0 when there was no prior.
+    pub prior_type: u32,
+}
+
+/// The recorded outcome of a best-effort taskbar pin (v6 rich
+/// shortcuts). Informational only — a pin is never something an
+/// uninstall can (or should) undo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinRecord {
+    /// The shortcut's display name.
+    pub name: String,
+    /// The link file that was pinned.
+    pub link_path: String,
+    /// "pinned" or "unavailable".
+    pub outcome: String,
+}
+
 /// System artifacts an install applied (all paths are the exact files /
 /// values created, so removal touches nothing else).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -66,6 +110,12 @@ pub struct AppliedArtifacts {
     pub associations: Vec<AssocRecord>,
     pub path_segment_added: Option<String>,
     pub start_at_login: Option<RunRecord>,
+    /// Journaled registry writes (v6), restored by uninstall.
+    pub registry_writes: Vec<RegWriteRecord>,
+    /// Journaled environment writes (v6), restored by uninstall.
+    pub env_writes: Vec<EnvWriteRecord>,
+    /// Taskbar pin outcomes (v6) — informational, nothing to remove.
+    pub pins: Vec<PinRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +145,40 @@ pub struct InstallReceipt {
     /// install time. The uninstall's data-purge option works from
     /// exactly this list.
     pub data_dirs: Vec<String>,
+    /// The install-time preset's data-purge default (v7, from an
+    /// answer file's `purgeDataOnUninstall`): the interactive
+    /// uninstall confirmation's checkbox starts in this state. It is
+    /// a default only — a silent uninstall still never purges without
+    /// its explicit `--purge-data` flag.
+    pub purge_data_default: bool,
+    /// Component ids this install actually installed (v6), in part
+    /// order — `core` included when the package has unclaimed files.
+    /// Uninstall removes exactly these components' payload files, and
+    /// an upgrade uses this (with `components_known`) as the default
+    /// selection for the new package.
+    pub components: Vec<String>,
+    /// Every component id the package offered at install time (v6).
+    pub components_known: Vec<String>,
+    /// Every install hook that ran (v6): phase, command, exit code,
+    /// failure policy, outcome.
+    pub hooks: Vec<HookRunRecord>,
     pub artifacts: AppliedArtifacts,
+}
+
+/// One install hook run (v6): what ran, how it ended, and the failure
+/// policy that decided what the failure meant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookRunRecord {
+    /// "preInstall" or "postInstall".
+    pub phase: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// The process exit code; `None` when the process could not be
+    /// started or was killed by a signal.
+    pub exit_code: Option<i64>,
+    /// "abort" or "continue".
+    pub on_failure: String,
+    pub succeeded: bool,
 }
 
 pub fn receipt_path(dest: &Path) -> PathBuf {
@@ -185,11 +268,53 @@ impl InstallReceipt {
                         JsonValue::Bool(self.launch_after_install_default),
                     ),
                     ("startAtLogin", JsonValue::Bool(self.start_at_login)),
+                    ("purgeDataDefault", JsonValue::Bool(self.purge_data_default)),
                 ]),
             ),
             (
                 "dataDirs",
                 JsonValue::Array(self.data_dirs.iter().map(|d| jstr(d.clone())).collect()),
+            ),
+            (
+                "components",
+                JsonValue::Array(self.components.iter().map(|c| jstr(c.clone())).collect()),
+            ),
+            (
+                "componentsKnown",
+                JsonValue::Array(
+                    self.components_known
+                        .iter()
+                        .map(|c| jstr(c.clone()))
+                        .collect(),
+                ),
+            ),
+            (
+                "hooks",
+                JsonValue::Array(
+                    self.hooks
+                        .iter()
+                        .map(|h| {
+                            jobj(vec![
+                                ("phase", jstr(h.phase.clone())),
+                                ("command", jstr(h.command.clone())),
+                                (
+                                    "args",
+                                    JsonValue::Array(
+                                        h.args.iter().map(|a| jstr(a.clone())).collect(),
+                                    ),
+                                ),
+                                (
+                                    "exitCode",
+                                    h.exit_code
+                                        .map(|n| JsonValue::Number(n as f64))
+                                        .unwrap_or(JsonValue::Null),
+                                ),
+                                ("onFailure", jstr(h.on_failure.clone())),
+                                ("succeeded", JsonValue::Bool(h.succeeded)),
+                            ])
+                        })
+                        .collect(),
+                ),
             ),
             (
                 "artifacts",
@@ -226,6 +351,74 @@ impl InstallReceipt {
                             ]),
                             None => JsonValue::Null,
                         },
+                    ),
+                    (
+                        "registryWrites",
+                        JsonValue::Array(
+                            self.artifacts
+                                .registry_writes
+                                .iter()
+                                .map(|w| {
+                                    jobj(vec![
+                                        ("key", jstr(w.key.clone())),
+                                        ("name", jstr(w.name.clone())),
+                                        (
+                                            "priorKind",
+                                            w.prior_kind
+                                                .clone()
+                                                .map(jstr)
+                                                .unwrap_or(JsonValue::Null),
+                                        ),
+                                        (
+                                            "priorValue",
+                                            w.prior_value
+                                                .clone()
+                                                .map(jstr)
+                                                .unwrap_or(JsonValue::Null),
+                                        ),
+                                        ("createdKey", JsonValue::Bool(w.created_key)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "envWrites",
+                        JsonValue::Array(
+                            self.artifacts
+                                .env_writes
+                                .iter()
+                                .map(|w| {
+                                    jobj(vec![
+                                        ("name", jstr(w.name.clone())),
+                                        (
+                                            "priorValue",
+                                            w.prior_value
+                                                .clone()
+                                                .map(jstr)
+                                                .unwrap_or(JsonValue::Null),
+                                        ),
+                                        ("priorType", JsonValue::Number(w.prior_type as f64)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "pins",
+                        JsonValue::Array(
+                            self.artifacts
+                                .pins
+                                .iter()
+                                .map(|p| {
+                                    jobj(vec![
+                                        ("name", jstr(p.name.clone())),
+                                        ("linkPath", jstr(p.link_path.clone())),
+                                        ("outcome", jstr(p.outcome.clone())),
+                                    ])
+                                })
+                                .collect(),
+                        ),
                     ),
                 ]),
             ),
@@ -328,6 +521,78 @@ impl InstallReceipt {
             }),
             _ => None,
         };
+        let opt_s = |item: &JsonValue, key: &str| {
+            item.get(key).and_then(|v| v.as_str()).map(str::to_string)
+        };
+        let registry_writes = match artifacts.get("registryWrites") {
+            Some(JsonValue::Array(items)) => items
+                .iter()
+                .filter_map(|item| {
+                    Some(RegWriteRecord {
+                        key: item.get("key")?.as_str()?.to_string(),
+                        name: opt_s(item, "name").unwrap_or_default(),
+                        prior_kind: opt_s(item, "priorKind"),
+                        prior_value: opt_s(item, "priorValue"),
+                        created_key: item
+                            .get("createdKey")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let env_writes = match artifacts.get("envWrites") {
+            Some(JsonValue::Array(items)) => items
+                .iter()
+                .filter_map(|item| {
+                    Some(EnvWriteRecord {
+                        name: item.get("name")?.as_str()?.to_string(),
+                        prior_value: opt_s(item, "priorValue"),
+                        prior_type: match item.get("priorType") {
+                            Some(JsonValue::Number(n)) => *n as u32,
+                            _ => 0,
+                        },
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let pins = match artifacts.get("pins") {
+            Some(JsonValue::Array(items)) => items
+                .iter()
+                .filter_map(|item| {
+                    Some(PinRecord {
+                        name: item.get("name")?.as_str()?.to_string(),
+                        link_path: opt_s(item, "linkPath").unwrap_or_default(),
+                        outcome: opt_s(item, "outcome").unwrap_or_default(),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let hooks = match root.get("hooks") {
+            Some(JsonValue::Array(items)) => items
+                .iter()
+                .filter_map(|item| {
+                    Some(HookRunRecord {
+                        phase: item.get("phase")?.as_str()?.to_string(),
+                        command: opt_s(item, "command").unwrap_or_default(),
+                        args: str_list(item.get("args")),
+                        exit_code: match item.get("exitCode") {
+                            Some(JsonValue::Number(n)) => Some(*n as i64),
+                            _ => None,
+                        },
+                        on_failure: opt_s(item, "onFailure").unwrap_or_else(|| "abort".to_string()),
+                        succeeded: item
+                            .get("succeeded")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         Some(InstallReceipt {
             app: get_s("app")?,
             version: get_s("version").unwrap_or_default(),
@@ -360,7 +625,14 @@ impl InstallReceipt {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
             start_at_login: opt_b("startAtLogin"),
+            // Receipts written before v7 parse with the safe default.
+            purge_data_default: opt_b("purgeDataDefault"),
             data_dirs: str_list(root.get("dataDirs")),
+            // Receipts written before v6 parse with empty power
+            // records (no components recorded = everything was core).
+            components: str_list(root.get("components")),
+            components_known: str_list(root.get("componentsKnown")),
+            hooks,
             artifacts: AppliedArtifacts {
                 shortcuts: str_list(artifacts.get("shortcuts")),
                 associations,
@@ -369,6 +641,9 @@ impl InstallReceipt {
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
                 start_at_login,
+                registry_writes,
+                env_writes,
+                pins,
             },
         })
     }
@@ -444,7 +719,22 @@ mod tests {
             launch_after_install_offered: true,
             launch_after_install_default: false,
             start_at_login: true,
+            purge_data_default: true,
             data_dirs: vec!["C:\\Users\\x\\AppData\\Roaming\\Test App".to_string()],
+            components: vec!["core".to_string(), "extras".to_string()],
+            components_known: vec![
+                "core".to_string(),
+                "extras".to_string(),
+                "engine".to_string(),
+            ],
+            hooks: vec![HookRunRecord {
+                phase: "postInstall".to_string(),
+                command: "finish.exe".to_string(),
+                args: vec!["--done".to_string()],
+                exit_code: Some(0),
+                on_failure: "abort".to_string(),
+                succeeded: true,
+            }],
             artifacts: AppliedArtifacts {
                 shortcuts: vec!["C:\\Users\\x\\Desktop\\Test App.lnk".to_string()],
                 associations: vec![AssocRecord {
@@ -460,6 +750,23 @@ mod tests {
                     command: "\"C:\\Apps\\Test App\\app.exe\"".to_string(),
                     prior_value: None,
                 }),
+                registry_writes: vec![RegWriteRecord {
+                    key: "Software\\Test App".to_string(),
+                    name: "Mode".to_string(),
+                    prior_kind: Some("dword".to_string()),
+                    prior_value: Some("3".to_string()),
+                    created_key: false,
+                }],
+                env_writes: vec![EnvWriteRecord {
+                    name: "TEST_APP_HOME".to_string(),
+                    prior_value: None,
+                    prior_type: 0,
+                }],
+                pins: vec![PinRecord {
+                    name: "Test App".to_string(),
+                    link_path: "C:\\Users\\x\\Desktop\\Test App.lnk".to_string(),
+                    outcome: "unavailable".to_string(),
+                }],
             },
         }
     }
@@ -484,6 +791,11 @@ mod tests {
         assert!(!receipt.start_at_login);
         assert!(receipt.data_dirs.is_empty());
         assert!(receipt.artifacts.start_at_login.is_none());
+        assert!(receipt.components.is_empty());
+        assert!(receipt.hooks.is_empty());
+        assert!(receipt.artifacts.registry_writes.is_empty());
+        assert!(receipt.artifacts.env_writes.is_empty());
+        assert!(receipt.artifacts.pins.is_empty());
     }
 
     #[test]

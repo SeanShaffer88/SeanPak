@@ -55,6 +55,17 @@ pub struct AssetInfo {
     pub sha256: String,
 }
 
+/// One component of a packed release (v6), with the packed size the
+/// packer's own codec produced for its files.
+#[derive(Debug, Clone)]
+pub struct ComponentInfo {
+    pub id: String,
+    pub name: String,
+    pub required: bool,
+    pub packed_size: u64,
+    pub file_count: usize,
+}
+
 #[derive(Debug)]
 pub struct PackOutcome {
     pub setup: AssetInfo,
@@ -63,6 +74,9 @@ pub struct PackOutcome {
     pub stub_bytes: u64,
     pub file_count: usize,
     pub total_payload_bytes: u64,
+    /// The package's components (v6): `core` first when the package
+    /// has unclaimed files, then the manifest's components in order.
+    pub components: Vec<ComponentInfo>,
 }
 
 /// One release packaging run. See the module docs for the contract.
@@ -132,6 +146,45 @@ pub fn pack(
             (abs.clone(), rel.clone(), is_primary)
         })
         .collect();
+
+    // v6 power block: the manifest's components / hooks / writes /
+    // shortcuts, embedded in the package. Component files and
+    // shortcut targets/icons must be among the packaged files — a
+    // component or shortcut pointing at a file that is not packed
+    // would install broken, so the pack refuses here.
+    let power = manifest.to_power_spec();
+    {
+        let chosen_rels: Vec<String> = chosen
+            .iter()
+            .map(|(_, rel)| rel.replace('\\', "/"))
+            .collect();
+        for component in &power.components {
+            for file in &component.files {
+                if !chosen_rels.iter().any(|rel| rel == file) {
+                    return Err(PackError::BadFiles(format!(
+                        "component \"{}\" lists \"{file}\" but it is not among the packaged files",
+                        component.id
+                    )));
+                }
+            }
+        }
+        for shortcut in &power.shortcuts {
+            if !chosen_rels.iter().any(|rel| rel == &shortcut.target) {
+                return Err(PackError::BadFiles(format!(
+                    "shortcut \"{}\" targets \"{}\" but it is not among the packaged files",
+                    shortcut.name, shortcut.target
+                )));
+            }
+            if let Some(icon) = &shortcut.icon {
+                if !chosen_rels.iter().any(|rel| rel == icon) {
+                    return Err(PackError::BadFiles(format!(
+                        "shortcut \"{}\" uses icon \"{icon}\" but it is not among the packaged files",
+                        shortcut.name
+                    )));
+                }
+            }
+        }
+    }
     let total_payload_bytes: u64 = files_arg
         .iter()
         .map(|(abs, _, _)| std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0))
@@ -157,7 +210,8 @@ pub fn pack(
     let temp_portable = temp_dir.join(&portable_name);
 
     let options = manifest.to_install_options();
-    let build_result = OverlayWriter::build_overlay(
+    let mut packed_power: Option<crate::overlay::PowerSpec> = None;
+    let build_result = OverlayWriter::build_overlay_with_power(
         stub_path,
         &temp_setup,
         files_dir,
@@ -166,12 +220,52 @@ pub fn pack(
         &manifest.version,
         &manifest.publisher,
         &options,
+        &power,
     )
-    .and_then(|_| write_portable_zip(&files_arg, &temp_portable));
+    .and_then(|(_, computed)| {
+        packed_power = Some(computed);
+        write_portable_zip(&files_arg, &temp_portable)
+    });
     if let Err(e) = build_result {
         cleanup(&temp_dir);
         return Err(PackError::Io(e));
     }
+    let packed_power = packed_power.unwrap_or(power);
+    let components: Vec<ComponentInfo> = {
+        // `core` first (when it owns files), sized from the records
+        // the writer just produced — recompute from the temp Setup.
+        let mut infos: Vec<ComponentInfo> = Vec::new();
+        let stream_len = std::fs::metadata(&temp_setup).map(|m| m.len()).unwrap_or(0);
+        if let Ok(Some((_, records, _, _))) =
+            std::fs::File::open(&temp_setup).and_then(OverlayReader::read_package_full)
+        {
+            if packed_power.has_core_files(&records) {
+                infos.push(ComponentInfo {
+                    id: crate::overlay::CORE_COMPONENT_ID.to_string(),
+                    name: "Core files".to_string(),
+                    required: true,
+                    packed_size: packed_power.core_packed_size(&records, stream_len),
+                    file_count: records
+                        .iter()
+                        .filter(|r| {
+                            packed_power.component_id_for_file(&r.relative_path())
+                                == crate::overlay::CORE_COMPONENT_ID
+                        })
+                        .count(),
+                });
+            }
+        }
+        for component in &packed_power.components {
+            infos.push(ComponentInfo {
+                id: component.id.clone(),
+                name: component.name.clone(),
+                required: component.required,
+                packed_size: component.packed_size,
+                file_count: component.files.len(),
+            });
+        }
+        infos
+    };
 
     let stub_bytes = std::fs::metadata(stub_path)?.len();
     std::fs::create_dir_all(out_dir)?;
@@ -238,6 +332,7 @@ pub fn pack(
         stub_bytes,
         file_count: files_arg.len(),
         total_payload_bytes,
+        components,
     })
 }
 
@@ -418,7 +513,7 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
         sane = false;
         sane_notes.push("primary exe index is out of range".to_string());
     }
-    if !(2..=5).contains(&manifest.version) {
+    if !(2..=6).contains(&manifest.version) {
         sane = false;
         sane_notes.push(format!("unsupported manifest version {}", manifest.version));
     }
@@ -559,11 +654,28 @@ pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
         Ok((out.status.success(), text))
     };
 
-    // 1. Silent install of the staged installer.
-    let (installed_ok, install_output) = match run(
-        &staged,
-        &["--install", "--to", &dir_arg, "--silent", "--json"],
-    ) {
+    // 1. Silent install of the staged installer. A package with
+    // components (v6) installs ALL of them explicitly: the check
+    // below compares every payload byte against the install, which a
+    // default selection (some components default off) would fail.
+    let mut install_args: Vec<String> = vec![
+        "--install".to_string(),
+        "--to".to_string(),
+        dir_arg.clone(),
+        "--silent".to_string(),
+        "--json".to_string(),
+    ];
+    if let Ok(Some((_, records, _, power))) =
+        std::fs::File::open(setup_path).and_then(OverlayReader::read_package_full)
+    {
+        if !power.components.is_empty() {
+            let all = power.part_ids(power.has_core_files(&records)).join(",");
+            install_args.push("--components".to_string());
+            install_args.push(all);
+        }
+    }
+    let install_arg_refs: Vec<&str> = install_args.iter().map(|s| s.as_str()).collect();
+    let (installed_ok, install_output) = match run(&staged, &install_arg_refs) {
         Ok(result) => result,
         Err(e) => {
             report.checks.push((
@@ -653,27 +765,40 @@ pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
         },
     ));
 
-    // 4. Residue: payload files and the receipt must be gone. The
-    // running uninstaller copy and its log are the known, reported
-    // leftovers (a process cannot delete its own running image).
+    // 4. Residue: everything the install OWNED (payload files + the
+    // receipt) must be gone. The running uninstaller copy and its log
+    // are known leftovers (a process cannot delete its own running
+    // image). Files an install hook created are NOT residue — hooks
+    // exist to make state the installer does not track, and their
+    // changes are never uninstalled — so they are reported in
+    // `leftovers` without failing the check.
     let mut remaining: Vec<String> = Vec::new();
     collect_relative_files(&install_dir, &install_dir, &mut remaining);
     remaining.sort();
     report.leftovers = remaining.clone();
-    let known = ["Uninstall.exe", "seanpak.log"];
-    let unexpected: Vec<&String> = remaining
+    let mut owned: Vec<String> = Vec::new();
+    if let Ok(Some((_, records, _, _))) =
+        std::fs::File::open(setup_path).and_then(OverlayReader::read_package_full)
+    {
+        owned.extend(records.iter().map(|r| r.relative_path().replace('\\', "/")));
+    }
+    owned.push(crate::receipt::RECEIPT_FILE_NAME.to_string());
+    let residue: Vec<&String> = remaining
         .iter()
-        .filter(|f| !known.contains(&f.replace('\\', "/").as_str()))
+        .filter(|f| owned.contains(&f.replace('\\', "/")))
         .collect();
     report.checks.push((
         "no install residue".to_string(),
-        unexpected.is_empty(),
-        if unexpected.is_empty() {
-            format!("only known leftovers remain: {}", remaining.join(", "))
+        residue.is_empty(),
+        if residue.is_empty() {
+            format!(
+                "install-owned files all removed; leftovers: {}",
+                remaining.join(", ")
+            )
         } else {
             format!(
-                "unexpected files left behind: {}",
-                unexpected
+                "install-owned files left behind: {}",
+                residue
                     .iter()
                     .map(|s| s.as_str())
                     .collect::<Vec<_>>()

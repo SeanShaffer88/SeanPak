@@ -33,6 +33,15 @@ pub struct ShortcutSpec {
     pub arguments: String,
     pub description: String,
     pub working_dir: PathBuf,
+    /// v6 rich shortcuts: the icon resource (install-dir file) and its
+    /// index inside that file. `None` = the target's own icon.
+    pub icon: Option<PathBuf>,
+    pub icon_index: i32,
+    /// v6 rich shortcuts: best-effort taskbar pin after the link is
+    /// created; the outcome is journaled, never an install failure.
+    pub pin: bool,
+    /// Display label for messages and the pin journal record.
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -118,6 +127,13 @@ pub fn path_remove_segment(path_value: &str, segment: &str) -> String {
 /// Builds the artifact plan. `desktop_root` / `programs_root` are the
 /// user's Desktop and Start Menu Programs folders (None when unknown —
 /// off Windows they are always None, so no shortcuts are planned).
+///
+/// `power` + `selection` (v6) add the manifest's rich shortcuts: a
+/// rich shortcut is planned only when its target's component is in
+/// `selection` (`None` = no component filtering — pre-v6 packages and
+/// component-free calls). Start Menu rich shortcuts live in the same
+/// folder as the automatic Start Menu shortcut.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_with_roots(
     options: &InstallOptions,
     app_name: &str,
@@ -125,6 +141,8 @@ pub fn plan_with_roots(
     primary_rel: Option<&str>,
     desktop_root: Option<&Path>,
     programs_root: Option<&Path>,
+    power: &crate::overlay::PowerSpec,
+    selection: Option<&[String]>,
 ) -> ArtifactPlan {
     let mut plan = ArtifactPlan {
         prog_id: prog_id_for(app_name),
@@ -134,6 +152,15 @@ pub fn plan_with_roots(
     if options.wants_path_entry() {
         plan.path_dir = Some(dest.to_path_buf());
     }
+    let start_menu_dir = programs_root.map(|programs| {
+        let folder = options.start_menu_folder();
+        let folder = if folder.trim().is_empty() {
+            app_name.to_string()
+        } else {
+            folder
+        };
+        programs.join(folder)
+    });
     if let Some(primary) = primary_rel {
         let target = dest.join(primary.replace('\\', "/"));
         plan.primary_target = Some(target.clone());
@@ -145,24 +172,25 @@ pub fn plan_with_roots(
                     arguments: String::new(),
                     description: format!("Open {app_name}"),
                     working_dir: dest.to_path_buf(),
+                    icon: None,
+                    icon_index: 0,
+                    pin: false,
+                    label: app_name.to_string(),
                 });
             }
         }
         if options.wants_start_menu_shortcut() {
-            if let Some(programs) = programs_root {
-                let folder = options.start_menu_folder();
-                let folder = if folder.trim().is_empty() {
-                    app_name.to_string()
-                } else {
-                    folder
-                };
-                let dir = programs.join(&folder);
+            if let Some(dir) = &start_menu_dir {
                 plan.shortcuts.push(ShortcutSpec {
                     link_path: dir.join(format!("{app_name}.lnk")),
                     target: target.clone(),
                     arguments: String::new(),
                     description: format!("Open {app_name}"),
                     working_dir: dest.to_path_buf(),
+                    icon: None,
+                    icon_index: 0,
+                    pin: false,
+                    label: app_name.to_string(),
                 });
                 plan.shortcuts.push(ShortcutSpec {
                     link_path: dir.join(format!("Uninstall {app_name}.lnk")),
@@ -170,7 +198,53 @@ pub fn plan_with_roots(
                     arguments: format!("--uninstall --to \"{}\"", dest.display()),
                     description: format!("Uninstall {app_name}"),
                     working_dir: dest.to_path_buf(),
+                    icon: None,
+                    icon_index: 0,
+                    pin: false,
+                    label: format!("Uninstall {app_name}"),
                 });
+            }
+        }
+    }
+    // Rich shortcuts (v6): planned alongside the automatic ones, in
+    // manifest order, when their target's component is installed.
+    for rich in &power.shortcuts {
+        if let Some(sel) = selection {
+            let owner = power.component_id_for_file(&rich.target);
+            if !sel.iter().any(|id| id == &owner) {
+                continue;
+            }
+        }
+        let target = dest.join(rich.target.replace('\\', "/"));
+        let icon = rich
+            .icon
+            .as_ref()
+            .map(|icon| dest.join(icon.replace('\\', "/")));
+        let mut push = |root: &Path| {
+            plan.shortcuts.push(ShortcutSpec {
+                link_path: root.join(format!("{}.lnk", rich.name)),
+                target: target.clone(),
+                arguments: rich.arguments.clone(),
+                description: if rich.description.is_empty() {
+                    format!("Open {}", rich.name)
+                } else {
+                    rich.description.clone()
+                },
+                working_dir: dest.to_path_buf(),
+                icon: icon.clone(),
+                icon_index: rich.icon_index,
+                pin: rich.pin,
+                label: rich.name.clone(),
+            });
+        };
+        if rich.location.wants_desktop() {
+            if let Some(desktop) = desktop_root {
+                push(desktop);
+            }
+        }
+        if rich.location.wants_start_menu() {
+            if let Some(dir) = &start_menu_dir {
+                push(dir);
             }
         }
     }
@@ -184,6 +258,8 @@ pub fn plan_artifacts(
     app_name: &str,
     dest: &Path,
     primary_rel: Option<&str>,
+    power: &crate::overlay::PowerSpec,
+    selection: Option<&[String]>,
 ) -> ArtifactPlan {
     #[cfg(windows)]
     {
@@ -194,11 +270,22 @@ pub fn plan_artifacts(
             primary_rel,
             win::desktop_folder().as_deref(),
             win::programs_folder().as_deref(),
+            power,
+            selection,
         )
     }
     #[cfg(not(windows))]
     {
-        plan_with_roots(options, app_name, dest, primary_rel, None, None)
+        plan_with_roots(
+            options,
+            app_name,
+            dest,
+            primary_rel,
+            None,
+            None,
+            power,
+            selection,
+        )
     }
 }
 
@@ -223,6 +310,28 @@ pub fn apply_artifacts(
             applied
                 .shortcuts
                 .push(spec.link_path.to_string_lossy().into_owned());
+            if spec.pin {
+                // Best-effort taskbar pin (v6): some Windows versions
+                // refuse programmatic pinning outright. Either way the
+                // outcome is journaled — never an install failure.
+                let outcome = if win::pin_to_taskbar(&spec.link_path) {
+                    "pinned"
+                } else {
+                    "unavailable"
+                };
+                crate::diag::record(
+                    "taskbar-pin",
+                    vec![
+                        ("shortcut", crate::manifest::jstr(spec.label.clone())),
+                        ("outcome", crate::manifest::jstr(outcome)),
+                    ],
+                );
+                applied.pins.push(crate::receipt::PinRecord {
+                    name: spec.label.clone(),
+                    link_path: spec.link_path.to_string_lossy().into_owned(),
+                    outcome: outcome.to_string(),
+                });
+            }
         }
         if !plan.associations.is_empty() {
             let primary_target = plan
@@ -264,6 +373,18 @@ pub fn apply_artifacts(
     Ok(AppliedArtifacts::default())
 }
 
+/// Tells running programs the per-user environment changed — the
+/// same broadcast the PATH entry applies (used by the v6 environment
+/// writes in `crate::writes`). No-op off Windows.
+#[cfg(windows)]
+pub fn broadcast_env_change() {
+    win::broadcast_environment_change();
+}
+
+/// See the Windows form.
+#[cfg(not(windows))]
+pub fn broadcast_env_change() {}
+
 /// Undoes exactly what a journal records. Best-effort and careful:
 /// associations are only reverted while they still point at the
 /// journal's ProgId, PATH loses only the recorded segment, and shortcut
@@ -290,6 +411,9 @@ pub fn remove_artifacts(artifacts: &AppliedArtifacts) {
         if let Some(record) = &artifacts.start_at_login {
             win::remove_run_entry(record);
         }
+        // Journaled registry + environment writes (v6) restore their
+        // recorded priors (their own module owns the registry work).
+        crate::writes::remove_writes(&artifacts.registry_writes, &artifacts.env_writes);
     }
 }
 
@@ -608,6 +732,18 @@ mod win {
                 }
             }
             if result.is_ok() {
+                if let Some(icon) = &spec.icon {
+                    let hr = ((*vtbl).set_icon_location)(
+                        link,
+                        wide(&icon.to_string_lossy()).as_ptr(),
+                        spec.icon_index,
+                    );
+                    if hr < 0 {
+                        result = Err(fail(hr, "SetIconLocation"));
+                    }
+                }
+            }
+            if result.is_ok() {
                 let mut persist: ComPtr = std::ptr::null_mut();
                 let hr = ((*vtbl).query_interface)(link, &IID_IPERSIST_FILE, &mut persist);
                 if hr < 0 || persist.is_null() {
@@ -628,6 +764,37 @@ mod win {
             ((*vtbl).release)(link);
             result
         }
+    }
+
+    /// Best-effort taskbar pin: invokes the shell's `taskbarpin` verb
+    /// on the link file. Windows restricts programmatic pinning (the
+    /// verb is absent or refused on many builds), so any failure is
+    /// simply `false` — the caller journals the outcome and moves on.
+    pub fn pin_to_taskbar(link_path: &Path) -> bool {
+        // SEE_MASK_INVOKEIDLIST: required for context-menu verbs.
+        const SEE_MASK_INVOKEIDLIST_FLAG: u32 = 0x0000_000C;
+        let file = wide(&link_path.to_string_lossy());
+        let verb = wide("taskbarpin");
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_INVOKEIDLIST_FLAG,
+            hwnd: std::ptr::null_mut(),
+            lpVerb: verb.as_ptr(),
+            lpFile: file.as_ptr(),
+            lpParameters: std::ptr::null(),
+            lpDirectory: std::ptr::null(),
+            nShow: 0,
+            hInstApp: std::ptr::null_mut(),
+            lpIDList: std::ptr::null_mut(),
+            lpClass: std::ptr::null(),
+            hkeyClass: std::ptr::null_mut(),
+            dwHotKey: 0,
+            Anonymous: SHELLEXECUTEINFOW_0 {
+                hIcon: std::ptr::null_mut(),
+            },
+            hProcess: std::ptr::null_mut(),
+        };
+        unsafe { ShellExecuteExW(&mut info) != 0 }
     }
 
     // -- File associations --------------------------------------------------
@@ -679,7 +846,7 @@ mod win {
 
     // -- PATH (HKCU\Environment) ---------------------------------------------
 
-    fn broadcast_environment_change() {
+    pub fn broadcast_environment_change() {
         unsafe {
             let env_wide = wide("Environment");
             let mut result: usize = 0;
@@ -810,6 +977,8 @@ mod tests {
             Some("myapp.exe"),
             Some(Path::new("C:\\Users\\x\\Desktop")),
             Some(Path::new("C:\\Users\\x\\Programs")),
+            &crate::overlay::PowerSpec::default(),
+            None,
         );
         assert_eq!(plan.shortcuts.len(), 3); // desktop + start menu app + start menu uninstall
         assert_eq!(
@@ -832,10 +1001,20 @@ mod tests {
     #[test]
     fn plan_start_at_login_follows_the_effective_choice() {
         let dest = Path::new("C:\\Apps\\My App");
+        let no_power = crate::overlay::PowerSpec::default();
         let mut options = InstallOptions::defaults_for("My App");
         options.start_at_login = 1;
         options.start_at_login_default = 1;
-        let plan = plan_with_roots(&options, "My App", dest, Some("myapp.exe"), None, None);
+        let plan = plan_with_roots(
+            &options,
+            "My App",
+            dest,
+            Some("myapp.exe"),
+            None,
+            None,
+            &no_power,
+            None,
+        );
         assert!(plan.start_at_login);
         assert_eq!(
             plan.primary_target.as_deref(),
@@ -844,13 +1023,105 @@ mod tests {
 
         // Offered but defaulted off (or turned off in the wizard): no entry.
         options.start_at_login_default = 0;
-        let plan = plan_with_roots(&options, "My App", dest, Some("myapp.exe"), None, None);
+        let plan = plan_with_roots(
+            &options,
+            "My App",
+            dest,
+            Some("myapp.exe"),
+            None,
+            None,
+            &no_power,
+            None,
+        );
         assert!(!plan.start_at_login);
 
         // No primary exe: nothing to point the Run entry at.
         options.start_at_login_default = 1;
-        let plan = plan_with_roots(&options, "My App", dest, None, None, None);
+        let plan = plan_with_roots(&options, "My App", dest, None, None, None, &no_power, None);
         assert!(!plan.start_at_login);
         assert!(plan.primary_target.is_none());
+    }
+
+    #[test]
+    fn plan_rich_shortcuts_follow_component_selection() {
+        use crate::overlay::{ComponentSpec, PowerSpec, RichShortcutSpec, ShortcutLocation};
+        let dest = Path::new("C:\\Apps\\My App");
+        let options = InstallOptions::defaults_for("My App");
+        let power = PowerSpec {
+            components: vec![ComponentSpec {
+                id: "extras".to_string(),
+                name: "Extras".to_string(),
+                description: String::new(),
+                files: vec!["extras/tool.exe".to_string()],
+                required: false,
+                default_selected: true,
+                packed_size: 1,
+            }],
+            shortcuts: vec![
+                RichShortcutSpec {
+                    name: "Tool".to_string(),
+                    target: "extras/tool.exe".to_string(),
+                    arguments: "--go".to_string(),
+                    icon: Some("extras/tool.exe".to_string()),
+                    icon_index: 2,
+                    description: String::new(),
+                    location: ShortcutLocation::Both,
+                    pin: true,
+                },
+                RichShortcutSpec {
+                    name: "Main".to_string(),
+                    target: "myapp.exe".to_string(),
+                    arguments: String::new(),
+                    icon: None,
+                    icon_index: 0,
+                    description: "The app".to_string(),
+                    location: ShortcutLocation::StartMenu,
+                    pin: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let desktop = Path::new("C:\\Users\\x\\Desktop");
+        let programs = Path::new("C:\\Users\\x\\Programs");
+        // No selection filter: both shortcuts, Tool in both places.
+        let plan = plan_with_roots(
+            &options,
+            "My App",
+            dest,
+            Some("myapp.exe"),
+            Some(desktop),
+            Some(programs),
+            &power,
+            None,
+        );
+        let rich: Vec<&ShortcutSpec> = plan
+            .shortcuts
+            .iter()
+            .filter(|s| s.label == "Tool" || s.label == "Main")
+            .collect();
+        assert_eq!(rich.len(), 3);
+        let tool = rich.iter().find(|s| s.label == "Tool").unwrap();
+        assert_eq!(tool.arguments, "--go");
+        assert_eq!(
+            tool.icon.as_deref(),
+            Some(dest.join("extras/tool.exe").as_path())
+        );
+        assert_eq!(tool.icon_index, 2);
+        assert!(tool.pin);
+        // Selection without the extras component: Tool disappears,
+        // the core-targeted Main stays.
+        let selection = vec!["core".to_string()];
+        let plan = plan_with_roots(
+            &options,
+            "My App",
+            dest,
+            Some("myapp.exe"),
+            Some(desktop),
+            Some(programs),
+            &power,
+            Some(&selection),
+        );
+        assert!(plan.shortcuts.iter().all(|s| s.label != "Tool"));
+        assert!(plan.shortcuts.iter().any(|s| s.label == "Main"));
     }
 }

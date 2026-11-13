@@ -406,7 +406,11 @@ mod tests {
             launch_after_install_offered: true,
             launch_after_install_default: true,
             start_at_login: false,
+            purge_data_default: false,
             data_dirs,
+            components: Vec::new(),
+            components_known: Vec::new(),
+            hooks: Vec::new(),
             artifacts: Default::default(),
         }
     }

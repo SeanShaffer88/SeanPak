@@ -30,6 +30,16 @@
 //!    offers it shows a "Launch <App>" checkbox (checked per the
 //!    package's default); closing with it checked starts the app.
 //!
+//! Two v7 additions share the same pages. **Modify mode**
+//! (`InstallWizard::modify`, reached from a bare `--modify` or the
+//! ARP entry's Modify button) re-opens the wizard on an existing
+//! install: the pages seed from the install's receipt (its current
+//! options, component selection, and login entry), the location is
+//! fixed, and the primary button — "Apply changes" — runs
+//! `crate::modify::perform_modify`. And the **answer-file offer**: an
+//! `answers.json` found beside the Setup.exe is offered on the Review
+//! page (Apply preset / Ignore) and applied only on the user's click.
+//!
 //! The module also hosts [`confirm_uninstall`]: the small native
 //! confirmation window an interactive uninstall opens — what will be
 //! removed, plus the opt-in data-deletion checkbox — in the same
@@ -45,7 +55,7 @@
 
 use std::path::PathBuf;
 
-use crate::overlay::{FileRecordHeader, InstallOptions, OverlayManifestHeader};
+use crate::overlay::{FileRecordHeader, InstallOptions, OverlayManifestHeader, PowerSpec};
 
 /// Builds the Rail review rows (Item / Value / Change) for a package.
 /// Pure and platform-independent so the table content is unit-tested.
@@ -61,15 +71,26 @@ pub fn review_rows(
     records: &[FileRecordHeader],
     install_dir_display: &str,
     location_writable: bool,
+    power: &PowerSpec,
+    selection: &[String],
 ) -> Vec<[String; 3]> {
     let primary = records
         .get(manifest.primary_exe_index as usize)
         .map(|r| r.relative_path());
-    let components = match (records.len(), primary) {
-        (0, _) => "No files".to_string(),
-        (1, Some(p)) => p,
-        (n, Some(p)) => format!("{p} + {} more files", n - 1),
-        (n, None) => format!("{n} files"),
+    // With declared components (v6) the Components row reports the
+    // selection ("2 of 3 parts"); required parts then get their own
+    // informational rows below it. Without components it keeps the
+    // plain file summary.
+    let components = if power.components.is_empty() {
+        match (records.len(), primary) {
+            (0, _) => "No files".to_string(),
+            (1, Some(p)) => p,
+            (n, Some(p)) => format!("{p} + {} more files", n - 1),
+            (n, None) => format!("{n} files"),
+        }
+    } else {
+        let total = power.part_ids(power.has_core_files(records)).len();
+        format!("{} of {total} parts", selection.len())
     };
     let start_menu = options.start_menu_folder();
     let start_menu = if start_menu.is_empty() {
@@ -100,6 +121,17 @@ pub fn review_rows(
     let mut rows = vec![
         location_row,
         ["Components".to_string(), components, "Choose…".to_string()],
+    ];
+    // Required components (v6) are informational rows: they are
+    // always installed, so there is nothing to change.
+    for component in power.components.iter().filter(|c| c.required) {
+        rows.push([
+            format!("Part: {}", component.name),
+            "Included (required)".to_string(),
+            String::new(),
+        ]);
+    }
+    rows.extend([
         [
             "Start Menu folder".to_string(),
             start_menu,
@@ -120,7 +152,23 @@ pub fn review_rows(
             yes_no(options.wants_path_entry()),
             "Toggle".to_string(),
         ],
-    ];
+    ]);
+    // Journaled writes (v6) summarize as count rows when the package
+    // declares any — informational; the receipt records the details.
+    if !power.registry_writes.is_empty() {
+        rows.push([
+            "Registry writes".to_string(),
+            format!("{} values", power.registry_writes.len()),
+            String::new(),
+        ]);
+    }
+    if !power.env_writes.is_empty() {
+        rows.push([
+            "Environment variables".to_string(),
+            format!("{} variables", power.env_writes.len()),
+            String::new(),
+        ]);
+    }
     // The start-at-login row exists only when the package offers the
     // option; it stays last.
     if options.offers_start_at_login() {
@@ -193,9 +241,13 @@ pub fn delete_uninstall_entry(_app_name: &str) {}
 
 /// The uninstall confirmation window, in the wizard's visual language:
 /// names what uninstall removes and — when the install recorded data
-/// directories — offers a checkbox (default UNCHECKED) to delete the
-/// app's data files too, listing the exact folders and warning that
-/// deleted data cannot be recovered.
+/// directories — offers a checkbox to delete the app's data files
+/// too, listing the exact folders and warning that deleted data
+/// cannot be recovered. The checkbox *starts* in the state
+/// `purge_default` carries (v7: the install receipt's recorded
+/// default, set at install time by an answer file's
+/// `purgeDataOnUninstall`); it is unchecked for every install that
+/// did not opt in, and the user always makes the final call here.
 ///
 /// Returns `Some(purge_data)` when the user confirms (the checkbox
 /// state), or `None` when the window is cancelled or closed — the
@@ -206,14 +258,22 @@ pub fn delete_uninstall_entry(_app_name: &str) {}
 /// Off Windows there is no native window; the function proceeds with
 /// the safe default (uninstall, keep data).
 #[cfg(windows)]
-pub fn confirm_uninstall(app_name: &str, data_dirs: &[PathBuf]) -> Option<bool> {
-    imp::confirm_uninstall(app_name, data_dirs)
+pub fn confirm_uninstall(
+    app_name: &str,
+    data_dirs: &[PathBuf],
+    purge_default: bool,
+) -> Option<bool> {
+    imp::confirm_uninstall(app_name, data_dirs, purge_default)
 }
 
 /// Off Windows there is no native window; proceeds with the safe
 /// default (uninstall, keep data). See the Windows form.
 #[cfg(not(windows))]
-pub fn confirm_uninstall(_app_name: &str, _data_dirs: &[PathBuf]) -> Option<bool> {
+pub fn confirm_uninstall(
+    _app_name: &str,
+    _data_dirs: &[PathBuf],
+    _purge_default: bool,
+) -> Option<bool> {
     Some(false)
 }
 
@@ -223,6 +283,12 @@ pub struct InstallWizard {
     records: Vec<FileRecordHeader>,
     options: InstallOptions,
     exe_path: PathBuf,
+    power: PowerSpec,
+    /// Modify mode (v7): the existing install's folder. The wizard
+    /// then seeds its pages from that install's receipt and its
+    /// primary button runs the shared modify operation instead of an
+    /// install.
+    modify_dir: Option<PathBuf>,
 }
 
 impl InstallWizard {
@@ -231,12 +297,36 @@ impl InstallWizard {
         records: Vec<FileRecordHeader>,
         options: InstallOptions,
         exe_path: PathBuf,
+        power: PowerSpec,
     ) -> Self {
         Self {
             manifest,
             records,
             options,
             exe_path,
+            power,
+            modify_dir: None,
+        }
+    }
+
+    /// The wizard in Modify mode for the install at `dest` (its
+    /// receipt must be there — the caller checks first and reports
+    /// the plain refusal when it is not).
+    pub fn modify(
+        manifest: OverlayManifestHeader,
+        records: Vec<FileRecordHeader>,
+        options: InstallOptions,
+        exe_path: PathBuf,
+        power: PowerSpec,
+        dest: PathBuf,
+    ) -> Self {
+        Self {
+            manifest,
+            records,
+            options,
+            exe_path,
+            power,
+            modify_dir: Some(dest),
         }
     }
 }
@@ -250,6 +340,8 @@ impl InstallWizard {
             std::mem::take(&mut self.records),
             self.options,
             self.exe_path.clone(),
+            std::mem::take(&mut self.power),
+            self.modify_dir.clone(),
         )
     }
 }
@@ -265,6 +357,8 @@ impl InstallWizard {
             self.records.len(),
             self.options.install_location(),
             self.exe_path.display().to_string(),
+            self.power.components.len(),
+            self.modify_dir.as_ref().map(|d| d.display().to_string()),
         );
         Err(1)
     }
@@ -285,7 +379,7 @@ mod imp {
 
     use super::{default_install_dir, review_rows, InstallOptions};
     use crate::install::{InstallOutcome, ProgressEvent};
-    use crate::overlay::{FileRecordHeader, OverlayManifestHeader};
+    use crate::overlay::{FileRecordHeader, OverlayManifestHeader, PowerSpec};
     use crate::scanner::format_bytes;
 
     // TesselGUI rev2 GitHub Dark palette (COLORREF is 0x00BBGGRR).
@@ -340,6 +434,15 @@ mod imp {
     // Progress page (page 3).
     const ID_LBL_PROGFILE: usize = 440;
     const ID_PROGRESS: usize = 441;
+
+    // Options-page component checkboxes (v6): a section label plus up
+    // to MAX_COMPONENT_BOXES checkboxes, one per OPTIONAL component,
+    // created only when the package declares any. Packages with more
+    // optional parts than boxes keep the extra parts at their current
+    // selection (the CLI's --components covers every part).
+    const ID_LBL_COMPONENTS: usize = 470;
+    const ID_CHK_COMPONENT_BASE: usize = 471;
+    const MAX_COMPONENT_BOXES: usize = 6;
     // Finish page (page 4).
     const ID_LBL_FINISH: usize = 450;
     const ID_CHK_LAUNCH: usize = 451;
@@ -351,6 +454,14 @@ mod imp {
     const ID_LBL_CONFIRM_WARN: usize = 464;
     const ID_BTN_CONFIRM: usize = 465;
     const ID_BTN_CONFIRM_CANCEL: usize = 466;
+
+    // The Review page's answer-file offer (v7): a label plus Apply /
+    // Ignore, shown only while a valid beside-the-exe answers.json is
+    // waiting for the user's decision (or, for an invalid one, the
+    // label alone explains why it was not used).
+    const ID_LBL_ANSWERS: usize = 480;
+    const ID_BTN_ANSWERS_APPLY: usize = 481;
+    const ID_BTN_ANSWERS_IGNORE: usize = 482;
 
     const OPTION_CONTROLS: [usize; 12] = [
         ID_LBL_LOC,
@@ -415,6 +526,13 @@ mod imp {
         options: InstallOptions,
         exe_path: PathBuf,
         install_dir: PathBuf,
+        /// The package's v6 power block (empty for older packages).
+        power: PowerSpec,
+        /// The component selection the install will use (v6): starts
+        /// at the resolved default (previous install's choices on an
+        /// upgrade, else manifest defaults); the Options page's
+        /// component checkboxes edit it.
+        component_selection: Vec<String>,
         /// Latest writability pre-flight verdict for `install_dir`
         /// (see `refresh_location_state`); starts optimistic and is
         /// recomputed whenever the Review/Options pages are shown or
@@ -436,6 +554,25 @@ mod imp {
         /// page is armed with a working "Launch <App>" checkbox (the
         /// package offers it and the install succeeded).
         launch_path: Option<PathBuf>,
+        /// Modify mode (v7): the wizard re-opened on the install in
+        /// `install_dir`; pages are seeded from its receipt and the
+        /// primary button applies a modify, not an install.
+        modify: bool,
+        /// The finished modify's outcome (Modify mode's `finish`).
+        modify_finish: Option<Result<crate::modify::ModifyOutcome, String>>,
+        /// A valid beside-the-exe answer file waiting for the user's
+        /// Apply / Ignore decision on the Review page (install mode
+        /// only; never applied silently).
+        answers: Option<crate::answers::Answers>,
+        /// Why a beside-the-exe answer file was NOT offered (it
+        /// exists but did not validate) — shown on the Review page.
+        answers_note: Option<String>,
+        /// The offer was answered (applied or ignored): the offer
+        /// controls hide and the choice is final for this run.
+        answers_decided: bool,
+        /// The uninstall data-purge default an applied preset chose;
+        /// recorded in the receipt by the install operation.
+        purge_data_default: bool,
     }
 
     static STATE: Mutex<Option<WizardState>> = Mutex::new(None);
@@ -454,8 +591,59 @@ mod imp {
         records: Vec<FileRecordHeader>,
         options: InstallOptions,
         exe_path: PathBuf,
+        power: PowerSpec,
+        modify_dir: Option<PathBuf>,
     ) -> Result<(), u32> {
-        let install_dir = default_install_dir(&options, &manifest.app_name());
+        let modify = modify_dir.is_some();
+        let mut options = options;
+        let mut install_dir = default_install_dir(&options, &manifest.app_name());
+        if let Some(dir) = &modify_dir {
+            // Modify mode: the pages show the install's CURRENT state
+            // — its receipt's recorded choices, not the package
+            // defaults — and the location is that install's folder.
+            install_dir = dir.clone();
+            if let Some(receipt) =
+                crate::receipt::read_receipt(dir).filter(|r| r.app == manifest.app_name())
+            {
+                options = crate::modify::options_from_receipt(&options, &receipt);
+            }
+        }
+        // The beside-the-exe answer file (install mode only): parsed
+        // now, offered on the Review page, applied only if the user
+        // clicks Apply. An invalid file is explained, never used.
+        let (answers_offer, answers_note) = if modify {
+            (None, None)
+        } else {
+            let candidate = exe_path
+                .parent()
+                .map(|p| p.join(crate::answers::ANSWERS_FILE_NAME));
+            match candidate {
+                Some(path) if path.is_file() => match crate::answers::load_answers(&path) {
+                    Ok(parsed) => (Some(parsed), None),
+                    Err(errors) => (None, Some(errors.join("; "))),
+                },
+                _ => (None, None),
+            }
+        };
+        // The starting component selection (v6): the previous
+        // install's choices when its receipt is at the destination,
+        // else the manifest defaults — the same resolution the shared
+        // operation performs, so the Review page shows the truth.
+        let component_selection = {
+            let previous_receipt =
+                crate::receipt::read_receipt(&install_dir).filter(|r| r.app == manifest.app_name());
+            let previous = previous_receipt
+                .as_ref()
+                .map(|r| (r.components.as_slice(), r.components_known.as_slice()));
+            let primary_rel = records
+                .get(manifest.primary_exe_index as usize)
+                .map(|r| r.relative_path());
+            power
+                .resolve_selection(None, &[], previous, &records, primary_rel.as_deref())
+                .unwrap_or_else(|_| {
+                    power.default_selection(previous, power.has_core_files(&records))
+                })
+        };
         if let Ok(mut guard) = STATE.lock() {
             *guard = Some(WizardState {
                 manifest,
@@ -463,6 +651,8 @@ mod imp {
                 options,
                 exe_path,
                 install_dir,
+                power,
+                component_selection,
                 location_ok: true,
                 page: 1,
                 installing: false,
@@ -471,6 +661,12 @@ mod imp {
                 progress: Arc::new(Mutex::new((0, 0, String::new()))),
                 finish: None,
                 launch_path: None,
+                modify,
+                modify_finish: None,
+                answers: answers_offer,
+                answers_note,
+                answers_decided: false,
+                purge_data_default: false,
             });
         }
         unsafe {
@@ -488,9 +684,13 @@ mod imp {
                 .ok()
                 .and_then(|g| g.as_ref().map(|s| s.manifest.app_name()))
                 .unwrap_or_else(|| "App".to_string());
-            let window_title: Vec<u16> = format!("{app_name} Setup — SeanPak\0")
-                .encode_utf16()
-                .collect();
+            let window_title: Vec<u16> = if modify {
+                format!("{app_name} Modify — SeanPak\0")
+            } else {
+                format!("{app_name} Setup — SeanPak\0")
+            }
+            .encode_utf16()
+            .collect();
 
             BG_BRUSH = CreateSolidBrush(COLOR_BG);
             SURFACE_BRUSH = CreateSolidBrush(COLOR_SURFACE);
@@ -799,6 +999,30 @@ mod imp {
             46,
             ID_LBL_INFO,
         );
+        // The answer-file offer row (v7): sits between the info box
+        // and the status line; show_page decides its visibility and
+        // text from the state's offer.
+        mk(&static_class, "", 0, 174, 420, 398, 22, ID_LBL_ANSWERS);
+        mk(
+            &button_class,
+            "Apply preset",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            584,
+            418,
+            120,
+            26,
+            ID_BTN_ANSWERS_APPLY,
+        );
+        mk(
+            &button_class,
+            "Ignore",
+            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            712,
+            418,
+            120,
+            26,
+            ID_BTN_ANSWERS_IGNORE,
+        );
         mk(&static_class, "", 0, 174, 458, 674, 22, ID_LBL_STATUS);
         mk(&static_class, "", SS_ETCHEDHORZ, RAIL_W, 486, 714, 2, 0);
         mk(
@@ -960,6 +1184,44 @@ mod imp {
             "Shortcuts, associations, the PATH entry, and the login entry are created for your user account only — no administrator rights needed — and uninstall removes exactly what install created.",
             0, 174, 404, 674, 48, ID_LBL_OPTNOTE,
         );
+        // Component checkboxes (v6): created only when the package
+        // declares OPTIONAL components (labels and check states are
+        // set by fill_options_controls). The block takes the note's
+        // space, so show_page hides the note when components show.
+        let optional_components = STATE
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|s| s.power.components.iter().filter(|c| !c.required).count())
+            })
+            .unwrap_or(0);
+        if optional_components > 0 {
+            mk(
+                &static_class,
+                "Components — optional parts of this package",
+                0,
+                174,
+                396,
+                674,
+                20,
+                ID_LBL_COMPONENTS,
+            );
+            for i in 0..MAX_COMPONENT_BOXES.min(optional_components) {
+                let x = 174 + (i % 2) as i32 * 338;
+                let y = 418 + (i / 2) as i32 * 22;
+                mk(
+                    &button_class,
+                    "Component",
+                    WS_TABSTOP | BS_AUTOCHECKBOX,
+                    x,
+                    y,
+                    330,
+                    22,
+                    ID_CHK_COMPONENT_BASE + i,
+                );
+            }
+        }
 
         // ---- Page 3: Progress ----
         mk(
@@ -1019,6 +1281,42 @@ mod imp {
         // Review group.
         show(ID_LIST, page == 1);
         show(ID_LBL_INFO, page == 1);
+        // The answer-file offer (v7): the label shows while an offer
+        // is pending or an invalid file needs explaining; the buttons
+        // only while a valid preset awaits the user's decision.
+        let (offer_pending, answers_note) = STATE
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref().map(|s| {
+                    (
+                        s.answers.is_some() && !s.answers_decided,
+                        s.answers_note.clone(),
+                    )
+                })
+            })
+            .unwrap_or((false, None));
+        show(
+            ID_LBL_ANSWERS,
+            page == 1 && (offer_pending || answers_note.is_some()),
+        );
+        show(ID_BTN_ANSWERS_APPLY, page == 1 && offer_pending);
+        show(ID_BTN_ANSWERS_IGNORE, page == 1 && offer_pending);
+        if page == 1 {
+            if offer_pending {
+                set_text(
+                    hwnd,
+                    ID_LBL_ANSWERS,
+                    "A preset file (answers.json) was found beside this installer.",
+                );
+            } else if let Some(note) = &answers_note {
+                set_text(
+                    hwnd,
+                    ID_LBL_ANSWERS,
+                    &format!("The answers.json beside this installer is invalid and was not used: {note}"),
+                );
+            }
+        }
         // Options group.
         for id in OPTION_CONTROLS {
             show(id, page == 2);
@@ -1031,6 +1329,26 @@ mod imp {
             .and_then(|g| g.as_ref().map(|s| s.options.offers_start_at_login()))
             .unwrap_or(false);
         show(ID_CHK_LOGIN, page == 2 && login_offered);
+        // Component checkboxes (v6) join page 2 when the package has
+        // optional components — and take the options note's space.
+        let optional_components = STATE
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|s| s.power.components.iter().filter(|c| !c.required).count())
+            })
+            .unwrap_or(0);
+        show(ID_LBL_COMPONENTS, page == 2 && optional_components > 0);
+        for i in 0..MAX_COMPONENT_BOXES {
+            show(
+                ID_CHK_COMPONENT_BASE + i,
+                page == 2 && i < optional_components,
+            );
+        }
+        if optional_components > 0 {
+            show(ID_LBL_OPTNOTE, false);
+        }
         // Progress group.
         show(ID_LBL_PROGFILE, page == 3);
         show(ID_PROGRESS, page == 3);
@@ -1059,10 +1377,21 @@ mod imp {
                 "Cancel"
             },
         );
+        let modify = STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.modify))
+            .unwrap_or(false);
         set_text(
             hwnd,
             ID_BTN_INSTALL,
-            if page == 4 { "Close" } else { "Install" },
+            if page == 4 {
+                "Close"
+            } else if modify {
+                "Apply changes"
+            } else {
+                "Install"
+            },
         );
         set_text(
             hwnd,
@@ -1079,6 +1408,7 @@ mod imp {
             ID_LBL_HEADER,
             match page {
                 2 => "Options",
+                3 if modify => "Modifying",
                 3 => "Installing",
                 4 => "Finish",
                 _ => "Review",
@@ -1088,15 +1418,28 @@ mod imp {
             hwnd,
             ID_LBL_SUBTITLE,
             match page {
+                2 if modify => {
+                    "The current install's choices — change any option, then apply. The location is fixed: Modify works on the install that is already there."
+                }
                 2 => "Change any option — install uses exactly these choices.",
+                3 if modify => "Applying changes — cancelling rolls back to the current state.",
                 3 => "Installing — cancelling rolls back every change.",
+                4 if modify => "The changes have been applied.",
                 4 => "The install has finished.",
+                _ if modify => {
+                    "This app is already installed here — the rows show its current state. Change parts or options, then apply."
+                }
                 _ => "Check the install options — change anything before you install.",
             },
         );
         update_rail(hwnd, page);
         if page == 2 {
             fill_options_controls(hwnd);
+            // Modify never moves an install: the location edit and
+            // its Browse button are disabled (the operation refuses
+            // a different destination by construction).
+            set_enabled(hwnd, ID_EDT_LOCATION, !modify);
+            set_enabled(hwnd, ID_BTN_BROWSE, !modify);
         }
         if page == 1 || page == 2 {
             refresh_location_state(hwnd);
@@ -1298,6 +1641,33 @@ mod imp {
         set_check(hwnd, ID_CHK_LOGIN, options.start_at_login_default_checked());
         set_text(hwnd, ID_EDT_SMFOLDER, &options.start_menu_folder());
         set_text(hwnd, ID_EDT_ASSOC, &options.file_associations());
+        // Component checkboxes (v6): one per optional component, in
+        // manifest order — the name plus the packed size it adds.
+        let components = STATE.lock().ok().and_then(|g| {
+            g.as_ref().map(|s| {
+                (
+                    s.power
+                        .components
+                        .iter()
+                        .filter(|c| !c.required)
+                        .map(|c| (c.id.clone(), c.name.clone(), c.packed_size))
+                        .collect::<Vec<_>>(),
+                    s.component_selection.clone(),
+                )
+            })
+        });
+        if let Some((optional, selection)) = components {
+            for (i, (id, name, packed_size)) in
+                optional.iter().enumerate().take(MAX_COMPONENT_BOXES)
+            {
+                set_text(
+                    hwnd,
+                    ID_CHK_COMPONENT_BASE + i,
+                    &format!("{name} ({})", format_bytes(*packed_size)),
+                );
+                set_check(hwnd, ID_CHK_COMPONENT_BASE + i, selection.contains(id));
+            }
+        }
     }
 
     /// Page 2 controls → state (called when leaving the page to
@@ -1310,6 +1680,9 @@ mod imp {
         let login = get_check(hwnd, ID_CHK_LOGIN);
         let sm_folder = get_text(hwnd, ID_EDT_SMFOLDER);
         let associations = get_text(hwnd, ID_EDT_ASSOC);
+        let component_checks: Vec<bool> = (0..MAX_COMPONENT_BOXES)
+            .map(|i| get_check(hwnd, ID_CHK_COMPONENT_BASE + i))
+            .collect();
         if let Ok(mut g) = STATE.lock() {
             if let Some(s) = g.as_mut() {
                 if !location.trim().is_empty() {
@@ -1328,6 +1701,38 @@ mod imp {
                 }
                 set_fixed_str(&mut s.options.start_menu_folder_utf8, sm_folder.trim());
                 set_fixed_str(&mut s.options.file_associations_utf8, associations.trim());
+                // Component selection (v6): optional parts follow
+                // their checkboxes; parts beyond the visible boxes
+                // keep their state, and required parts and `core`
+                // are never removed here (the operation enforces
+                // them regardless). The result is stored in canonical
+                // part order.
+                if !s.power.components.is_empty() {
+                    let optional_ids: Vec<String> = s
+                        .power
+                        .components
+                        .iter()
+                        .filter(|c| !c.required)
+                        .map(|c| c.id.clone())
+                        .collect();
+                    let mut selection = s.component_selection.clone();
+                    for (i, id) in optional_ids.iter().enumerate().take(MAX_COMPONENT_BOXES) {
+                        if component_checks.get(i).copied().unwrap_or(true) {
+                            if !selection.contains(id) {
+                                selection.push(id.clone());
+                            }
+                        } else {
+                            selection.retain(|x| x != id);
+                        }
+                    }
+                    let include_core = s.power.has_core_files(&s.records);
+                    s.component_selection = s
+                        .power
+                        .part_ids(include_core)
+                        .into_iter()
+                        .filter(|id| selection.contains(id))
+                        .collect();
+                }
             }
         }
     }
@@ -1374,6 +1779,8 @@ mod imp {
                     &s.records,
                     &s.install_dir.to_string_lossy(),
                     s.location_ok,
+                    &s.power,
+                    &s.component_selection,
                 )
             })
         });
@@ -1580,6 +1987,20 @@ mod imp {
                         }
                     }
                     ID_BTN_INSTALL => on_install_click(hwnd),
+                    ID_BTN_ANSWERS_APPLY => on_answers_apply(hwnd),
+                    ID_BTN_ANSWERS_IGNORE => {
+                        if let Ok(mut g) = STATE.lock() {
+                            if let Some(s) = g.as_mut() {
+                                s.answers_decided = true;
+                            }
+                        }
+                        show_page(hwnd, 1);
+                        set_text(
+                            hwnd,
+                            ID_LBL_STATUS,
+                            "Preset ignored — the package defaults stay in charge.",
+                        );
+                    }
                     _ => {}
                 }
                 0
@@ -1678,6 +2099,65 @@ mod imp {
 
     /// Completion message from the worker: land on the Finish page.
     unsafe fn on_done_message(hwnd: HWND) {
+        // Modify mode has its own outcome slot and Finish text.
+        let is_modify = STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.modify))
+            .unwrap_or(false);
+        if is_modify {
+            let finish = STATE.lock().ok().and_then(|mut g| {
+                g.as_mut().and_then(|s| {
+                    s.installing = false;
+                    s.modify_finish.take()
+                })
+            });
+            let Some(finish) = finish else {
+                return;
+            };
+            match &finish {
+                Ok(outcome) => {
+                    if let Ok(mut g) = STATE.lock() {
+                        if let Some(s) = g.as_mut() {
+                            s.installed = true;
+                        }
+                    }
+                    crate::diag::log(
+                        "wizard",
+                        &format!(
+                            "modify ok: {} added, {} removed at {}",
+                            outcome.files_added,
+                            outcome.files_removed,
+                            outcome.dest.display()
+                        ),
+                    );
+                    let text = format!(
+                        "Modified {} {} at {}.\r\n\r\n{} file(s) added, {} removed.\r\nParts now installed: {}\r\nReceipt: {}\r\n\r\nRemove it any time from Windows Settings \u{2192} Apps, or by running Uninstall.exe in the install folder.",
+                        outcome.app_name,
+                        outcome.version,
+                        outcome.dest.display(),
+                        outcome.files_added,
+                        outcome.files_removed,
+                        outcome.components_after.join(", "),
+                        outcome.receipt_path.display(),
+                    );
+                    set_text(hwnd, ID_LBL_FINISH, &text);
+                }
+                Err(e) => {
+                    crate::diag::log("wizard", &format!("modify failed: {e}"));
+                    let text = if e.starts_with("Modify cancelled") {
+                        format!("Modify cancelled.\r\n\r\n{e}")
+                    } else {
+                        format!(
+                            "Modify failed.\r\n\r\n{e}\r\n\r\nEvery change was rolled back; the previous install state was kept."
+                        )
+                    };
+                    set_text(hwnd, ID_LBL_FINISH, &text);
+                }
+            }
+            show_page(hwnd, 4);
+            return;
+        }
         let finish = STATE.lock().ok().and_then(|mut g| {
             g.as_mut().and_then(|s| {
                 s.installing = false;
@@ -1782,20 +2262,11 @@ mod imp {
     }
 
     unsafe fn on_row_activate(hwnd: HWND) {
-        let (busy, installed, page, login_offered) = STATE
+        let (busy, installed, page) = STATE
             .lock()
             .ok()
-            .and_then(|g| {
-                g.as_ref().map(|s| {
-                    (
-                        s.installing,
-                        s.installed,
-                        s.page,
-                        s.options.offers_start_at_login(),
-                    )
-                })
-            })
-            .unwrap_or((true, true, 1, false));
+            .and_then(|g| g.as_ref().map(|s| (s.installing, s.installed, s.page)))
+            .unwrap_or((true, true, 1));
         if busy || installed || page != 1 {
             return;
         }
@@ -1841,18 +2312,110 @@ mod imp {
                 return;
             }
         }
-        // Rows with a real Change action route to the Options page:
-        // 0 location, 2 Start Menu folder, 3 desktop shortcut,
-        // 4 associations, 5 PATH, and 6 Start at login when the
-        // package offers it. Components (1) is informational.
-        let login_row: Option<isize> = if login_offered { Some(6) } else { None };
-        match selected {
-            0 | 2 | 3 | 4 | 5 => show_page(hwnd, 2),
-            sel if Some(sel) == login_row => show_page(hwnd, 2),
+        // Rows dispatch on their Item text, not their position: v6
+        // packages insert required-part rows and the writes summaries
+        // between the fixed rows, so positions shift. Rows with a
+        // real Change action route to the Options page; the rest are
+        // informational and explain themselves in the status line.
+        let item = STATE.lock().ok().and_then(|g| {
+            g.as_ref().and_then(|s| {
+                let rows = review_rows(
+                    &s.manifest,
+                    &s.options,
+                    &s.records,
+                    &s.install_dir.to_string_lossy(),
+                    s.location_ok,
+                    &s.power,
+                    &s.component_selection,
+                );
+                rows.get(selected as usize).map(|row| row[0].clone())
+            })
+        });
+        match item.as_deref() {
+            Some(
+                "Install location"
+                | "Components"
+                | "Start Menu folder"
+                | "Desktop shortcut"
+                | "File associations"
+                | "PATH entry"
+                | "Start at login",
+            ) => show_page(hwnd, 2),
+            Some(name) if name.starts_with("Part: ") => set_text(
+                hwnd,
+                ID_LBL_STATUS,
+                "That part is required — it is always installed. Optional parts are chosen on the Options page.",
+            ),
+            Some("Registry writes") | Some("Environment variables") => set_text(
+                hwnd,
+                ID_LBL_STATUS,
+                "The package declares these writes. They are applied on install and recorded in the receipt; uninstall restores what was there.",
+            ),
             _ => set_text(
                 hwnd,
                 ID_LBL_STATUS,
-                "That row is informational — the package decides its components.",
+                "That row is informational — there is nothing to change.",
+            ),
+        }
+    }
+
+    /// The Review page's Apply-preset button: the beside-the-exe
+    /// answer file's choices land on the wizard state exactly as if
+    /// the user had made them on the Options page — options, the
+    /// location (when the preset names one), the component
+    /// selection, and the uninstall data-purge default the receipt
+    /// will record. Nothing here runs without this click: the offer
+    /// is the whole point.
+    unsafe fn on_answers_apply(hwnd: HWND) {
+        let answers = STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s.answers.clone()));
+        let Some(answers) = answers else {
+            return;
+        };
+        let mut selection_error: Option<String> = None;
+        if let Ok(mut g) = STATE.lock() {
+            if let Some(s) = g.as_mut() {
+                answers.apply_to_options(&mut s.options);
+                if let Some(location) = &answers.install_location {
+                    s.install_dir = PathBuf::from(location);
+                }
+                if answers.components.is_some() || !answers.without_components.is_empty() {
+                    let primary_rel = s
+                        .records
+                        .get(s.manifest.primary_exe_index as usize)
+                        .map(|r| r.relative_path());
+                    match s.power.resolve_selection(
+                        answers.components.as_deref(),
+                        &answers.without_components,
+                        None,
+                        &s.records,
+                        primary_rel.as_deref(),
+                    ) {
+                        Ok(selection) => s.component_selection = selection,
+                        Err(e) => selection_error = Some(e),
+                    }
+                }
+                s.purge_data_default = answers.purge_data_on_uninstall;
+                s.answers_decided = true;
+            }
+        }
+        let list = GetDlgItem(hwnd, ID_LIST as i32);
+        if !list.is_null() {
+            fill_list(list);
+        }
+        show_page(hwnd, 1);
+        match &selection_error {
+            Some(e) => set_text(
+                hwnd,
+                ID_LBL_STATUS,
+                &format!("Preset applied, except its component selection: {e}"),
+            ),
+            None => set_text(
+                hwnd,
+                ID_LBL_STATUS,
+                "Preset applied — the Review rows and the Options page now show its choices.",
             ),
         }
     }
@@ -1930,7 +2493,16 @@ mod imp {
     /// posted back to the UI thread (WM_APP_PROGRESS / WM_APP_DONE);
     /// the Cancel button sets the shared flag the operation polls.
     unsafe fn start_install(hwnd: HWND) {
-        let (exe_path, install_dir, options, cancel, progress) = match STATE.lock() {
+        let (
+            exe_path,
+            install_dir,
+            options,
+            cancel,
+            progress,
+            component_selection,
+            modify,
+            purge_data_default,
+        ) = match STATE.lock() {
             Ok(mut g) => match g.as_mut() {
                 Some(s) => {
                     s.installing = true;
@@ -1944,6 +2516,9 @@ mod imp {
                         s.options,
                         s.cancel.clone(),
                         s.progress.clone(),
+                        s.component_selection.clone(),
+                        s.modify,
+                        s.purge_data_default,
                     )
                 }
                 None => return,
@@ -1959,12 +2534,6 @@ mod imp {
         }
         let hwnd_value = hwnd as usize;
         std::thread::spawn(move || {
-            let request = crate::install::InstallRequest {
-                options_override: Some(options),
-                force: false,
-                repair: false,
-                start_at_login: None,
-            };
             let progress_slot = progress.clone();
             let mut on_progress = move |ev: &ProgressEvent| {
                 if let Ok(mut p) = progress_slot.lock() {
@@ -1974,16 +2543,50 @@ mod imp {
                     PostMessageW(hwnd_value as HWND, WM_APP_PROGRESS, 0, 0);
                 }
             };
-            let result = crate::install::perform_install_with(
-                &exe_path,
-                &install_dir,
-                &request,
-                Some(&mut on_progress),
-                Some(&cancel),
-            );
-            if let Ok(mut g) = STATE.lock() {
-                if let Some(s) = g.as_mut() {
-                    s.finish = Some(result);
+            if modify {
+                // Modify mode: the shared modify operation reconciles
+                // the existing install with the page's choices; its
+                // outcome lands in the modify slot on_done_message
+                // reads.
+                let request = crate::modify::ModifyRequest {
+                    options_override: Some(options),
+                    start_at_login: None,
+                    components: Some(component_selection),
+                    without_components: Vec::new(),
+                };
+                let result = crate::modify::perform_modify(
+                    &exe_path,
+                    &install_dir,
+                    &request,
+                    Some(&mut on_progress),
+                    Some(&cancel),
+                );
+                if let Ok(mut g) = STATE.lock() {
+                    if let Some(s) = g.as_mut() {
+                        s.modify_finish = Some(result);
+                    }
+                }
+            } else {
+                let request = crate::install::InstallRequest {
+                    options_override: Some(options),
+                    force: false,
+                    repair: false,
+                    start_at_login: None,
+                    components: Some(component_selection),
+                    without_components: Vec::new(),
+                    purge_data_default,
+                };
+                let result = crate::install::perform_install_with(
+                    &exe_path,
+                    &install_dir,
+                    &request,
+                    Some(&mut on_progress),
+                    Some(&cancel),
+                );
+                if let Ok(mut g) = STATE.lock() {
+                    if let Some(s) = g.as_mut() {
+                        s.finish = Some(result);
+                    }
                 }
             }
             unsafe {
@@ -2001,13 +2604,21 @@ mod imp {
     struct ConfirmState {
         app_name: String,
         data_dirs: Vec<String>,
+        /// The data-purge checkbox's starting state (the receipt's
+        /// recorded default; unchecked unless an answer file opted
+        /// in at install time).
+        purge_default: bool,
         /// None until the user confirms; Cancel/close leaves it None.
         result: Option<bool>,
     }
 
     static CONFIRM_STATE: Mutex<Option<ConfirmState>> = Mutex::new(None);
 
-    pub fn confirm_uninstall(app_name: &str, data_dirs: &[PathBuf]) -> Option<bool> {
+    pub fn confirm_uninstall(
+        app_name: &str,
+        data_dirs: &[PathBuf],
+        purge_default: bool,
+    ) -> Option<bool> {
         if let Ok(mut g) = CONFIRM_STATE.lock() {
             *g = Some(ConfirmState {
                 app_name: app_name.to_string(),
@@ -2015,6 +2626,7 @@ mod imp {
                     .iter()
                     .map(|d| d.to_string_lossy().into_owned())
                     .collect(),
+                purge_default,
                 result: None,
             });
         }
@@ -2114,14 +2726,14 @@ mod imp {
     unsafe fn create_confirm_controls(parent: HWND, instance: HINSTANCE) {
         let static_class: Vec<u16> = "STATIC\0".encode_utf16().collect();
         let button_class: Vec<u16> = "BUTTON\0".encode_utf16().collect();
-        let (app_name, data_dirs) = CONFIRM_STATE
+        let (app_name, data_dirs, purge_default) = CONFIRM_STATE
             .lock()
             .ok()
             .and_then(|g| {
                 g.as_ref()
-                    .map(|s| (s.app_name.clone(), s.data_dirs.clone()))
+                    .map(|s| (s.app_name.clone(), s.data_dirs.clone(), s.purge_default))
             })
-            .unwrap_or_else(|| ("App".to_string(), Vec::new()));
+            .unwrap_or_else(|| ("App".to_string(), Vec::new(), false));
         let mk =
             |class: &[u16], text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: usize| {
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -2174,7 +2786,7 @@ mod imp {
             ID_LBL_CONFIRM_BODY,
         );
         if !data_dirs.is_empty() {
-            mk(
+            let purge_box = mk(
                 &button_class,
                 &format!("Also delete {app_name}'s data files"),
                 WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -2184,6 +2796,11 @@ mod imp {
                 24,
                 ID_CHK_PURGE,
             );
+            // The checkbox starts in the receipt-recorded state; the
+            // user still decides here, every time.
+            if purge_default {
+                SendMessageW(purge_box, BM_SETCHECK_MSG, BST_CHECKED_STATE, 0);
+            }
             mk(
                 &static_class,
                 &data_dirs.join("\r\n"),
@@ -2326,7 +2943,15 @@ mod tests {
         options.desktop_shortcut = 0;
         options.path_entry = 1;
         set_fixed(&mut options.file_associations_utf8, ".txt");
-        let rows = review_rows(&manifest, &options, &records, "C:\\Apps\\Test App", true);
+        let rows = review_rows(
+            &manifest,
+            &options,
+            &records,
+            "C:\\Apps\\Test App",
+            true,
+            &PowerSpec::default(),
+            &[],
+        );
         // Six rows: disk space lives in the rail, not the table.
         assert_eq!(rows.len(), 6);
         assert_eq!(rows[0][0], "Install location");
@@ -2343,7 +2968,15 @@ mod tests {
     fn review_rows_without_files() {
         let (manifest, records) = manifest_with(&[], 0);
         let options = InstallOptions::defaults_for("Empty");
-        let rows = review_rows(&manifest, &options, &records, "D:\\Empty", true);
+        let rows = review_rows(
+            &manifest,
+            &options,
+            &records,
+            "D:\\Empty",
+            true,
+            &PowerSpec::default(),
+            &[],
+        );
         assert_eq!(rows[1][1], "No files");
         assert_eq!(rows[4][1], "None");
     }
@@ -2354,14 +2987,30 @@ mod tests {
         let mut options = InstallOptions::defaults_for("Test App");
         options.start_at_login = 1;
         options.start_at_login_default = 1;
-        let rows = review_rows(&manifest, &options, &records, "C:\\Apps\\Test App", true);
+        let rows = review_rows(
+            &manifest,
+            &options,
+            &records,
+            "C:\\Apps\\Test App",
+            true,
+            &PowerSpec::default(),
+            &[],
+        );
         assert_eq!(rows.len(), 7);
         assert_eq!(rows[6][0], "Start at login");
         assert_eq!(rows[6][1], "Yes");
         assert_eq!(rows[6][2], "Toggle");
         // Offered but off reads "No".
         options.start_at_login_default = 0;
-        let rows = review_rows(&manifest, &options, &records, "C:\\Apps\\Test App", true);
+        let rows = review_rows(
+            &manifest,
+            &options,
+            &records,
+            "C:\\Apps\\Test App",
+            true,
+            &PowerSpec::default(),
+            &[],
+        );
         assert_eq!(rows[6][1], "No");
     }
 
@@ -2375,6 +3024,8 @@ mod tests {
             &records,
             "C:\\Program Files\\Test App",
             false,
+            &PowerSpec::default(),
+            &[],
         );
         assert_eq!(
             rows[0][1],
@@ -2384,6 +3035,67 @@ mod tests {
         // Every other row is untouched by the verdict.
         assert_eq!(rows[1][1], "app.exe");
         assert_eq!(rows[5][0], "PATH entry");
+    }
+
+    #[test]
+    fn review_rows_show_power_parts_and_write_summaries() {
+        use crate::overlay::{ComponentSpec, EnvWriteSpec, RegValueKind, RegWriteSpec};
+        let (manifest, records) = manifest_with(&["app.exe", "extras/big.bin"], 300);
+        let options = InstallOptions::defaults_for("Test App");
+        let power = PowerSpec {
+            components: vec![
+                ComponentSpec {
+                    id: "extras".to_string(),
+                    name: "Extras".to_string(),
+                    description: String::new(),
+                    files: vec!["extras/big.bin".to_string()],
+                    required: false,
+                    default_selected: false,
+                    packed_size: 10,
+                },
+                ComponentSpec {
+                    id: "engine".to_string(),
+                    name: "Engine".to_string(),
+                    description: String::new(),
+                    files: vec![],
+                    required: true,
+                    default_selected: true,
+                    packed_size: 0,
+                },
+            ],
+            registry_writes: vec![RegWriteSpec {
+                key: "Software\\Test App".to_string(),
+                name: "Mode".to_string(),
+                kind: RegValueKind::Dword,
+                value: "31".to_string(),
+            }],
+            env_writes: vec![EnvWriteSpec {
+                name: "TEST_APP_HOME".to_string(),
+                value: "C:\\Test".to_string(),
+            }],
+            ..Default::default()
+        };
+        let selection = vec!["core".to_string(), "engine".to_string()];
+        let rows = review_rows(
+            &manifest,
+            &options,
+            &records,
+            "C:\\Apps\\Test App",
+            true,
+            &power,
+            &selection,
+        );
+        // location, Components, required part, SM folder, desktop,
+        // associations, PATH, registry, environment.
+        assert_eq!(rows.len(), 9);
+        assert_eq!(rows[1][1], "2 of 3 parts");
+        assert_eq!(rows[2][0], "Part: Engine");
+        assert_eq!(rows[2][1], "Included (required)");
+        assert_eq!(rows[2][2], "");
+        assert_eq!(rows[7][0], "Registry writes");
+        assert_eq!(rows[7][1], "1 values");
+        assert_eq!(rows[8][0], "Environment variables");
+        assert_eq!(rows[8][1], "1 variables");
     }
 
     #[test]
