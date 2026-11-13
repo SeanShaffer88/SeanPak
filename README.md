@@ -4,9 +4,59 @@
 SeanPak turns a folder containing your finished program into a single setup file you can hand to other people. They run that one file and your program unpacks itself onto their computer — no zip files to wrestle with, and nothing else they need to install first. It's free, works offline, and stays small and fast because it's built from Windows' own built-in parts rather than bulky add-ons.
 
 ## Description
-SeanPak is a low-overhead native Windows installer packaging and distribution utility written in Rust against direct Windows API bindings (`windows-sys`). Instead of compressing payloads into a proprietary archive, SeanPak appends them uncompressed, aligned to 4096-byte sector boundaries, as a PE executable overlay — so packaging is a streaming file copy with no compression latency, and the resulting installer is a real executable that can inspect and extract itself.
+SeanPak is a low-overhead native Windows installer packager written in Rust against direct Windows API bindings (`windows-sys`). It appends your program's files — each compressed, or stored as-is when compression would not shrink it — to a copy of its own executable as a PE overlay (`SEANPAK_OVL`), producing a single self-contained `Setup.exe`. That file is a real installer, not an archive: run it and the installer wizard opens; run it with flags and it installs, repairs, modifies, or uninstalls headlessly. The same executable is also the packager and the Builder studio — one tool authors the package, builds it, verifies it, and installs it.
 
-A built native installer is the SeanPak executable plus your payload. Run it with no arguments and the SeanPak installer wizard opens (a one-page review of every install choice); `--install` extracts the payload headlessly, next to itself, into a folder named after your app.
+SeanPak is built to be driven by a local AI: packaging is the primary workflow, every capability exists on the command line with `--json` output, and the Builder GUI is a secondary surface over the same operations.
+
+## Features
+
+**Packaging**
+- One `pack` command produces exactly the release set: `<App>-v<version>-x64-Setup.exe`, `<App>-v<version>-x64-Portable.zip`, and `SHA256SUMS.txt`
+- Per-file compression — the Windows Compression API (XPRESS Huffman) on Windows, a built-in LZ codec elsewhere — with files stored uncompressed when compression would not shrink them
+- Sector-aligned PE-overlay format; the reader also accepts packages written by the CrucibleKit and RustPak eras (`CRUCIBLEKIT_OVL`, `RUSTPAK_OVERLAY`)
+- Safe extraction: every stored path is validated before writing — absolute paths and `..` traversal are rejected, so a crafted installer cannot write outside the destination
+- `verify` proves a built package (overlay readable, manifest sane, file list matches payloads); `verify --sandbox` goes further — silent install into a fresh temp folder, byte-for-byte comparison, silent uninstall, residue check
+- Alternative engines: generate or compile Inno Setup / NSIS installers (`--engine inno|nsis`, `--script-only`), plus the legacy `--batch` packaging mode
+- A reusable GitHub Actions workflow (`pack-reusable.yml`) so other projects package with SeanPak in CI
+- Windows Restart Manager awareness: hosts can detect processes locking files; the packager never force-closes your apps
+
+**Built for AI and scripts — the primary workflow**
+- Every capability is available from the command line; nothing is GUI-only
+- `--json` machine-readable output on every command, plus a JSON-lines outcome log (`seanpak.log`) beside the executable
+- `--headless`, `--silent`, and `--dry-run` — a dry run prints the exact plan (locations, components, hooks, writes) and changes nothing
+- Deterministic, documented exit codes (`0`–`6`; `6` = `diff` found differences)
+- `schema` prints the manifest JSON Schema; `validate` checks a manifest and reports plain-language errors
+- `inspect` reports a package: identity, options, components with packed sizes, hooks, registry/environment writes, shortcuts, and per-file sizes and compression
+- `diff` compares two packages — files added/removed/changed by content hash, plus identity, option, and component deltas
+- `init` scaffolds a project: a starter `manifest.json` (primary executable detected, power blocks present as inert examples) and a `PACKAGING.md` stub; the generated manifest is validated before `init` reports success
+- `answers-template` prints an answer file filled with a package's own defaults
+
+**Installing**
+- Per-user installs only: no administrator rights and no elevation prompt, ever. A pre-flight writability check refuses an unwritable destination *before* anything changes and suggests the per-user folder instead — the wizard offers that folder in one click
+- A TesselGUI Rail wizard (Review → Options → Installing → Done) over the same install operation the CLI runs; cancelling mid-install rolls everything back
+- Desktop and Start Menu shortcuts, file associations (the previous default handler is captured and restored by uninstall), and a PATH entry — all journaled
+- Launch after install, offered and checked per the manifest; headless installs launch only with an explicit `--launch`
+- Start at login via a per-user Run entry, journaled and removed by uninstall
+- Optional components with packed sizes on the wizard's Options page (`--components` / `--without` on the CLI); upgrades default to the previous install's selection
+- Pre/post install hooks with per-hook abort/continue failure policies; every run is recorded in the receipt
+- Journaled HKCU registry writes and user environment writes: prior values (or their absence) are captured exactly and restored by uninstall — a pre-existing value of a type SeanPak does not model refuses the install rather than risking data it cannot restore
+- Rich shortcuts with arguments, custom icons and descriptions, and a best-effort taskbar pin whose outcome is recorded and never fails the install
+- Upgrade in place, `--repair`, and downgrade refusal unless `--force`
+- Modify mode: add or remove components and flip install options in place — from the CLI, the wizard, or the Modify button in Add/Remove Programs — with the pre-modify state snapshotted for rollback
+- Answer files preset an install (explicit flags > answer file > package defaults); the wizard offers an `answers.json` found beside the Setup.exe on its Review page — Apply or Ignore, never applied silently
+- A transactional rollback journal: any failure restores the previous state, and every install writes a receipt (`seanpak-receipt.json`) recording files, artifacts, component selection, hook runs, and write priors
+- The uninstaller asks before deleting the app's data folders (opt-in checkbox, off by default); silent uninstalls delete data only with an explicit `--purge-data`
+
+**Builder studio**
+- An IDE-layout window over the same operations as the CLI: folder tree, files table with real packed-size estimates, and a manifest panel
+- Edits the real `manifest.json` — identity, install location, associations, shortcut and PATH toggles, launch/login offers with their defaults, data folders, and the Power blocks (components, hooks, writes, shortcuts) as JSON
+- Build Setup / Validate / Verify (including the sandbox test install) run on a worker thread with results in the output panel
+- Window geometry and last-used paths persist between runs
+
+**Engineering**
+- Rust + `windows-sys` only: zero third-party runtime dependencies, static CRT, and the shipped executables import Windows system libraries only
+- Zero telemetry, fully offline, no account, no network code paths in the installer
+- TesselGUI 1.4.0 dark theme (GitHub Dark High Contrast values) from one shared theme module, test-pinned to the published tokens
 
 ## Download
 Prebuilt binaries are on the **[latest GitHub Release](https://github.com/SeanShaffer88/SeanPak/releases/latest)**:
@@ -23,7 +73,7 @@ Prebuilt binaries are on the **[latest GitHub Release](https://github.com/SeanSh
 - **Windows Restart Manager API (`rstrtmgr.dll`):** The library wraps Restart Manager sessions (loaded dynamically, graceful fallback when unavailable) so hosts can detect processes locking files, query how many are affected, and shut them down / restart them around a file mutation. The packager itself never force-closes your apps.
 - **Transactional rollback journaling:** Native builds snapshot an existing output file before overwriting; on failure the snapshot is restored (LIFO transaction log covering created/modified files and created directories, plus registry-key deletion on Windows).
 - **Privilege separation (UAC):** Embedded manifest execution level is `asInvoker`. Installs are per-user (shortcuts, associations, and PATH all land under HKCU / the user profile), so neither the packager nor a built installer asks for administrator rights.
-- **Windows 11 x64:** Release builds target `x86_64-pc-windows-msvc` only. Pure-logic modules (overlay, scanner, rollback file journal, and script backends) are platform-independent and unit-tested on any host OS.
+- **x64 Windows:** Release builds target `x86_64-pc-windows-msvc` only. Pure-logic modules (overlay, scanner, rollback file journal, and script backends) are platform-independent and unit-tested on any host OS.
 
 ## Installer engines
 | Engine | Flag | Output | Needs |
@@ -32,7 +82,7 @@ Prebuilt binaries are on the **[latest GitHub Release](https://github.com/SeanSh
 | Inno Setup | `--engine inno` | Compiled Inno Setup 6 installer | `ISCC.exe` installed |
 | NSIS | `--engine nsis` | Compiled NSIS installer (MUI2) | `makensis.exe` installed |
 
-Use `--script-only` with the Inno/NSIS engines to generate the `.iss` / `.nsi` script without compiling it. Shortcuts, file associations, and startup entries are features of the Inno/NSIS scripts; the native overlay engine's wizard installs the payload to the chosen location and registers an uninstaller (see `docs/PARITY.md` for exactly what the native install does and does not apply yet).
+Use `--script-only` with the Inno/NSIS engines to generate the `.iss` / `.nsi` script without compiling it. The native overlay engine is the full-featured route — its install applies shortcuts, file associations, PATH, and the startup entry itself, all journaled for uninstall (see `docs/PARITY.md` for the exact matrix); the Inno/NSIS engines remain for projects that specifically want those script formats.
 
 ## Directory structure
 ```
@@ -53,6 +103,8 @@ seanpak/
     ├── diag.rs            # Structured log (seanpak.log) incl. JSON-lines outcome records
     ├── hash.rs            # Hand-rolled SHA-256 / CRC-32 (no external crates)
     ├── answers.rs         # Answer files: strict preset parser + template (4.7.0)
+    ├── codec.rs           # Per-file compression (Windows Compression API / LZ fallback)
+    ├── hooks.rs           # Pre/post install hooks (4.6.0)
     ├── init.rs            # `seanpak init` project scaffolding (4.7.0)
     ├── inspect.rs         # `inspect` / `diff` package reports (4.7.0)
     ├── install.rs         # Shared install operation (wizard + CLI): plan, perform, rollback
@@ -61,11 +113,16 @@ seanpak/
     ├── native_dialog.rs   # Native folder / save-file / icon pickers (SHBrowseForFolder + comdlg32)
     ├── overlay.rs         # Sector-aligned PE overlay writer, reader, and extractor
     ├── pack.rs            # Headless pack pipeline + verify (release set, stored ZIP, sums)
+    ├── receipt.rs         # Install receipt (seanpak-receipt.json) model + journal records
     ├── restart_manager.rs # Dynamic rstrtmgr.dll binding with RAII session lifecycle
     ├── rollback.rs        # Transactional filesystem/registry rollback log
     ├── scanner.rs         # Recursive directory scanner + COFF PE architecture inspector
     ├── studio.rs          # Builder studio GUI (Design H IDE layout) over the same pack/verify operations
-    └── wizard.rs          # Installer wizard (Design E Rail layout) over install.rs
+    ├── sysinstall.rs      # Shortcuts, associations, PATH, Run entry (COM + HKCU, journaled)
+    ├── theme.rs           # TesselGUI 1.4.0 dark palette + shared control painters (4.7.1)
+    ├── uninstall.rs       # Shared uninstall operation (receipt-driven, data-purge opt-in)
+    ├── wizard.rs          # Installer wizard (Design E Rail layout) over install.rs
+    └── writes.rs          # Journaled HKCU registry + environment writes (4.6.0)
 ```
 
 ## Building
@@ -224,7 +281,7 @@ manifest/overlay · `4` I/O failure (including a refused overwrite) ·
 `6` differences found (`diff` only).
 
 ## Known limitations (honest list)
-- The Builder studio (Design H, IDE layout) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. Its Windows runtime behavior is **Unverified** until an on-machine field pass (the document/settings model and the full open → validate → pack → verify chain are covered by host tests). Screenshots of the 4.5.0 layouts are owed from that field pass.
+- The Builder studio (Design H, IDE layout) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. The studio has run on a real Windows desktop (the v4.7.0 build, 2026-11-13); its 4.7.1 TesselGUI 1.4.0 re-theme — owner-drawn buttons, checkboxes and list headers, corrected label and edit colors, the PACKAGE-cluster layout fix — is **Unverified** until the next on-machine field pass, and current screenshots of both layouts are owed from that pass.
 - Payloads are compressed per file (Windows Compression API on Windows; a built-in LZ codec elsewhere) and stored uncompressed when compression would not shrink them. Packages written by older SeanPak/CrucibleKit/RustPak versions remain readable and installable.
 - Windows GUI behavior is compile-verified in CI on all three targets; interactive on-machine testing is still recommended before shipping an installer to users. `docs/PARITY.md` tracks exactly what is shipped and what remains.
 
