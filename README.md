@@ -22,7 +22,7 @@ Prebuilt binaries are on the **[latest GitHub Release](https://github.com/SeanSh
 - **Safe extraction:** The overlay reader validates every stored path before writing — absolute paths and `..` traversal are rejected, so a crafted installer cannot write outside the chosen destination.
 - **Windows Restart Manager API (`rstrtmgr.dll`):** The library wraps Restart Manager sessions (loaded dynamically, graceful fallback when unavailable) so hosts can detect processes locking files, query how many are affected, and shut them down / restart them around a file mutation. The packager itself never force-closes your apps.
 - **Transactional rollback journaling:** Native builds snapshot an existing output file before overwriting; on failure the snapshot is restored (LIFO transaction log covering created/modified files and created directories, plus registry-key deletion on Windows).
-- **Privilege separation (UAC):** Embedded manifest execution level is `asInvoker` by default. Self-elevation via `ShellExecuteExW` with the `runas` verb occurs strictly on demand from the GUI.
+- **Privilege separation (UAC):** Embedded manifest execution level is `asInvoker`. Installs are per-user (shortcuts, associations, and PATH all land under HKCU / the user profile), so neither the packager nor a built installer asks for administrator rights.
 - **Broad Windows compatibility:** Targets Windows 7 SP1 / Server 2008 R2 through Windows 11 / Server 2025 across `x86_64`, `i686`, and `aarch64` (all three are built in CI). The pure-logic modules (overlay, scanner, rollback file journal, script backends) are platform-independent and unit-tested on any host OS.
 
 ## Installer engines
@@ -60,7 +60,7 @@ seanpak/
     ├── restart_manager.rs # Dynamic rstrtmgr.dll binding with RAII session lifecycle
     ├── rollback.rs        # Transactional filesystem/registry rollback log
     ├── scanner.rs         # Recursive directory scanner + COFF PE architecture inspector
-    ├── win32_ui.rs        # Native Win32 GUI: browse, build on a worker thread, UAC elevation
+    ├── studio.rs          # Builder studio GUI (Design D) over the same pack/verify operations
     └── wizard.rs          # Installer wizard (Design C ledger review) over install.rs
 ```
 
@@ -75,7 +75,9 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 ## Usage
 ```powershell
-# GUI (optionally with a starting folder)
+# GUI — the Builder studio (optionally with a starting folder):
+# a files table + manifest panel over the same pack/validate/verify
+# operations the CLI exposes (see below)
 .\seanpak.exe [C:\AppBuild]
 
 # Headless packaging (CI/CD friendly, prints a JSON status line)
@@ -143,7 +145,7 @@ manifest/overlay · `4` I/O failure (including a refused overwrite) ·
 `5` install failed (destination rolled back).
 
 ## Known limitations (honest list)
-- The native GUI is a single-window packager (folder → build); multi-page configuration lives in the CLI flags and the `BuildConfig` used by the script engines.
+- The Builder studio (Design D) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. Its Windows runtime behavior is **Unverified** until an on-machine field pass (the document/settings model and the full open → validate → pack → verify chain are covered by host tests).
 - Payloads are compressed per file (Windows Compression API on Windows; a built-in LZ codec elsewhere) and stored uncompressed when compression would not shrink them. Packages written by older SeanPak/CrucibleKit/RustPak versions remain readable and installable.
 - Windows GUI behavior is compile-verified in CI on all three targets; interactive on-machine testing is still recommended before shipping an installer to users. `docs/PARITY.md` tracks exactly what is shipped and what remains.
 

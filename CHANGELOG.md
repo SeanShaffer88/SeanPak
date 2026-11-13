@@ -2,6 +2,17 @@
 
 All notable changes to the SeanPak utility are documented in this file. (3.0.0 was published under the product's former name, CrucibleKit; releases before 3.0.0 under its original name, RustPak.)
 
+## [4.2.0] - 2026-11-13
+### Added
+- **Builder studio (Design D).** Running `seanpak` with no arguments now opens the Builder studio instead of the 3.0.0-era builder window: a dominant files table (File / Destination / Size / Packed estimate — the estimate is computed with the packer's own compression, not a guess) with Add files… / Add folder… / Remove, an App Manifest panel bound to a real `manifest.json` document (Open / Save / Save As, unsaved-changes marker in the title), and an output strip along the bottom. **Build Setup** packs the release set, **Validate** checks the manifest, **Verify** proves the built Setup.exe (with a Sandbox toggle; the footer's **Test install** runs the full sandbox proof) — every action calls the exact shared operation the CLI exposes (`pack`, `validate`, `verify`, `verify --sandbox`), on worker threads, with results (asset sizes + SHA-256) streamed into the output strip. Menus (File / Project / Build / Tools / Help), Ctrl+O / Ctrl+S / Ctrl+K, tooltips, Per-Monitor DPI v2 scaling, a resize-surviving layout, and persisted window geometry + last-used paths (`seanpak-studio.json` beside the executable) round it out. A pack that would overwrite a differing output asks first, then retries with the equivalent of `--force`.
+
+### Removed
+- The inherited 3.0.0-era builder window (folder → legacy overlay build, UAC self-elevate button). The legacy folder build remains available headlessly as `--batch`; installs are per-user and never needed elevation.
+
+### Known limitations
+- The studio's Windows runtime behavior is **Unverified** until a field pass on a real Windows machine. Its document/settings model and the whole open → scan → validate → pack → verify chain the buttons run are covered by host tests, and the window compiles warning-free for the Windows target in the local gate.
+- The mockup's manifest panel showed a License field; the pack manifest schema has no license field, so the panel omits it rather than inventing data the packer would reject.
+
 ## [4.1.0] - 2026-11-13
 ### Added
 - **Install now applies everything the wizard shows.** Desktop and Start Menu shortcuts (`.lnk` via IShellLink), per-user file associations (HKCU `Software\Classes`, no admin), and the PATH entry (HKCU Environment, appended only when absent, change broadcast) are created at install time from the manifest's install options — and journaled, so uninstall removes exactly what install added: shortcuts are deleted, an association is reverted only while it still points at this app (its previous default is restored), and PATH loses only the exact segment that was added. The CLI `--install` and the wizard run the same shared operation.
