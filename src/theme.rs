@@ -1,8 +1,9 @@
 //! TesselGUI 2.0.0 (design revision 3, "Carmine") design tokens —
 //! the single source of truth for the colors of every SeanPak
 //! window (Builder studio, installer wizard in every mode,
-//! uninstall confirmation, silent-update window). SeanPak ships
-//! dark only, so only the standard's dark palette lives here.
+//! uninstall confirmation, silent-update window). SeanPak ships the
+//! dark palette by default; High Contrast Mode maps visual roles to
+//! the current Windows system colors.
 //!
 //! Values are the TesselGUI revision 3 dark theme, taken from the
 //! published standard's own files — `docs/tokens.json` (the dark
@@ -104,6 +105,43 @@ pub const READ_ONLY_FILL: u32 = 0x0026_2323;
 /// the standard's ten segments; see [`win::subclass_progress`]).
 pub const PROGRESS: u32 = 0x00A0_AAB8;
 
+fn high_contrast_fill_index(token: u32) -> i32 {
+    const COLOR_WINDOW_INDEX: i32 = 5;
+    const COLOR_WINDOWTEXT_INDEX: i32 = 8;
+    const COLOR_HIGHLIGHT_INDEX: i32 = 13;
+    const COLOR_BUTTON_INDEX: i32 = 15;
+
+    if token == ACTION
+        || token == ACCENT
+        || token == ACTION_HOVER
+        || token == ACTION_PRESSED
+        || token == FOCUS
+        || token == SELECTION_INDICATOR
+        || token == SELECTED
+        || token == SELECTED_STRONG
+        || token == PROGRESS
+        || token == TEXT_SELECTION
+    {
+        COLOR_HIGHLIGHT_INDEX
+    } else if token == BORDER || token == EDGE || token == GRID {
+        COLOR_WINDOWTEXT_INDEX
+    } else if token == RAISED
+        || token == HOVER_FILL
+        || token == PRESSED_FILL
+        || token == READ_ONLY_FILL
+        || token == MATERIAL_RIM
+        || token == SUCCESS
+        || token == SUCCESS_FILL
+        || token == WARNING_FILL
+        || token == DANGER_FILL
+        || token == INFO_FILL
+    {
+        COLOR_BUTTON_INDEX
+    } else {
+        COLOR_WINDOW_INDEX
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +153,15 @@ mod tests {
         let g = (color >> 8) & 0xFF;
         let b = (color >> 16) & 0xFF;
         format!("#{r:02X}{g:02X}{b:02X}")
+    }
+
+    #[test]
+    fn high_contrast_fill_roles_map_to_system_colors() {
+        assert_eq!(high_contrast_fill_index(BACKGROUND), 5);
+        assert_eq!(high_contrast_fill_index(ACTION), 13);
+        assert_eq!(high_contrast_fill_index(SELECTED), 13);
+        assert_eq!(high_contrast_fill_index(BORDER), 8);
+        assert_eq!(high_contrast_fill_index(INFO_FILL), 15);
     }
 
     #[test]
@@ -169,6 +216,7 @@ mod win {
     use windows_sys::Win32::UI::Controls::*;
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
@@ -198,7 +246,117 @@ mod win {
     static mut BRUSH_CACHE: [(u32, HBRUSH); CACHE_SLOTS] =
         [(u32::MAX, std::ptr::null_mut()); CACHE_SLOTS];
 
-    pub fn brush(color: u32) -> HBRUSH {
+    static HIGH_CONTRAST_INITIALIZED: AtomicBool = AtomicBool::new(false);
+    static HIGH_CONTRAST_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    #[repr(C)]
+    struct HighContrastInfo {
+        cb_size: u32,
+        dw_flags: u32,
+        default_scheme: *mut u16,
+    }
+
+    const HCF_HIGHCONTRASTON_FLAG: u32 = 0x0000_0001;
+
+    fn high_contrast_active() -> bool {
+        if !HIGH_CONTRAST_INITIALIZED.load(Ordering::Relaxed) {
+            refresh_system_colors();
+        }
+        HIGH_CONTRAST_ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Refreshes the accessibility palette after Windows broadcasts a
+    /// high-contrast or system-color change.
+    pub fn refresh_system_colors() {
+        let mut info: HighContrastInfo = unsafe { std::mem::zeroed() };
+        info.cb_size = std::mem::size_of::<HighContrastInfo>() as u32;
+        let result = unsafe {
+            SystemParametersInfoW(
+                SPI_GETHIGHCONTRAST,
+                info.cb_size,
+                &mut info as *mut HighContrastInfo as *mut std::ffi::c_void,
+                0,
+            )
+        };
+        if result != 0 {
+            HIGH_CONTRAST_ENABLED.store(
+                info.dw_flags & HCF_HIGHCONTRASTON_FLAG != 0,
+                Ordering::Relaxed,
+            );
+        }
+        HIGH_CONTRAST_INITIALIZED.store(true, Ordering::Relaxed);
+        unsafe { clear_brush_cache() };
+    }
+
+    pub fn fill_color(token: u32) -> u32 {
+        if high_contrast_active() {
+            unsafe { GetSysColor(super::high_contrast_fill_index(token)) }
+        } else {
+            token
+        }
+    }
+
+    pub fn text_color(token: u32) -> u32 {
+        if high_contrast_active() {
+            unsafe { GetSysColor(COLOR_WINDOWTEXT) }
+        } else {
+            token
+        }
+    }
+
+    pub fn button_text_color(token: u32) -> u32 {
+        if high_contrast_active() {
+            unsafe { GetSysColor(COLOR_BTNTEXT) }
+        } else {
+            token
+        }
+    }
+
+    pub fn highlight_text_color(token: u32) -> u32 {
+        if high_contrast_active() {
+            unsafe { GetSysColor(COLOR_HIGHLIGHTTEXT) }
+        } else {
+            token
+        }
+    }
+
+    pub fn disabled_text_color(token: u32) -> u32 {
+        if high_contrast_active() {
+            unsafe { GetSysColor(COLOR_GRAYTEXT) }
+        } else {
+            token
+        }
+    }
+
+    pub fn focus_color(token: u32) -> u32 {
+        if high_contrast_active() {
+            unsafe { GetSysColor(COLOR_HIGHLIGHT) }
+        } else {
+            token
+        }
+    }
+
+    pub fn border_color(token: u32) -> u32 {
+        if high_contrast_active() {
+            unsafe { GetSysColor(COLOR_WINDOWTEXT) }
+        } else {
+            token
+        }
+    }
+
+    unsafe fn clear_brush_cache() {
+        let base = std::ptr::addr_of_mut!(BRUSH_CACHE) as *mut (u32, HBRUSH);
+        for i in 0..CACHE_SLOTS {
+            let slot = base.add(i);
+            if !(*slot).1.is_null() {
+                DeleteObject((*slot).1 as HGDIOBJ);
+            }
+            *slot = (u32::MAX, std::ptr::null_mut());
+        }
+    }
+
+    pub fn brush(token: u32) -> HBRUSH {
+        let color = fill_color(token);
         unsafe {
             // Raw-pointer access: no references to the mutable
             // static are ever created (single UI-thread callers).
@@ -219,6 +377,24 @@ mod win {
             }
             created
         }
+    }
+
+    unsafe extern "system" fn refresh_child_list_colors(child: HWND, _data: LPARAM) -> BOOL {
+        let mut class_name = [0u16; 64];
+        let length = GetClassNameW(child, class_name.as_mut_ptr(), class_name.len() as i32);
+        if length > 0
+            && String::from_utf16_lossy(&class_name[..length as usize]) == "SysListView32"
+        {
+            SendMessageW(child, LVM_SETBKCOLOR, 0, fill_color(SURFACE) as LPARAM);
+            SendMessageW(child, LVM_SETTEXTBKCOLOR, 0, fill_color(SURFACE) as LPARAM);
+            SendMessageW(child, LVM_SETTEXTCOLOR, 0, text_color(FOREGROUND) as LPARAM);
+        }
+        1
+    }
+
+    /// Refreshes native list-view color state after a system palette change.
+    pub unsafe fn refresh_listview_colors(parent: HWND) {
+        EnumChildWindows(parent, Some(refresh_child_list_colors), 0);
     }
 
     /// A control's current window text (owner-drawn controls still
@@ -262,7 +438,7 @@ mod win {
         inner.top += 1;
         inner.right -= 1;
         inner.bottom -= 1;
-        let pen = CreatePen(PS_SOLID, 2, FOCUS);
+        let pen = CreatePen(PS_SOLID, 2, focus_color(FOCUS));
         let old_pen = SelectObject(hdc, pen as HGDIOBJ);
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         Rectangle(hdc, inner.left, inner.top, inner.right, inner.bottom);
@@ -318,7 +494,16 @@ mod win {
         FrameRect(dis.hDC, &dis.rcItem, brush(BORDER));
         let old_font = select_control_font(dis.hDC, dis.hwndItem);
         SetBkMode(dis.hDC, TRANSPARENT as i32);
-        SetTextColor(dis.hDC, text_color);
+        SetTextColor(
+            dis.hDC,
+            if disabled {
+                disabled_text_color(text_color)
+            } else if primary {
+                highlight_text_color(text_color)
+            } else {
+                button_text_color(text_color)
+            },
+        );
         let text = control_text(dis.hwndItem);
         let mut rc = dis.rcItem;
         DrawTextW(
@@ -371,6 +556,13 @@ mod win {
         };
         FillRect(dis.hDC, &box_rc, brush(box_fill));
         FrameRect(dis.hDC, &box_rc, brush(BORDER));
+        let check_color = if disabled {
+            disabled_text_color(check_color)
+        } else if checked {
+            highlight_text_color(check_color)
+        } else {
+            button_text_color(check_color)
+        };
         if checked {
             // A three-point check, thick enough to read at 12px.
             let pen = CreatePen(PS_SOLID, (side / 6).max(2), check_color);
@@ -534,8 +726,8 @@ mod win {
         FillRect(hdc, &client, brush(SURFACE));
         let old_font = select_control_font(hdc, hwnd);
         SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, MUTED);
-        let pen = CreatePen(PS_SOLID, 1, EDGE);
+        SetTextColor(hdc, button_text_color(MUTED));
+        let pen = CreatePen(PS_SOLID, 1, border_color(EDGE));
         let old_pen = SelectObject(hdc, pen as HGDIOBJ);
         let mut pt: POINT = std::mem::zeroed();
         let count = SendMessageW(hwnd, HDM_GETITEMCOUNT, 0, 0) as i32;
@@ -606,6 +798,7 @@ mod win {
     /// NMHDR pointer); non-custom-draw notifications are detected
     /// from the header and left alone.
     pub unsafe fn listview_custom_draw(lparam: LPARAM, draw_grid: bool) -> Option<LRESULT> {
+        let draw_grid = draw_grid && !high_contrast_active();
         let hdr = lparam as *const NMHDR;
         if hdr.is_null() || (*hdr).code as i32 != NM_CUSTOMDRAW_CODE {
             return None;
@@ -621,8 +814,8 @@ mod win {
         }
         if stage == CDDS_ITEMPREPAINT {
             if (*cd).nmcd.uItemState & CDIS_SELECTED_FLAG != 0 {
-                (*cd).clrText = FOREGROUND;
-                (*cd).clrTextBk = SELECTED;
+                (*cd).clrText = highlight_text_color(FOREGROUND);
+                (*cd).clrTextBk = fill_color(SELECTED);
             }
             // CDRF_NEWFONT is what makes the color changes above
             // take; the notify bits add the subitem postpaint stage
@@ -636,7 +829,7 @@ mod win {
         if draw_grid && stage == (CDDS_SUBITEM | CDDS_ITEMPOSTPAINT | CDDS_ITEM) {
             let rc = (*cd).nmcd.rc;
             let hdc = (*cd).nmcd.hdc;
-            let pen = CreatePen(PS_SOLID, 1, EDGE);
+            let pen = CreatePen(PS_SOLID, 1, border_color(EDGE));
             let old_pen = SelectObject(hdc, pen as HGDIOBJ);
             let mut pt: POINT = std::mem::zeroed();
             MoveToEx(hdc, rc.left, rc.bottom - 1, &mut pt);
@@ -676,10 +869,10 @@ mod win {
     /// `hdc` must be a live device context for the duration of the
     /// call (a paint or erase-background DC).
     pub unsafe fn paint_grid(hdc: HDC, rect: &RECT, cell: i32) {
-        if cell < 4 || rect.right <= rect.left || rect.bottom <= rect.top {
+        if high_contrast_active() || cell < 4 || rect.right <= rect.left || rect.bottom <= rect.top {
             return;
         }
-        let pen = CreatePen(PS_SOLID, 1, GRID);
+        let pen = CreatePen(PS_SOLID, 1, border_color(GRID));
         let old_pen = SelectObject(hdc, pen as HGDIOBJ);
         let mut pt: POINT = std::mem::zeroed();
         let mut x = rect.left + cell;
@@ -820,6 +1013,8 @@ mod win {
 
 #[cfg(windows)]
 pub use win::{
-    brush, draw_checkbox, draw_focus_ring, draw_push_button, listview_custom_draw, paint_grid,
-    subclass_list_header, subclass_progress,
+    border_color, brush, button_text_color, disabled_text_color, draw_checkbox, draw_focus_ring,
+    draw_push_button, fill_color, focus_color, highlight_text_color, listview_custom_draw,
+    paint_grid, refresh_listview_colors, refresh_system_colors, subclass_list_header,
+    subclass_progress, text_color,
 };

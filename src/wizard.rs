@@ -1156,9 +1156,9 @@ mod imp {
             (LVS_EX_FULLROWSELECT) as WPARAM,
             (LVS_EX_FULLROWSELECT) as LPARAM,
         );
-        SendMessageW(list, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
+        SendMessageW(list, LVM_SETBKCOLOR, 0, theme::fill_color(theme::SURFACE) as LPARAM);
+        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::fill_color(theme::SURFACE) as LPARAM);
+        SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::text_color(theme::FOREGROUND) as LPARAM);
         fill_list(list);
 
         mk(
@@ -1433,8 +1433,8 @@ mod imp {
         );
         // The progress role color on the surface token (honored
         // wherever the control paints with message colors).
-        SendMessageW(bar, PBM_SETBARCOLOR_MSG, 0, theme::PROGRESS as LPARAM);
-        SendMessageW(bar, PBM_SETBKCOLOR_MSG, 0, theme::SURFACE as LPARAM);
+        SendMessageW(bar, PBM_SETBARCOLOR_MSG, 0, theme::fill_color(theme::PROGRESS) as LPARAM);
+        SendMessageW(bar, PBM_SETBKCOLOR_MSG, 0, theme::fill_color(theme::SURFACE) as LPARAM);
         // Revision 3 progress is ten segments; the subclass paints
         // them over the native control (position/range unchanged).
         theme::subclass_progress(bar);
@@ -2107,6 +2107,17 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                theme::refresh_system_colors();
+                theme::refresh_listview_colors(hwnd);
+                RedrawWindow(
+                    hwnd,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_ERASEBKGND => {
                 // The page background: the background fill with the
                 // revision 3 signature grid over it. The rail static
@@ -2131,14 +2142,14 @@ mod imp {
                 if id == ID_TILE {
                     // The monogram tile: Carmine block, light initial.
                     SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, theme::ACTION);
-                    SetTextColor(hdc, theme::ACCENT_FOREGROUND);
+                    SetBkColor(hdc, theme::fill_color(theme::ACTION));
+                    SetTextColor(hdc, theme::highlight_text_color(theme::ACCENT_FOREGROUND));
                     return theme::brush(theme::ACTION) as LRESULT;
                 }
                 if id == ID_RAIL_BG {
                     // The rail's own background: solid darkest panel.
                     SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, theme::BACKGROUND);
+                    SetBkColor(hdc, theme::fill_color(theme::BACKGROUND));
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if let Some(i) = ID_STEP_ACCENTS.iter().position(|a| *a == id) {
@@ -2146,10 +2157,10 @@ mod imp {
                     // color (invisible) for the rest.
                     SetBkMode(hdc, OPAQUE as i32);
                     if page == (i + 1) as u8 {
-                        SetBkColor(hdc, theme::ACTION);
+                        SetBkColor(hdc, theme::fill_color(theme::ACTION));
                         return theme::brush(theme::ACTION) as LRESULT;
                     }
-                    SetBkColor(hdc, theme::BACKGROUND);
+                    SetBkColor(hdc, theme::fill_color(theme::BACKGROUND));
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if let Some(i) = ID_STEP_NUMS.iter().position(|a| *a == id) {
@@ -2159,17 +2170,17 @@ mod imp {
                     let step = (i + 1) as u8;
                     if page == step {
                         SetBkMode(hdc, OPAQUE as i32);
-                        SetBkColor(hdc, theme::ACTION);
-                        SetTextColor(hdc, theme::ACTION_FOREGROUND);
+                        SetBkColor(hdc, theme::fill_color(theme::ACTION));
+                        SetTextColor(hdc, theme::highlight_text_color(theme::ACTION_FOREGROUND));
                         return theme::brush(theme::ACTION) as LRESULT;
                     }
                     SetBkMode(hdc, TRANSPARENT as i32);
                     SetTextColor(
                         hdc,
                         if page > step {
-                            theme::SUCCESS
+                            theme::text_color(theme::SUCCESS)
                         } else {
-                            theme::MUTED
+                            theme::text_color(theme::MUTED)
                         },
                     );
                     return theme::brush(theme::BACKGROUND) as LRESULT;
@@ -2181,16 +2192,16 @@ mod imp {
                     SetTextColor(
                         hdc,
                         if page >= (i + 1) as u8 {
-                            theme::FOREGROUND
+                            theme::text_color(theme::FOREGROUND)
                         } else {
-                            theme::MUTED
+                            theme::text_color(theme::MUTED)
                         },
                     );
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_APPNAME || id == ID_LBL_DISKNEED {
                     SetBkMode(hdc, TRANSPARENT as i32);
-                    SetTextColor(hdc, theme::FOREGROUND);
+                    SetTextColor(hdc, theme::text_color(theme::FOREGROUND));
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_APPVER
@@ -2199,7 +2210,7 @@ mod imp {
                     || id == ID_LBL_DISKFREE
                 {
                     SetBkMode(hdc, TRANSPARENT as i32);
-                    SetTextColor(hdc, theme::MUTED);
+                    SetTextColor(hdc, theme::text_color(theme::MUTED));
                     return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_INFO {
@@ -2216,28 +2227,28 @@ mod imp {
                         .unwrap_or(true);
                     SetBkMode(hdc, OPAQUE as i32);
                     if location_ok {
-                        SetBkColor(hdc, theme::INFO_FILL);
-                        SetTextColor(hdc, theme::INFO);
+                        SetBkColor(hdc, theme::fill_color(theme::INFO_FILL));
+                        SetTextColor(hdc, theme::button_text_color(theme::INFO));
                         return theme::brush(theme::INFO_FILL) as LRESULT;
                     }
-                    SetBkColor(hdc, theme::WARNING_FILL);
-                    SetTextColor(hdc, theme::WARNING);
+                    SetBkColor(hdc, theme::fill_color(theme::WARNING_FILL));
+                    SetTextColor(hdc, theme::button_text_color(theme::WARNING));
                     return theme::brush(theme::WARNING_FILL) as LRESULT;
                 }
                 SetBkMode(hdc, TRANSPARENT as i32);
                 if (id == ID_LBL_STATUS || id == ID_LBL_FINISH) && installed {
                     // Success color, always paired with the status text.
-                    SetTextColor(hdc, theme::SUCCESS);
+                    SetTextColor(hdc, theme::text_color(theme::SUCCESS));
                 } else if id == ID_LBL_STEP
                     || id == ID_LBL_HINT
                     || id == ID_LBL_STATUS
                     || id == ID_LBL_SUBTITLE
                 {
-                    SetTextColor(hdc, theme::MUTED);
+                    SetTextColor(hdc, theme::text_color(theme::MUTED));
                 } else if id == ID_LBL_OPTNOTE {
-                    SetTextColor(hdc, theme::INFO);
+                    SetTextColor(hdc, theme::button_text_color(theme::INFO));
                 } else {
-                    SetTextColor(hdc, theme::FOREGROUND);
+                    SetTextColor(hdc, theme::text_color(theme::FOREGROUND));
                 }
                 theme::brush(theme::BACKGROUND) as LRESULT
             }
@@ -2248,12 +2259,12 @@ mod imp {
                 if IsWindowEnabled(ctrl) == 0 {
                     // The location edit in Modify mode: fixed, and
                     // drawn as disabled rather than merely inert.
-                    SetBkColor(hdc, theme::DISABLED_FILL);
-                    SetTextColor(hdc, theme::DISABLED_FOREGROUND);
+                    SetBkColor(hdc, theme::fill_color(theme::DISABLED_FILL));
+                    SetTextColor(hdc, theme::disabled_text_color(theme::DISABLED_FOREGROUND));
                     theme::brush(theme::DISABLED_FILL) as LRESULT
                 } else {
-                    SetBkColor(hdc, theme::SURFACE);
-                    SetTextColor(hdc, theme::FOREGROUND);
+                    SetBkColor(hdc, theme::fill_color(theme::SURFACE));
+                    SetTextColor(hdc, theme::text_color(theme::FOREGROUND));
                     theme::brush(theme::SURFACE) as LRESULT
                 }
             }
@@ -3305,19 +3316,30 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                theme::refresh_system_colors();
+                theme::refresh_listview_colors(hwnd);
+                RedrawWindow(
+                    hwnd,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_CTLCOLORSTATIC => {
                 let hdc = wparam as HDC;
                 let ctrl = lparam as HWND;
                 let id = GetWindowLongW(ctrl, GWL_ID) as usize;
                 SetBkMode(hdc, TRANSPARENT as i32);
                 if id == ID_LBL_CONFIRM_WARN {
-                    SetTextColor(hdc, theme::WARNING);
+                    SetTextColor(hdc, theme::button_text_color(theme::WARNING));
                 } else if id == ID_LBL_CONFIRM_BODY {
-                    SetTextColor(hdc, theme::INFO);
+                    SetTextColor(hdc, theme::button_text_color(theme::INFO));
                 } else if id == ID_LBL_CONFIRM_DIRS {
-                    SetTextColor(hdc, theme::MUTED);
+                    SetTextColor(hdc, theme::text_color(theme::MUTED));
                 } else {
-                    SetTextColor(hdc, theme::FOREGROUND);
+                    SetTextColor(hdc, theme::text_color(theme::FOREGROUND));
                 }
                 theme::brush(theme::BACKGROUND) as LRESULT
             }
