@@ -1,0 +1,79 @@
+name: SeanPak Pack (reusable)
+
+# Reusable packaging workflow: any of SEAN's project repos can package
+# its Windows release with SeanPak by calling this workflow (see
+# docs/PACKAGING.md). It checks out the CALLER's repository, builds
+# SeanPak from this repo, runs `seanpak pack` with the caller-supplied
+# manifest + files, and uploads the three release assets as a workflow
+# artifact for the caller's release job to attach.
+
+on:
+  workflow_call:
+    inputs:
+      manifest:
+        description: "Path (in the caller repo) to the SeanPak manifest JSON."
+        required: true
+        type: string
+      files:
+        description: "Path (in the caller repo) to the payload files directory."
+        required: true
+        type: string
+      out:
+        description: "Output directory for the three release assets."
+        required: false
+        type: string
+        default: "dist-seanpak"
+      seanpak-ref:
+        description: "SeanPak git ref to build the packager from."
+        required: false
+        type: string
+        default: "main"
+    outputs:
+      out-dir:
+        description: "Directory the three assets were written to."
+        value: ${{ jobs.pack.outputs.out-dir }}
+
+jobs:
+  pack:
+    name: Pack with SeanPak
+    runs-on: windows-latest
+    outputs:
+      out-dir: ${{ inputs.out }}
+    steps:
+      - name: Check out caller project
+        uses: actions/checkout@v4
+
+      - name: Check out SeanPak
+        uses: actions/checkout@v4
+        with:
+          repository: SeanShaffer88/SeanPak
+          ref: ${{ inputs.seanpak-ref }}
+          path: .seanpak
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build SeanPak
+        shell: bash
+        working-directory: .seanpak
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Pack release assets
+        shell: bash
+        run: |
+          .seanpak/target/x86_64-pc-windows-msvc/release/seanpak.exe pack \
+            "${{ inputs.manifest }}" "${{ inputs.files }}" \
+            --out-dir "${{ inputs.out }}" --json
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: seanpak-release-assets
+          path: |
+            ${{ inputs.out }}/*-Setup.exe
+            ${{ inputs.out }}/*-Portable.zip
+            ${{ inputs.out }}/SHA256SUMS.txt
+          if-no-files-found: error

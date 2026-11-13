@@ -54,6 +54,44 @@ jobs:
         run: |
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target ${{ matrix.target }}
 
+      # Stub-size budget: the installer stub is the binary every packaged
+      # app ships, so it stays lean. Measured Slice 2 stubs: 635,904
+      # bytes (Windows PE, gnu-linked) and 607,384 bytes (host release);
+      # the MSVC CI build is the same code and profile class. The budget
+      # is 4 MiB — several times the measured size, far under the 15 MB
+      # blueprint ceiling, and tight enough to fail loudly if a heavy
+      # runtime ever sneaks in.
+      - name: Stub size budget (x86_64 stub)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          size=$(stat -c %s target/x86_64-pc-windows-msvc/release/seanpak.exe)
+          budget=4194304
+          echo "Stub size: $size bytes (budget: $budget bytes / 4 MiB)"
+          if [ "$size" -gt "$budget" ]; then
+            echo "::error::SeanPak stub is $size bytes, over the 4 MiB budget ($budget)."
+            exit 1
+          fi
+
+      # Golden-package sandbox proof on the real Windows build: pack the
+      # fixture, then `verify --sandbox` silently installs it, compares
+      # every file byte-for-byte, silently uninstalls, and asserts no
+      # residue — the same fixture the host test suite uses.
+      - name: Golden package sandbox verify
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          SP=target/x86_64-pc-windows-msvc/release/seanpak.exe
+          mkdir -p golden/files/data golden/out
+          yes "golden fixture exe bytes aaaaaaaa" | head -n 200 > golden/files/golden.exe
+          yes "golden fixture line bbbbbbbb" | head -n 5000 > golden/files/data/big.txt
+          printf 'golden readme\n' > golden/files/readme.txt
+          cat > golden/manifest.json <<'EOF'
+          {"appName":"GoldenApp","version":"1.0.0","publisher":"SeanPak CI","primaryExe":"golden.exe","desktopShortcut":true,"startMenuShortcut":true,"fileAssociations":[".gold"],"pathEntry":false}
+          EOF
+          "$SP" pack golden/manifest.json golden/files --out-dir golden/out --json
+          "$SP" verify golden/out/GoldenApp-v1.0.0-x64-Setup.exe --sandbox --json
+
       - name: Prepare Binary Artifacts
         shell: bash
         run: |
