@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#121214"/>
+      <stop offset="50%" stop-color="#0a0a0c"/>
+      <stop offset="100%" stop-color="#050506"/>
+    </linearGradient>
+
+    <!-- Border Glow Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ef4444"/>
+      <stop offset="50%" stop-color="#7f1d1d"/>
+      <stop offset="100%" stop-color="#dc2626"/>
+    </linearGradient>
+
+    <!-- Crimson Red Main Gradient -->
+    <linearGradient id="redPrimary" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff3344"/>
+      <stop offset="50%" stop-color="#e11d48"/>
+      <stop offset="100%" stop-color="#991b1b"/>
+    </linearGradient>
+
+    <!-- Dark Red Metallic -->
+    <linearGradient id="redDark" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#450a0a"/>
+      <stop offset="50%" stop-color="#991b1b"/>
+      <stop offset="100%" stop-color="#b91c1c"/>
+    </linearGradient>
+
+    <!-- Package Isometric Facet Gradients -->
+    <linearGradient id="topFacet" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#27272a"/>
+      <stop offset="100%" stop-color="#18181b"/>
+    </linearGradient>
+    <linearGradient id="leftFacet" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#18181b"/>
+      <stop offset="100%" stop-color="#09090b"/>
+    </linearGradient>
+    <linearGradient id="rightFacet" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#222226"/>
+      <stop offset="100%" stop-color="#0c0c0e"/>
+    </linearGradient>
+
+    <!-- Glow Filter -->
+    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+    <filter id="subtleGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Base Plate: Deep Carbon Black Rounded Square -->
+  <rect x="24" y="24" width="464" height="464" rx="96" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="4" />
+
+  <!-- Subtle Cybernetic Tech Grid Detail -->
+  <g opacity="0.15" stroke="#dc2626" stroke-width="1.5">
+    <line x1="24" y1="140" x2="488" y2="140" />
+    <line x1="24" y1="372" x2="488" y2="372" />
+    <line x1="140" y1="24" x2="140" y2="488" />
+    <line x1="372" y1="24" x2="372" y2="488" />
+    <!-- Diagonal Corner Accents -->
+    <line x1="56" y1="56" x2="110" y2="56" stroke-width="3" stroke="#ef4444" />
+    <line x1="56" y1="56" x2="56" y2="110" stroke-width="3" stroke="#ef4444" />
+    <line x1="456" y1="456" x2="402" y2="456" stroke-width="3" stroke="#ef4444" />
+    <line x1="456" y1="456" x2="456" y2="402" stroke-width="3" stroke="#ef4444" />
+  </g>
+
+  <!-- Ambient Under-Glow (Vivid Red) -->
+  <circle cx="256" cy="256" r="140" fill="#dc2626" opacity="0.16" filter="url(#neonGlow)" />
+
+  <!-- 3D Package Cube (Isometric Structure) -->
+  <!-- Top Flap / Facet -->
+  <polygon points="256,92 388,168 256,244 124,168" fill="url(#topFacet)" stroke="#dc2626" stroke-width="2.5" />
+  
+  <!-- Left Flap / Facet -->
+  <polygon points="124,168 256,244 256,400 124,324" fill="url(#leftFacet)" stroke="#7f1d1d" stroke-width="2" />
+  
+  <!-- Right Flap / Facet -->
+  <polygon points="256,244 388,168 388,324 256,400" fill="url(#rightFacet)" stroke="#991b1b" stroke-width="2" />
+
+  <!-- Package Seam Lines (Laser Crimson Ribbon) -->
+  <polyline points="256,92 256,244" stroke="#ff3344" stroke-width="3.5" filter="url(#subtleGlow)" />
+  <polyline points="124,168 256,244 388,168" stroke="#ff3344" stroke-width="3" />
+  <polyline points="256,244 256,400" stroke="#ff3344" stroke-width="3.5" filter="url(#subtleGlow)" />
+
+  <!-- Central High-Impact "R" Emblem (Angled Cyberpunk / Industrial Rust Cutout) -->
+  <g filter="url(#neonGlow)">
+    <!-- Stylized Red 'R' with angular packaging geometry -->
+    <path d="M 216 172 
+             L 282 172 
+             C 314 172, 332 188, 332 214 
+             C 332 236, 318 250, 296 256 
+             L 336 328 
+             L 298 328 
+             L 262 264 
+             L 246 264 
+             L 246 328 
+             L 216 328 
+             Z 
+             M 246 200 
+             L 246 238 
+             L 278 238 
+             C 292 238, 302 230, 302 219 
+             C 302 208, 292 200, 278 200 
+             Z" 
+          fill="url(#redPrimary)" 
+          stroke="#ffe4e6" 
+          stroke-width="1.5" />
+  </g>
+
+  <!-- Tech Accent: Sector Alignment Hash Marks (Bottom Right Badge) -->
+  <g opacity="0.85">
+    <rect x="330" y="380" width="100" height="24" rx="6" fill="#09090b" stroke="#dc2626" stroke-width="1.5" />
+    <text x="380" y="396" fill="#f87171" font-family="Consolas, monospace" font-size="11" font-weight="bold" text-anchor="middle" letter-spacing="1">4096-PE</text>
+  </g>
+
+  <!-- Title Badge Text on Top Rim -->
+  <g opacity="0.95">
+    <rect x="186" y="44" width="140" height="24" rx="6" fill="#09090b" stroke="#dc2626" stroke-width="1.5" />
+    <text x="256" y="60" fill="#fca5a5" font-family="'Segoe UI', system-ui, sans-serif" font-size="12" font-weight="900" text-anchor="middle" letter-spacing="2">SEANPAK</text>
+  </g>
+</svg>
