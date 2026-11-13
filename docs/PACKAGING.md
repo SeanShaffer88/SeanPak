@@ -175,6 +175,19 @@ hash and reports files added / removed / changed plus option and
 component deltas; exit **0** = identical, **6** = differences found,
 **3** = a package could not be read.
 
+## Authenticode signing of SeanPak releases
+
+The repository release workflow can sign the executable in the Portable ZIP and the final Setup.exe. Add these GitHub Actions repository secrets to enable signing:
+
+- SEANPAK_CODESIGN_CERT_BASE64: the base64-encoded PFX code-signing certificate.
+- SEANPAK_CODESIGN_CERT_PASSWORD: the PFX password.
+
+Keep both values in GitHub Actions Secrets; do not commit the certificate or put either value in workflow files. The runner writes a temporary PFX file and removes it after signing.
+
+If neither secret is configured, releases continue unsigned and the workflow records a notice. If only one is configured, the release fails instead of silently producing a partially signed release. With both present, the workflow signs and verifies the portable executable and the completed Setup.exe, refreshes SHA256SUMS.txt, then runs the sandbox install/uninstall verification on the final Setup.exe. A signing or package-verification failure prevents the release assets from being published.
+
+The Setup.exe is signed only after its embedded package is complete. SeanPak excludes the appended Authenticode certificate table when locating the last package payload, so signing does not change the bytes extracted from the installer. This repository workflow signs SeanPak's own releases; projects using the reusable caller workflow remain responsible for signing their own final artifacts.
+
 ## Caller workflow (GitHub Actions)
 
 A project's release workflow calls SeanPak's reusable workflow, then

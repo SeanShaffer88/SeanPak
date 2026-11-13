@@ -423,7 +423,14 @@ fn run_install(args: &[String]) -> i32 {
         Ok(selection) => selection,
         Err(e) => return fail(args, "install", EXIT_USAGE, &e),
     };
-    let stream_len = std::fs::metadata(&exe).map(|m| m.len()).unwrap_or(0);
+    let mut package_file = match File::open(&exe) {
+        Ok(file) => file,
+        Err(e) => return fail(args, "install", EXIT_IO, &format!("cannot read package: {e}")),
+    };
+    let stream_len = match OverlayReader::payload_stream_len(&mut package_file) {
+        Ok(len) => len,
+        Err(e) => return fail(args, "install", EXIT_IO, &format!("cannot read package: {e}")),
+    };
     let plan = install::plan_install(
         &manifest, &records, &options, &dest, &power, &selection, stream_len,
     );

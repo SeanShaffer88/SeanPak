@@ -603,9 +603,9 @@ pub fn verify_package_with(
         files: Vec::new(),
         checks: Vec::new(),
     };
-    let file_len = std::fs::metadata(path)?.len();
-    let file = std::fs::File::open(path)?;
-    let (manifest, records, _options) = match OverlayReader::read_package(file)? {
+    let mut file = std::fs::File::open(path)?;
+    let file_len = OverlayReader::payload_stream_len(&mut file)?;
+    let (manifest, records, _options) = match OverlayReader::read_package(&mut file)? {
         Some(pkg) => {
             report.checks.push((
                 "overlay readable".to_string(),
