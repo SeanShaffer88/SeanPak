@@ -60,10 +60,9 @@ pub struct InspectReport {
 /// unreadable (the CLI's exit 3).
 pub fn inspect_package(path: &Path) -> Result<InspectReport, String> {
     let mut file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let stream_len = file
-        .seek(std::io::SeekFrom::End(0))
+    let stream_len = OverlayReader::payload_stream_len(&mut file)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let (manifest, records, options, power) = OverlayReader::read_package_full(file)
+    let (manifest, records, options, power) = OverlayReader::read_package_full(&mut file)
         .map_err(|e| format!("cannot read package {}: {e}", path.display()))?
         .ok_or_else(|| format!("no SeanPak overlay found in {}", path.display()))?;
     let files = records

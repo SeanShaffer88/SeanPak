@@ -1287,6 +1287,96 @@ pub type PackageFull = (
 );
 
 impl OverlayReader {
+    /// Returns the byte offset where package payload data ends. Authenticode
+    /// stores its certificate table at the PE security directory's file offset;
+    /// excluding that appended table keeps a signed installer readable without
+    /// treating the signature as the last file's compressed payload.
+    pub fn payload_stream_len<R: Read + Seek>(reader: &mut R) -> std::io::Result<u64> {
+        let stream_len = reader.seek(SeekFrom::End(0))?;
+        if stream_len < 64 {
+            return Ok(stream_len);
+        }
+
+        reader.seek(SeekFrom::Start(0))?;
+        let mut dos_header = [0u8; 64];
+        reader.read_exact(&mut dos_header)?;
+        if dos_header[0] != b'M' || dos_header[1] != b'Z' {
+            return Ok(stream_len);
+        }
+
+        let pe_offset = u32::from_le_bytes(dos_header[0x3c..0x40].try_into().unwrap()) as u64;
+        if pe_offset > stream_len.saturating_sub(24) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated PE header while locating Authenticode certificate table",
+            ));
+        }
+        reader.seek(SeekFrom::Start(pe_offset))?;
+        let mut pe_header = [0u8; 24];
+        reader.read_exact(&mut pe_header)?;
+        if &pe_header[..4] != b"PE\0\0" {
+            return Ok(stream_len);
+        }
+        let optional_header_size =
+            u16::from_le_bytes([pe_header[20], pe_header[21]]) as u64;
+        let optional_header_start = pe_offset + 24;
+        if optional_header_size < 2 {
+            return Ok(stream_len);
+        }
+
+        reader.seek(SeekFrom::Start(optional_header_start))?;
+        let mut magic_bytes = [0u8; 2];
+        reader.read_exact(&mut magic_bytes)?;
+        let (number_of_directories_offset, directories_offset) =
+            match u16::from_le_bytes(magic_bytes) {
+                0x10b => (92u64, 96u64),  // PE32
+                0x20b => (108u64, 112u64), // PE32+
+                _ => return Ok(stream_len),
+            };
+        if optional_header_size < number_of_directories_offset + 4
+            || optional_header_size < directories_offset + 5 * 8
+        {
+            return Ok(stream_len);
+        }
+
+        reader.seek(SeekFrom::Start(
+            optional_header_start + number_of_directories_offset,
+        ))?;
+        let mut directory_count = [0u8; 4];
+        reader.read_exact(&mut directory_count)?;
+        if u32::from_le_bytes(directory_count) < 5 {
+            return Ok(stream_len);
+        }
+
+        // IMAGE_DIRECTORY_ENTRY_SECURITY is index 4. Unlike the other PE
+        // directories, its address is a file offset, not an RVA.
+        reader.seek(SeekFrom::Start(
+            optional_header_start + directories_offset + 4 * 8,
+        ))?;
+        let mut security_directory = [0u8; 8];
+        reader.read_exact(&mut security_directory)?;
+        let certificate_offset =
+            u32::from_le_bytes(security_directory[..4].try_into().unwrap()) as u64;
+        let certificate_size =
+            u32::from_le_bytes(security_directory[4..].try_into().unwrap()) as u64;
+        if certificate_offset == 0 && certificate_size == 0 {
+            return Ok(stream_len);
+        }
+        let certificate_end = certificate_offset.checked_add(certificate_size).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Authenticode certificate table range overflows",
+            )
+        })?;
+        if certificate_offset == 0 || certificate_size == 0 || certificate_end != stream_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid PE Authenticode certificate table range",
+            ));
+        }
+        Ok(certificate_offset)
+    }
+
     /// Discovers and validates the direct overlay table within the host executable.
     pub fn read_manifest<R: Read + Seek>(
         reader: R,
@@ -1481,7 +1571,8 @@ impl OverlayReader {
         stream_len: u64,
     ) -> std::io::Result<Vec<u8>> {
         let record = &records[index];
-        let stored_len = Self::stored_len(records, index, stream_len);
+        let payload_end = Self::payload_stream_len(reader)?.min(stream_len);
+        let stored_len = Self::stored_len(records, index, payload_end);
         reader.seek(SeekFrom::Start(record.payload_offset))?;
         let mut stored = vec![0u8; stored_len as usize];
         reader.read_exact(&mut stored)?;
@@ -1528,7 +1619,7 @@ impl OverlayReader {
                 "no SeanPak overlay found in this file",
             )
         })?;
-        let stream_len = reader.seek(SeekFrom::End(0))?;
+        let stream_len = Self::payload_stream_len(&mut reader)?;
         let selected: Vec<usize> = records
             .iter()
             .enumerate()
@@ -1646,6 +1737,86 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn test_pe_stub(size: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; size];
+        bytes[..2].copy_from_slice(b"MZ");
+        let pe_offset = 0x80usize;
+        bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        bytes[pe_offset + 4 + 16..pe_offset + 4 + 18]
+            .copy_from_slice(&0x00f0u16.to_le_bytes());
+        let optional = pe_offset + 24;
+        bytes[optional..optional + 2].copy_from_slice(&0x020bu16.to_le_bytes());
+        bytes[optional + 108..optional + 112].copy_from_slice(&16u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn payload_stream_len_excludes_authenticode_certificate_table() {
+        let certificate_offset = 0x400u32;
+        let certificate_size = 16u32;
+        let mut bytes = test_pe_stub(certificate_offset as usize + certificate_size as usize);
+        let security_entry = 0x80 + 24 + 112 + 4 * 8;
+        bytes[security_entry..security_entry + 4]
+            .copy_from_slice(&certificate_offset.to_le_bytes());
+        bytes[security_entry + 4..security_entry + 8]
+            .copy_from_slice(&certificate_size.to_le_bytes());
+
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(
+            OverlayReader::payload_stream_len(&mut cursor).unwrap(),
+            certificate_offset as u64
+        );
+
+        let mut unsigned = Cursor::new(test_pe_stub(0x500));
+        assert_eq!(
+            OverlayReader::payload_stream_len(&mut unsigned).unwrap(),
+            0x500
+        );
+    }
+
+    #[test]
+    fn extract_reads_payload_before_authenticode_certificate_table() {
+        let root = unique_temp("authenticode");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let expected = b"payload remains readable after signing";
+        std::fs::write(src.join("app.exe"), expected).unwrap();
+        let stub = root.join("stub.exe");
+        std::fs::write(&stub, test_pe_stub(5000)).unwrap();
+        let package = root.join("signed-setup.exe");
+        OverlayWriter::build_from_folder(
+            &stub,
+            &package,
+            &src,
+            "Signed Test",
+            "1.0.0",
+            "Test Publisher",
+        )
+        .unwrap();
+
+        let mut image = std::fs::read(&package).unwrap();
+        let certificate_offset = u32::try_from(image.len()).unwrap();
+        let certificate_size = 16u32;
+        let security_entry = 0x80 + 24 + 112 + 4 * 8;
+        image[security_entry..security_entry + 4]
+            .copy_from_slice(&certificate_offset.to_le_bytes());
+        image[security_entry + 4..security_entry + 8]
+            .copy_from_slice(&certificate_size.to_le_bytes());
+        image.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&package, image).unwrap();
+
+        let mut file = std::fs::File::open(&package).unwrap();
+        assert_eq!(
+            OverlayReader::payload_stream_len(&mut file).unwrap(),
+            certificate_offset as u64
+        );
+        let destination = root.join("extracted");
+        OverlayReader::extract_file(&package, &destination).unwrap();
+        assert_eq!(std::fs::read(destination.join("app.exe")).unwrap(), expected.to_vec());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
