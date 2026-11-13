@@ -15,8 +15,9 @@ This document separates shipped capabilities from candidate improvements and pro
 
 ### Trust, inventory, and deployment formats
 
-- [ ] Add an Authenticode path for generated PE installers and executable payloads. Define certificate handling, timestamping, verification, and secrets-safe CI. Signing can identify a publisher but does not guarantee that SmartScreen will show no warnings; validate signed artifacts and state that limitation. Continue checksumming the portable ZIP.
+- [ ] Add an Authenticode path for generated PE installers. Define certificate handling, timestamping, verification, and secrets-safe CI. Signing can identify a publisher but does not guarantee that SmartScreen will show no warnings; validate signed artifacts and state that limitation. Assess customer-provided payload signing separately; never rewrite or re-sign those files implicitly. Continue checksumming the portable ZIP.
 - [ ] Generate an SBOM for the exact files and versions an installer ships, with SPDX and/or CycloneDX output tied to the build artifact.
+- [ ] Verify each embedded payload's recorded hash or signature before writing it to disk; refuse mismatches and keep offline verification available. Audit the current format and runtime path before assuming this is already covered.
 - [ ] Assess signed build provenance and attestations (for example, SLSA-style provenance), including how artifact hashes are verified. Keep local/offline verification available; any transparency-log lookup at install time must be optional and explicit about network use.
 - [ ] Prove byte-for-byte reproducible builds from the same inputs rather than assuming deterministic release assets imply reproducibility.
 - [ ] Assess centralized signing through an HSM or cloud KMS so developers do not handle exportable signing keys; define permissions, audit, recovery, and compatibility with hosted CI.
@@ -52,7 +53,7 @@ This document separates shipped capabilities from candidate improvements and pro
 
 ### Enterprise operations and ecosystem
 
-- [ ] Evaluate fleet-manifest output for Windows deployment systems such as Intune and SCCM, plus Ansible/Terraform where their Windows support fits the target.
+- [ ] Evaluate fleet-manifest output for Windows deployment systems such as Intune and SCCM, plus Ansible/Terraform where their Windows support fits. Jamf is outside the current Windows-only target unless platform scope changes.
 - [ ] Consider local install-audit and compliance reports, with a clear data-retention and export model.
 - [ ] Consider install-progress telemetry and post-install launch observability only with explicit opt-in consent; remain offline and silent by default.
 - [ ] Assess a reusable-module catalog only with package provenance, permissions, review, and revocation controls; do not treat third-party install actions as trusted by default.
@@ -60,7 +61,7 @@ This document separates shipped capabilities from candidate improvements and pro
 
 ### Developer workflow
 
-- [ ] Evaluate Visual Studio/MSBuild integration that invokes the existing manifest and CLI pipeline without introducing a second packaging implementation. The CLI and GitHub Actions already cover baseline automation; validate any Docker or other runner support against the Windows target before promising it.
+- [ ] Evaluate Visual Studio/MSBuild integration that invokes the existing manifest and CLI pipeline without introducing a second packaging implementation. The CLI and GitHub Actions already cover baseline automation; validate Windows-hosted Jenkins runners, Docker, and other runner support against the Windows target before promising it.
 
 ## Product decisions required
 
