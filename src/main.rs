@@ -122,7 +122,7 @@ fn print_usage() {
          \x20 seanpak.exe --extract <packed.exe> --to <dir> [--json]\n\
          \x20                                      Extract a SeanPak overlay to a directory\n\
          \x20 seanpak.exe --install [--to <dir>] [--dry-run] [--json] [--silent|--headless]\n\
-         \x20                                      [--repair] [--force] [--launch]\n\
+         \x20                                      [--repair] [--force] [--launch] [--elevate]\n\
          \x20                                      [--start-at-login|--no-start-at-login]\n\
          \x20                                      [--components <id,id>] [--without <id,id>]\n\
          \x20                                      [--answers <file.json>]\n\
@@ -156,7 +156,7 @@ fn print_usage() {
          \x20                                      [--start-at-login|--no-start-at-login]\n\
          \x20                                      [--desktop-shortcut|--no-desktop-shortcut]\n\
          \x20                                      [--start-menu-shortcut|--no-start-menu-shortcut]\n\
-         \x20                                      [--path-entry|--no-path-entry]\n\
+         \x20                                      [--path-entry|--no-path-entry] [--elevate]\n\
          \x20                                      Change an existing install in place:\n\
          \x20                                      add/remove components, flip the\n\
          \x20                                      shortcut / association / PATH /\n\
@@ -167,7 +167,7 @@ fn print_usage() {
          \x20                                      console attached, opens the wizard in\n\
          \x20                                      Modify mode instead. The Add/Remove\n\
          \x20                                      Programs Modify button runs this too\n\
-         \x20 seanpak.exe --uninstall [--to <dir>] [--json] [--purge-data]\n\
+         \x20 seanpak.exe --uninstall [--to <dir>] [--json] [--purge-data] [--elevate]\n\
          \x20                                      Remove an installed app: deletes its payload\n\
          \x20                                      files, its uninstall entry, the journaled\n\
          \x20                                      shortcuts/associations/PATH segment/\n\
@@ -180,6 +180,21 @@ fn print_usage() {
          \x20                                      delete the app's recorded data folders.\n\
          \x20                                      Silent/JSON runs never delete data unless\n\
          \x20                                      --purge-data is passed\n\
+         \x20 ELEVATION OFFER:                   SeanPak installs per-user and never asks\n\
+         \x20                                      for administrator rights. When a chosen\n\
+         \x20                                      folder cannot be written by the current\n\
+         \x20                                      account, the wizard and the uninstall\n\
+         \x20                                      confirmation offer \"Restart as\n\
+         \x20                                      administrator\" next to the per-user\n\
+         \x20                                      remedy, and the --json refusal reports\n\
+         \x20                                      \"elevationOffered\": true. Headless runs\n\
+         \x20                                      elevate only when asked: --elevate\n\
+         \x20                                      relaunches the same command elevated\n\
+         \x20                                      (Windows shows its permission prompt),\n\
+         \x20                                      waits for it, and returns its exit code.\n\
+         \x20                                      The internal --elevated-relaunch marker\n\
+         \x20                                      on a relaunched instance stops the offer\n\
+         \x20                                      from ever looping\n\
          \x20 seanpak.exe --help                   This help\n\
          \x20 seanpak.exe --version                Print version\n\
          \n\
@@ -421,7 +436,7 @@ fn run_install(args: &[String]) -> i32 {
             ],
         );
         if json_mode(args) {
-            print_json(&jobj(vec![
+            let mut pairs: Vec<(&str, JsonValue)> = vec![
                 ("command", jstr("install")),
                 ("status", jstr("dry-run")),
                 ("app", jstr(plan.app_name.clone())),
@@ -540,7 +555,15 @@ fn run_install(args: &[String]) -> i32 {
                         .unwrap_or(JsonValue::Null),
                 ),
                 ("changes", JsonValue::Bool(false)),
-            ]));
+            ];
+            if let Some(pair) = elevation_json_field(
+                args,
+                plan.location_writable,
+                seanpak::elevation::ElevationMode::Install,
+            ) {
+                pairs.push(pair);
+            }
+            print_json(&jobj(pairs));
         } else {
             println!(
                 "Dry run: would {} {} {} to {}",
@@ -620,6 +643,14 @@ fn run_install(args: &[String]) -> i32 {
     if let install::LocationVerdict::NotWritable { fallback, detail } =
         install::location_verdict(&dest, &plan.app_name, &options.install_location())
     {
+        // The headless elevation offer (v4.8.0): only behind the
+        // explicit --elevate flag — relaunch elevated, wait, and
+        // propagate the elevated instance's exit code. Without the
+        // flag the refusal below is unchanged, apart from the new
+        // "elevationOffered" field naming the wizard's remedy.
+        if let Some(code) = maybe_elevate(args, false, seanpak::elevation::ElevationMode::Install) {
+            return code;
+        }
         let message = install::location_not_writable_message(&dest, &fallback, &detail);
         diag::record(
             "install",
@@ -631,7 +662,7 @@ fn run_install(args: &[String]) -> i32 {
             ],
         );
         if json_mode(args) {
-            print_json(&jobj(vec![
+            let mut pairs: Vec<(&str, JsonValue)> = vec![
                 ("command", jstr("install")),
                 ("status", jstr("error")),
                 ("reason", jstr(install::REASON_LOCATION_NOT_WRITABLE)),
@@ -639,7 +670,13 @@ fn run_install(args: &[String]) -> i32 {
                 ("dest", jpath(&dest)),
                 ("suggestedLocation", jpath(&fallback)),
                 ("exitCode", JsonValue::Number(EXIT_INSTALL as f64)),
-            ]));
+            ];
+            if let Some(pair) =
+                elevation_json_field(args, false, seanpak::elevation::ElevationMode::Install)
+            {
+                pairs.push(pair);
+            }
+            print_json(&jobj(pairs));
             return EXIT_INSTALL;
         }
         return fail(args, "install", EXIT_INSTALL, &message);
@@ -934,6 +971,29 @@ fn run_uninstall(args: &[String]) -> i32 {
         .map(|r| r.purge_data_default)
         .unwrap_or(false);
 
+    // The elevation offer (v4.8.0): the same writability verdict
+    // decides both the headless --elevate relaunch and the
+    // confirmation window's Restart as administrator button, for
+    // the case where the app lives somewhere this account cannot
+    // write (an install that was itself elevated, for example).
+    let dest_writable = matches!(
+        install::location_verdict(&dest, &manifest.app_name(), &options.install_location()),
+        install::LocationVerdict::Writable
+    );
+    if let Some(code) = maybe_elevate(
+        args,
+        dest_writable,
+        seanpak::elevation::ElevationMode::Uninstall,
+    ) {
+        return code;
+    }
+    let offer_elevation = seanpak::elevation::elevation_offered(
+        dest_writable,
+        seanpak::elevation::is_process_elevated(),
+        seanpak::elevation::has_relaunch_marker(args),
+        seanpak::elevation::ElevationMode::Uninstall,
+    );
+
     let mut purge_data = has_flag(args, &["--purge-data"]);
     let interactive = !quiet_mode(args) && !json_mode(args);
     if interactive && !purge_data {
@@ -941,9 +1001,18 @@ fn run_uninstall(args: &[String]) -> i32 {
             &manifest.app_name(),
             &recorded_data_dirs,
             purge_default,
+            offer_elevation,
         ) {
-            Some(purge) => purge_data = purge,
-            None => {
+            seanpak::wizard::UninstallConfirmation::Proceed { purge_data: chosen } => {
+                purge_data = chosen;
+            }
+            seanpak::wizard::UninstallConfirmation::RelaunchedElevated => {
+                println!(
+                    "Restarting as administrator — the uninstall continues in the elevated window."
+                );
+                return EXIT_OK;
+            }
+            seanpak::wizard::UninstallConfirmation::Cancelled => {
                 println!("Uninstall cancelled; nothing was removed.");
                 return EXIT_OK;
             }
@@ -1046,6 +1115,10 @@ fn run_modify(args: &[String]) -> i32 {
     };
     let app_name = manifest.app_name();
     let dest = modify_dest(args, &options, &app_name);
+    // Captured before `options` is consumed below: the package's
+    // recorded location, which the writability verdict compares the
+    // destination against.
+    let recorded_location = options.install_location();
 
     // Option deltas from the flags, layered over the install's
     // current state: the override the operation expects is the full
@@ -1103,7 +1176,7 @@ fn run_modify(args: &[String]) -> i32 {
         return match seanpak::modify::plan_modify(&exe, &dest, &request) {
             Ok(plan) => {
                 if json_mode(args) {
-                    print_json(&jobj(vec![
+                    let mut pairs: Vec<(&str, JsonValue)> = vec![
                         ("command", jstr("modify")),
                         ("status", jstr("dry-run")),
                         ("app", jstr(plan.app_name.clone())),
@@ -1168,7 +1241,15 @@ fn run_modify(args: &[String]) -> i32 {
                                 .unwrap_or(JsonValue::Null),
                         ),
                         ("changes", JsonValue::Bool(false)),
-                    ]));
+                    ];
+                    if let Some(pair) = elevation_json_field(
+                        args,
+                        plan.location_writable,
+                        seanpak::elevation::ElevationMode::Modify,
+                    ) {
+                        pairs.push(pair);
+                    }
+                    print_json(&jobj(pairs));
                 } else {
                     println!(
                         "Dry run: would modify {} {} (installed: {}) at {}",
@@ -1195,6 +1276,49 @@ fn run_modify(args: &[String]) -> i32 {
             }
             Err(e) => fail(args, "modify", EXIT_INSTALL, &e),
         };
+    }
+
+    // Pre-flight writability check, mirroring install (v4.8.0): a
+    // modify against a folder this account cannot write refuses
+    // before the operation snapshots anything, with the same
+    // structured report — and the same --elevate relaunch behind
+    // the explicit flag. (For the usual destination — the recorded
+    // install location itself — the verdict is writable and this
+    // never fires.)
+    if let install::LocationVerdict::NotWritable { fallback, detail } =
+        install::location_verdict(&dest, &app_name, &recorded_location)
+    {
+        if let Some(code) = maybe_elevate(args, false, seanpak::elevation::ElevationMode::Modify) {
+            return code;
+        }
+        let message = install::location_not_writable_message(&dest, &fallback, &detail);
+        diag::record(
+            "modify",
+            vec![
+                ("status", jstr("error")),
+                ("reason", jstr(install::REASON_LOCATION_NOT_WRITABLE)),
+                ("error", jstr(message.clone())),
+            ],
+        );
+        if json_mode(args) {
+            let mut pairs: Vec<(&str, JsonValue)> = vec![
+                ("command", jstr("modify")),
+                ("status", jstr("error")),
+                ("reason", jstr(install::REASON_LOCATION_NOT_WRITABLE)),
+                ("error", jstr(message)),
+                ("dest", jpath(&dest)),
+                ("suggestedLocation", jpath(&fallback)),
+                ("exitCode", JsonValue::Number(EXIT_INSTALL as f64)),
+            ];
+            if let Some(pair) =
+                elevation_json_field(args, false, seanpak::elevation::ElevationMode::Modify)
+            {
+                pairs.push(pair);
+            }
+            print_json(&jobj(pairs));
+            return EXIT_INSTALL;
+        }
+        return fail(args, "modify", EXIT_INSTALL, &message);
     }
 
     match seanpak::modify::perform_modify(&exe, &dest, &request, None, None) {
@@ -1372,7 +1496,13 @@ fn modify_options_json(summary: &seanpak::modify::ModifyOptionSummary) -> JsonVa
 /// flag (or a machine mode): those run headlessly; a bare interactive
 /// `--modify` opens the wizard's Modify mode instead.
 fn modify_is_headless(args: &[String]) -> bool {
-    if json_mode(args) || quiet_mode(args) || has_flag(args, &["--dry-run", "--to"]) {
+    if json_mode(args)
+        || quiet_mode(args)
+        || has_flag(
+            args,
+            &["--dry-run", "--to", seanpak::elevation::ELEVATE_FLAG],
+        )
+    {
         return true;
     }
     const OPTION_FLAGS: [&str; 11] = [
@@ -1389,6 +1519,81 @@ fn modify_is_headless(args: &[String]) -> bool {
         "--file-associations",
     ];
     args.iter().any(|a| OPTION_FLAGS.contains(&a.as_str()))
+}
+
+/// The headless side of the elevation offer (v4.8.0): when the
+/// caller passed `--elevate` and the shared decision says a restart
+/// would be offered (the location is unwritable, this process is
+/// unelevated, and this instance is not itself a relaunch), relaunch
+/// this same command elevated — the same arguments minus `--elevate`,
+/// plus the marker — wait for the elevated instance, and return its
+/// exit code. Returns `None` when no relaunch applies, leaving the
+/// caller on its ordinary refusal path. A relaunch that Windows
+/// refuses (the permission prompt was declined) is reported and
+/// mapped to the install-failure exit, never retried.
+fn maybe_elevate(
+    args: &[String],
+    writable: bool,
+    mode: seanpak::elevation::ElevationMode,
+) -> Option<i32> {
+    if !has_flag(args, &[seanpak::elevation::ELEVATE_FLAG]) {
+        return None;
+    }
+    if !seanpak::elevation::elevation_offered(
+        writable,
+        seanpak::elevation::is_process_elevated(),
+        seanpak::elevation::has_relaunch_marker(args),
+        mode,
+    ) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let child_args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != seanpak::elevation::ELEVATE_FLAG)
+        .cloned()
+        .collect();
+    match seanpak::elevation::relaunch_elevated_wait(&exe, &child_args) {
+        Ok(code) => Some(code),
+        Err(e) => {
+            eprintln!("[ERROR] {}", e.describe());
+            Some(EXIT_INSTALL)
+        }
+    }
+}
+
+/// The `elevationOffered` JSON pair for a writability report: the
+/// pair exists only when the location is unwritable (on writable
+/// paths the offer makes no sense and the field is omitted).
+fn elevation_json_field(
+    args: &[String],
+    writable: bool,
+    mode: seanpak::elevation::ElevationMode,
+) -> Option<(&'static str, JsonValue)> {
+    seanpak::elevation::elevation_offered_field(
+        writable,
+        seanpak::elevation::is_process_elevated(),
+        seanpak::elevation::has_relaunch_marker(args),
+        mode,
+    )
+    .map(|offered| ("elevationOffered", JsonValue::Bool(offered)))
+}
+
+/// `args` with the named value-taking flags (and their values)
+/// removed; used to recognize an elevated wizard relaunch, whose
+/// arguments are only the marker plus carried choices.
+fn strip_value_flags(args: &[String], names: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if names.contains(&args[i].as_str()) {
+            i += 2;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
 }
 
 /// `seanpak inspect <Setup.exe>`: the full package report.
@@ -1706,6 +1911,8 @@ fn run_wizard(
     records: Vec<FileRecordHeader>,
     options: InstallOptions,
     power: seanpak::overlay::PowerSpec,
+    preset_answers: Option<PathBuf>,
+    relaunch_location: Option<PathBuf>,
 ) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1715,6 +1922,15 @@ fn run_wizard(
         }
     };
     let mut wizard = InstallWizard::new(manifest, records, options, exe, power);
+    // An elevated relaunch carries the user's already-made choices
+    // (v4.8.0): the preset they applied and the location they were
+    // looking at land before the first page.
+    if let Some(path) = preset_answers {
+        wizard = wizard.with_preset_answers(path);
+    }
+    if let Some(dir) = relaunch_location {
+        wizard = wizard.with_relaunch_location(dir);
+    }
     match wizard.run() {
         Ok(()) => 0,
         Err(err_code) => {
@@ -2579,13 +2795,48 @@ fn main() {
     if has_flag(&args, &["--install", "--extract-self"]) {
         std::process::exit(run_install(&args));
     }
+
+    // An elevated relaunch of the bare wizard (v4.8.0): the marker
+    // plus only the choices the unelevated instance carried
+    // (--answers <file> and/or --to <dir>) routes back to the
+    // wizard, which applies them before its first page. Flag-bearing
+    // commands above have already claimed their own relaunches; a
+    // marker riding any other argument mix changes nothing here —
+    // those paths read it themselves as the loop guard.
+    if seanpak::elevation::has_relaunch_marker(&args) {
+        let without_marker: Vec<String> = args
+            .iter()
+            .filter(|a| a.as_str() != seanpak::elevation::ELEVATED_RELAUNCH_ARG)
+            .cloned()
+            .collect();
+        if strip_value_flags(&without_marker, &["--answers", "--to"]).is_empty() {
+            if let Some((manifest, records, options, power)) = own_overlay_package_full() {
+                diag::log(
+                    "mode",
+                    &format!(
+                        "installer wizard (elevated relaunch: {})",
+                        manifest.app_name()
+                    ),
+                );
+                std::process::exit(run_wizard(
+                    manifest,
+                    records,
+                    options,
+                    power,
+                    flag_value(&args, &["--answers"]).map(PathBuf::from),
+                    flag_value(&args, &["--to"]).map(PathBuf::from),
+                ));
+            }
+        }
+    }
+
     if args.is_empty() {
         if let Some((manifest, records, options, power)) = own_overlay_package_full() {
             diag::log(
                 "mode",
                 &format!("installer wizard (own overlay: {})", manifest.app_name()),
             );
-            std::process::exit(run_wizard(manifest, records, options, power));
+            std::process::exit(run_wizard(manifest, records, options, power, None, None));
         }
         diag::log("mode", "packager GUI (no overlay in own executable)");
     }

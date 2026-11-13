@@ -2,6 +2,7 @@ pub mod answers;
 pub mod backends;
 pub mod codec;
 pub mod diag;
+pub mod elevation;
 pub mod hash;
 pub mod hooks;
 pub mod init;

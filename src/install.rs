@@ -21,7 +21,10 @@
 //! journal starts, a writability pre-flight
 //! ([`ensure_location_writable`]) refuses destinations this per-user
 //! process cannot write, suggesting the per-user Programs folder
-//! instead — installs never elevate.
+//! instead. Installs never elevate on their own — the single
+//! exception is the user-invoked restart-as-administrator offer
+//! ([`crate::elevation`], v4.8.0), which relaunches the process
+//! elevated only on the user's explicit click or `--elevate` flag.
 //!
 //! Packages carrying an overlay v6 power block (see
 //! [`crate::overlay::PowerSpec`]) extend the same run: the component
@@ -279,7 +282,7 @@ pub fn plan_install(
 pub const REASON_LOCATION_NOT_WRITABLE: &str = "location_not_writable";
 
 /// Pre-flight verdict for an install destination: can this per-user
-/// process write there? SeanPak installs never elevate, so a folder
+/// process write there? SeanPak installs never elevate on their own, so a folder
 /// that needs administrator access (the classic `C:\Program Files`
 /// case, field-proven with the ai.md 0.6.0 package) must be caught
 /// *before* the install starts — not midway through extraction.

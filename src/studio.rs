@@ -1,24 +1,29 @@
-//! The SeanPak Builder studio (TesselGUI Design H — the IDE layout) —
-//! the secondary, human-facing surface over the same operations the
-//! CLI exposes.
+//! The SeanPak Builder — the secondary, human-facing surface over
+//! the same operations the CLI exposes.
 //!
-//! Layout (approved mockup `h-studio-ide`): a slim toolbar strip along
-//! the top (Open / Save / Save As / Check details, with the
-//! app name · version at its right), a files-directory listing pane
-//! on the left, the dominant files detail table in the center, the
-//! app-manifest editor on the right, and an output strip along the
-//! bottom, in the shared TesselGUI 1.4.0 palette. Every action
-//! calls a shared operation — pack is `pack::pack_with_hooks`, validate is
-//! `manifest::AppManifest::from_json`, verify is `pack::verify_package_with`
-//! / `pack::sandbox_verify_with`, and the file listing is
-//! `scanner::ScannedFolder::scan_with` — so the studio can do nothing the
-//! CLI cannot (see `docs/PARITY.md`). The worker operations take
-//! the studio's cancel flag and progress sink; the CLI passes
-//! neither, so its behavior is unchanged.
+//! Layout (v5.0.0, SEAN-approved mockups in `~/workspace/seanpak/
+//! mockups-v5/`): a guided, page-based flow in place of the 4.x
+//! single dense IDE window. A slim left nav (Home · Projects ·
+//! Build · Settings) switches pages: a Home dashboard with recent
+//! projects, a three-step New Project flow (details → program
+//! folder → summary), the project editor as three tabs (Files and
+//! Folders · Installer Options · Program Requirements), and the
+//! build as three states (Build Settings → Building → Build
+//! Finished). The theme is VS Code's GitHub Dark High Contrast,
+//! taken directly through the shared tokens in `src/theme.rs`.
+//! Every action calls a shared operation — pack is
+//! `pack::pack_with_hooks`, validate is
+//! `manifest::AppManifest::from_json`, verify is
+//! `pack::verify_package_with` / `pack::sandbox_verify_with`, and
+//! the file listing is `scanner::ScannedFolder::scan_with` — so the
+//! Builder can do nothing the CLI cannot (see `docs/PARITY.md`).
+//! The worker operations take the Builder's cancel flag and
+//! progress sink; the CLI passes neither, so its behavior is
+//! unchanged.
 //!
-//! This module's first half is the platform-independent document and
-//! settings model (unit-tested on any host); the Win32 window itself is
-//! Windows-only, like the wizard.
+//! This module's first half is the platform-independent document,
+//! settings, and recent-projects model (unit-tested on any host);
+//! the Win32 window itself is Windows-only, like the wizard.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -382,10 +387,49 @@ impl StudioDocument {
 }
 
 // ---------------------------------------------------------------------------
-// Studio settings: window geometry + last-used paths, as a small JSON
-// file beside the executable — the same "beside the exe" location the
-// diagnostics log uses (see `diag::log_path`). No registry, no config
-// framework.
+// Studio settings: window geometry, last-used paths, and the recent
+// projects list, as a small JSON file beside the executable — the
+// same "beside the exe" location the diagnostics log uses (see
+// `diag::log_path`). No registry, no config framework.
+
+/// One project the Builder has opened or saved: the manifest path
+/// plus the name/version it carried at the time, so the Home
+/// dashboard and the Projects page can list it without opening
+/// every file. (The modified time shown beside it is read live from
+/// the file, so it stays true even if the entry is stale.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentProject {
+    pub path: PathBuf,
+    pub name: String,
+    pub version: String,
+}
+
+/// The recent-projects list is a convenience, not an archive: the
+/// dashboard shows the first few and the Projects page the rest.
+pub const MAX_RECENT_PROJECTS: usize = 12;
+
+/// How long ago `then` was, in the plain words the dashboard uses
+/// ("just now", "5 minutes ago", "2 hours ago", "3 days ago", or a
+/// date once it is older than a month). Pure, so it is unit-tested.
+pub fn relative_time_text(now_unix: u64, then_unix: u64) -> String {
+    let secs = now_unix.saturating_sub(then_unix);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => {
+            let n = secs / 60;
+            format!("{n} minute{} ago", if n == 1 { "" } else { "s" })
+        }
+        3600..=86399 => {
+            let n = secs / 3600;
+            format!("{n} hour{} ago", if n == 1 { "" } else { "s" })
+        }
+        86400..=2591999 => {
+            let n = secs / 86400;
+            format!("{n} day{} ago", if n == 1 { "" } else { "s" })
+        }
+        _ => "over a month ago".to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StudioSettings {
@@ -394,6 +438,8 @@ pub struct StudioSettings {
     pub manifest_path: Option<PathBuf>,
     pub files_dir: Option<PathBuf>,
     pub out_dir: Option<PathBuf>,
+    /// Projects opened or saved, most recent first.
+    pub recents: Vec<RecentProject>,
 }
 
 /// `seanpak-studio.json` beside the executable (temp dir fallback,
@@ -434,11 +480,24 @@ impl StudioSettings {
             ]),
             None => JsonValue::Null,
         };
+        let recents = JsonValue::Array(
+            self.recents
+                .iter()
+                .map(|r| {
+                    jobj(vec![
+                        ("path", jstr(r.path.display().to_string())),
+                        ("name", jstr(r.name.clone())),
+                        ("version", jstr(r.version.clone())),
+                    ])
+                })
+                .collect(),
+        );
         jobj(vec![
             ("window", window),
             ("manifestPath", path(&self.manifest_path)),
             ("filesDir", path(&self.files_dir)),
             ("outDir", path(&self.out_dir)),
+            ("recentProjects", recents),
         ])
     }
 
@@ -470,12 +529,60 @@ impl StudioSettings {
             }
             _ => None,
         };
+        let recents = match root.get("recentProjects") {
+            Some(JsonValue::Array(items)) => items
+                .iter()
+                .filter_map(|item| {
+                    let path = item.get("path").and_then(|v| v.as_str())?;
+                    if path.is_empty() {
+                        return None;
+                    }
+                    Some(RecentProject {
+                        path: PathBuf::from(path),
+                        name: item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        version: item
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .take(MAX_RECENT_PROJECTS)
+                .collect(),
+            _ => Vec::new(),
+        };
         Some(Self {
             window_rect,
             manifest_path: get_path("manifestPath"),
             files_dir: get_path("filesDir"),
             out_dir: get_path("outDir"),
+            recents,
         })
+    }
+
+    /// Records a project as just opened or saved: an existing entry
+    /// for the same path moves to the front with fresh name/version,
+    /// a new one is prepended, and the tail is trimmed to the cap.
+    pub fn touch_recent(&mut self, path: &Path, name: &str, version: &str) {
+        self.recents.retain(|r| r.path != path);
+        self.recents.insert(
+            0,
+            RecentProject {
+                path: path.to_path_buf(),
+                name: name.to_string(),
+                version: version.to_string(),
+            },
+        );
+        self.recents.truncate(MAX_RECENT_PROJECTS);
+    }
+
+    /// Drops one entry (the file itself is never touched).
+    pub fn remove_recent(&mut self, path: &Path) {
+        self.recents.retain(|r| r.path != path);
     }
 }
 
@@ -541,6 +648,11 @@ mod tests {
             manifest_path: Some(PathBuf::from("C:/apps/Foo/manifest.json")),
             files_dir: Some(PathBuf::from("C:/apps/Foo")),
             out_dir: None,
+            recents: vec![RecentProject {
+                path: PathBuf::from("C:/apps/Foo/manifest.json"),
+                name: "Foo".to_string(),
+                version: "1.2.0".to_string(),
+            }],
         };
         let text = settings.to_json().render();
         let back = StudioSettings::from_json(&text).expect("settings parse");
@@ -549,6 +661,48 @@ mod tests {
         assert_eq!(StudioSettings::from_json("not json"), None);
         let tiny = StudioSettings::from_json(r#"{"window":[0,0,10,10]}"#).unwrap();
         assert_eq!(tiny.window_rect, None);
+        // A pre-v5 settings file (no recentProjects) loads with an
+        // empty list rather than failing.
+        let legacy = StudioSettings::from_json(r#"{"window":[0,0,800,600]}"#).unwrap();
+        assert!(legacy.recents.is_empty());
+    }
+
+    #[test]
+    fn recents_touch_moves_to_front_and_caps() {
+        let mut settings = StudioSettings::default();
+        settings.touch_recent(Path::new("C:/a/manifest.json"), "A", "1.0");
+        settings.touch_recent(Path::new("C:/b/manifest.json"), "B", "2.0");
+        settings.touch_recent(Path::new("C:/a/manifest.json"), "A", "1.1");
+        assert_eq!(settings.recents.len(), 2);
+        assert_eq!(settings.recents[0].name, "A");
+        assert_eq!(settings.recents[0].version, "1.1");
+        for i in 0..MAX_RECENT_PROJECTS + 3 {
+            settings.touch_recent(Path::new(&format!("C:/p{i}/manifest.json")), "P", "1.0");
+        }
+        assert_eq!(settings.recents.len(), MAX_RECENT_PROJECTS);
+        settings.remove_recent(Path::new(&format!(
+            "C:/p{}/manifest.json",
+            MAX_RECENT_PROJECTS + 2
+        )));
+        assert_eq!(settings.recents.len(), MAX_RECENT_PROJECTS - 1);
+    }
+
+    #[test]
+    fn relative_time_words() {
+        let now = 1_000_000_000u64;
+        assert_eq!(relative_time_text(now, now), "just now");
+        assert_eq!(relative_time_text(now, now - 60), "1 minute ago");
+        assert_eq!(relative_time_text(now, now - 1500), "25 minutes ago");
+        assert_eq!(relative_time_text(now, now - 3600), "1 hour ago");
+        assert_eq!(relative_time_text(now, now - 7200), "2 hours ago");
+        assert_eq!(relative_time_text(now, now - 86400), "1 day ago");
+        assert_eq!(relative_time_text(now, now - 432000), "5 days ago");
+        assert_eq!(
+            relative_time_text(now, now - 86400 * 40),
+            "over a month ago"
+        );
+        // A file timestamped in the future reads as "just now", never negative.
+        assert_eq!(relative_time_text(now, now + 500), "just now");
     }
 
     #[test]
@@ -793,17 +947,39 @@ mod imp {
 
     use super::{
         build_rows, data_dirs_text, parse_data_dirs, parse_power_blocks, power_blocks_text,
-        scan_package_with, tree_entries, FileRow, ScanOutcome, StudioDocument, StudioSettings,
+        relative_time_text, scan_package_with, tree_entries, FileRow, ScanOutcome, StudioDocument,
+        StudioSettings,
     };
-    use crate::manifest::{jstr, AppManifest, JsonValue, MANIFEST_SCHEMA_JSON};
+    use crate::manifest::{jobj, jstr, AppManifest, JsonValue, MANIFEST_SCHEMA_JSON};
     use crate::pack::{PackError, PackOutcome};
     use crate::scanner::format_bytes;
 
-    // Colors come from the shared TesselGUI 1.4.0 theme module —
-    // this window keeps no private palette.
+    // Colors come from the shared theme module (VS Code GitHub Dark
+    // High Contrast tokens) — this window keeps no private palette.
     use crate::theme;
 
-    // Controls.
+    // ---- pages ----
+
+    /// The Builder's pages. The left nav selects a section (Home,
+    /// Projects, Build, Settings); the editor is three pages under
+    /// Projects, and the build is three pages under Build.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Page {
+        Home,
+        ProjectList,
+        NewProject,
+        EditorFiles,
+        EditorOptions,
+        EditorRequirements,
+        BuildSettings,
+        Building,
+        BuildDone,
+        Settings,
+    }
+
+    // ---- controls ----
+    // Manifest-field IDs keep their 4.x numbers so fill/harvest and
+    // the job handlers carry over unchanged.
     const ID_LIST: usize = 100;
     const ID_BTN_PROGRAM_FOLDER: usize = 101;
     const ID_BTN_REMOVE: usize = 103;
@@ -832,13 +1008,8 @@ mod imp {
     const ID_BTN_TEST: usize = 151;
     const ID_BTN_BUILD: usize = 152;
     const ID_LBL_FILES_HDR: usize = 160;
-    const ID_LBL_MANIFEST_HDR: usize = 161;
-    const ID_LBL_OUTPUT_HDR: usize = 162;
-    const ID_LBL_FACTS: usize = 163;
     const ID_LBL_PACKAGE_HDR: usize = 165;
     const ID_FOOTER_SEP: usize = 166;
-    // IDE layout (Design H): toolbar strip, left files pane, center
-    // totals line, and the install-options fields in the manifest pane.
     const ID_BTN_TB_OPEN: usize = 180;
     const ID_BTN_TB_SAVE: usize = 181;
     const ID_BTN_TB_SAVEAS: usize = 182;
@@ -857,11 +1028,11 @@ mod imp {
     const ID_LBL_DATADIRS: usize = 198;
     const ID_EDT_POWER: usize = 199;
     const ID_LBL_POWER: usize = 200;
-    // Field labels inside the manifest panel (colored as one group).
-    const PANEL_LABELS: [usize; 9] = [170, 171, 172, 173, 174, 175, 176, 177, 178];
-    // Every checkbox in the window (all owner-drawn; a click toggles
-    // the stored check state — see WM_COMMAND).
-    const CHECKBOX_IDS: [usize; 8] = [
+    // Field labels inside the options page's details group.
+    const PANEL_LABELS: [usize; 7] = [170, 171, 172, 173, 174, 175, 176];
+    // Every owner-drawn checkbox in the window (a click toggles the
+    // stored check state — see WM_COMMAND).
+    const CHECKBOX_IDS: [usize; 13] = [
         ID_CHK_DESKTOP,
         ID_CHK_STARTMENU,
         ID_CHK_PATH,
@@ -870,29 +1041,353 @@ mod imp {
         ID_CHK_LOGIN_OFFER,
         ID_CHK_LOGIN_DEFAULT,
         ID_CHK_SANDBOX,
+        ID_CHK_WINREQ,
+        ID_CHK_RT1,
+        ID_CHK_RT2,
+        ID_CHK_RT3,
+        ID_CHK_RT4,
     ];
 
-    // Menus.
-    const IDM_FILE_OPEN: usize = 9001;
-    const IDM_FILE_SAVE: usize = 9002;
-    const IDM_FILE_SAVEAS: usize = 9003;
-    const IDM_FILE_EXIT: usize = 9004;
-    const IDM_PROJ_FILES: usize = 9011;
-    const IDM_PROJ_OUT: usize = 9012;
-    const IDM_BUILD_VALIDATE: usize = 9021;
-    const IDM_BUILD_PACK: usize = 9022;
-    const IDM_BUILD_VERIFY: usize = 9023;
-    const IDM_BUILD_TEST: usize = 9024;
-    const IDM_BUILD_PREVIEW: usize = 9025;
-    const IDM_TOOLS_SCHEMA: usize = 9031;
-    const IDM_TOOLS_LOG: usize = 9032;
-    const IDM_HELP_ABOUT: usize = 9041;
+    // Nav rail.
+    const ID_NAV_HOME: usize = 300;
+    const ID_NAV_PROJECTS: usize = 301;
+    const ID_NAV_BUILD: usize = 302;
+    const ID_NAV_SETTINGS: usize = 303;
+    // Home.
+    const ID_LBL_HOME_TITLE: usize = 310;
+    const ID_LBL_HOME_SUB: usize = 311;
+    const ID_BTN_NEW_PROJECT: usize = 312;
+    const ID_LBL_RECENT_HDR: usize = 313;
+    const ID_BTN_VIEW_ALL: usize = 314;
+    const ID_RECENTS: usize = 315;
+    // Projects list.
+    const ID_LBL_PL_TITLE: usize = 320;
+    const ID_LBL_PL_SUB: usize = 321;
+    const ID_BTN_PL_OPEN: usize = 322;
+    const ID_BTN_PL_REMOVE: usize = 323;
+    const ID_BTN_PL_NEW: usize = 324;
+    const ID_BTN_PL_PICK: usize = 325;
+    const ID_LBL_PL_CURRENT: usize = 326;
+    // New Project flow.
+    const ID_LBL_NP_TITLE: usize = 330;
+    const ID_LBL_NP_SUB: usize = 331;
+    const ID_LBL_NP_STEP1: usize = 332;
+    const ID_LBL_NP_STEP2: usize = 333;
+    const ID_LBL_NP_STEP3: usize = 334;
+    const ID_EDT_NP_NAME: usize = 335;
+    const ID_EDT_NP_VERSION: usize = 336;
+    const ID_EDT_NP_PUBLISHER: usize = 337;
+    const ID_LBL_NP_NAME: usize = 338;
+    const ID_LBL_NP_VERSION: usize = 339;
+    const ID_LBL_NP_PUBLISHER: usize = 340;
+    const ID_EDT_NP_FOLDER: usize = 341;
+    const ID_BTN_NP_BROWSE: usize = 342;
+    const ID_LBL_NP_FOLDER: usize = 343;
+    const ID_LBL_NP_FOLDER_NOTE: usize = 344;
+    const ID_LBL_NP_SUMMARY: usize = 345;
+    const ID_BTN_NP_CANCEL: usize = 346;
+    const ID_BTN_NP_BACK: usize = 347;
+    const ID_BTN_NP_NEXT: usize = 348;
+    // Editor tabs.
+    const ID_TAB_FILES: usize = 350;
+    const ID_TAB_OPTIONS: usize = 351;
+    const ID_TAB_REQUIREMENTS: usize = 352;
+    // Files page.
+    const ID_LBL_FILES_TITLE: usize = 360;
+    const ID_LBL_FILES_SUB: usize = 361;
+    const ID_LBL_FOLDER_PATH_LBL: usize = 363;
+    // Options page.
+    const ID_LBL_OPT_TITLE: usize = 370;
+    const ID_LBL_OPT_SUB: usize = 371;
+    const ID_LBL_OPT_DETAILS: usize = 372;
+    const ID_LBL_OPT_ICON: usize = 373;
+    const ID_LBL_ICON_VALUE: usize = 374;
+    const ID_LBL_OPT_SHORTCUTS: usize = 375;
+    const ID_LBL_DATA_NOTE: usize = 376;
+    const ID_BTN_SCHEMA: usize = 377;
+    const ID_LBL_PREVIEW_HDR: usize = 378;
+    const ID_LBL_LOC_NOTE: usize = 379;
+    // Requirements page.
+    const ID_LBL_REQ_TITLE: usize = 380;
+    const ID_LBL_REQ_SUB: usize = 381;
+    const ID_LBL_REQ_WIN_HDR: usize = 382;
+    const ID_CHK_WINREQ: usize = 383;
+    const ID_LBL_WINREQ_TAG: usize = 384;
+    const ID_LBL_REQ_RT_HDR: usize = 385;
+    const ID_CHK_RT1: usize = 386;
+    const ID_CHK_RT2: usize = 387;
+    const ID_CHK_RT3: usize = 388;
+    const ID_CHK_RT4: usize = 389;
+    const ID_LBL_RT_TAG1: usize = 390;
+    const ID_LBL_RT_TAG2: usize = 391;
+    const ID_LBL_RT_TAG3: usize = 392;
+    const ID_LBL_RT_TAG4: usize = 393;
+    const ID_LBL_REQ_NOTE: usize = 394;
+    const ID_BTN_REQ_BACK: usize = 395;
+    const ID_BTN_REQ_NEXT: usize = 396;
+    // Build Settings page.
+    const ID_LBL_BS_TITLE: usize = 400;
+    const ID_LBL_BS_SUB: usize = 401;
+    const ID_LBL_BS_ARCH_HDR: usize = 402;
+    const ID_LBL_BS_ARCH: usize = 403;
+    const ID_LBL_BS_COMP_HDR: usize = 404;
+    const ID_CHK_COMPRESS: usize = 405;
+    const ID_LBL_BS_OUT_HDR: usize = 406;
+    const ID_LBL_BS_GET_HDR: usize = 407;
+    const ID_LBL_OUTPUTS: usize = 408;
+    const ID_LBL_BS_CHECK_HDR: usize = 409;
+    const ID_BTN_BS_BACK: usize = 410;
+    const ID_LBL_BS_CONSOLE_HDR: usize = 411;
+    // Building page.
+    const ID_LBL_ING_TITLE: usize = 420;
+    const ID_LBL_ING_SUB: usize = 421;
+    const ID_LBL_ING_PHASE: usize = 422;
+    const ID_PROGRESS: usize = 423;
+    const ID_LBL_ING_PCT: usize = 424;
+    const ID_BTN_CLEAR: usize = 425;
+    // Build Finished page.
+    const ID_LBL_DONE_TITLE: usize = 430;
+    const ID_LBL_DONE_SUB: usize = 431;
+    const ID_LBL_DONE_SUMMARY: usize = 432;
+    const ID_LBL_DONE_REASON: usize = 433;
+    const ID_BTN_DONE_INSTALLER: usize = 434;
+    const ID_BTN_DONE_FOLDER: usize = 435;
+    const ID_BTN_DONE_AGAIN: usize = 436;
+    const ID_BTN_DONE_BACK: usize = 437;
+    // Settings page.
+    const ID_LBL_SET_TITLE: usize = 440;
+    const ID_LBL_SET_RECENTS_HDR: usize = 441;
+    const ID_LBL_SET_RECENTS: usize = 442;
+    const ID_BTN_CLEAR_RECENTS: usize = 443;
+    const ID_LBL_SET_DIAG_HDR: usize = 444;
+    const ID_LBL_SET_LOG: usize = 445;
+    const ID_BTN_OPEN_LOG: usize = 446;
+    const ID_LBL_SET_SETTINGS: usize = 447;
+    const ID_LBL_SET_ABOUT_HDR: usize = 448;
+    const ID_LBL_SET_VERSION: usize = 449;
+    const ID_BTN_ABOUT: usize = 450;
+    const ID_LBL_SET_FACTS: usize = 451;
+
+    /// Every control the layout shows or hides per page (the footer
+    /// status line, its separator, and Cancel are always visible and
+    /// not listed here).
+    const ALL_PAGE_CONTROLS: &[usize] = &[
+        ID_NAV_HOME,
+        ID_NAV_PROJECTS,
+        ID_NAV_BUILD,
+        ID_NAV_SETTINGS,
+        ID_LBL_HOME_TITLE,
+        ID_LBL_HOME_SUB,
+        ID_BTN_NEW_PROJECT,
+        ID_LBL_RECENT_HDR,
+        ID_BTN_VIEW_ALL,
+        ID_RECENTS,
+        ID_LBL_PL_TITLE,
+        ID_LBL_PL_SUB,
+        ID_BTN_PL_OPEN,
+        ID_BTN_PL_REMOVE,
+        ID_BTN_PL_NEW,
+        ID_BTN_PL_PICK,
+        ID_LBL_PL_CURRENT,
+        ID_LBL_NP_TITLE,
+        ID_LBL_NP_SUB,
+        ID_LBL_NP_STEP1,
+        ID_LBL_NP_STEP2,
+        ID_LBL_NP_STEP3,
+        ID_EDT_NP_NAME,
+        ID_EDT_NP_VERSION,
+        ID_EDT_NP_PUBLISHER,
+        ID_LBL_NP_NAME,
+        ID_LBL_NP_VERSION,
+        ID_LBL_NP_PUBLISHER,
+        ID_EDT_NP_FOLDER,
+        ID_BTN_NP_BROWSE,
+        ID_LBL_NP_FOLDER,
+        ID_LBL_NP_FOLDER_NOTE,
+        ID_LBL_NP_SUMMARY,
+        ID_BTN_NP_CANCEL,
+        ID_BTN_NP_BACK,
+        ID_BTN_NP_NEXT,
+        ID_TAB_FILES,
+        ID_TAB_OPTIONS,
+        ID_TAB_REQUIREMENTS,
+        ID_BTN_TB_OPEN,
+        ID_BTN_TB_SAVE,
+        ID_BTN_TB_SAVEAS,
+        ID_BTN_TB_VALIDATE,
+        ID_LBL_APPVER,
+        ID_LBL_FILES_TITLE,
+        ID_LBL_FILES_SUB,
+        ID_LBL_FOLDER_PATH_LBL,
+        ID_EDT_FILES_DIR,
+        ID_BTN_FILES_DIR,
+        ID_LBL_FILES_PANE_HDR,
+        ID_TREE,
+        ID_BTN_PROGRAM_FOLDER,
+        ID_LBL_PACKAGE_HDR,
+        ID_LIST,
+        ID_LBL_TOTALS,
+        ID_BTN_REMOVE,
+        ID_LBL_OPT_TITLE,
+        ID_LBL_OPT_SUB,
+        ID_LBL_OPT_DETAILS,
+        PANEL_LABELS[0],
+        PANEL_LABELS[1],
+        PANEL_LABELS[2],
+        PANEL_LABELS[3],
+        PANEL_LABELS[4],
+        PANEL_LABELS[5],
+        PANEL_LABELS[6],
+        ID_EDT_NAME,
+        ID_EDT_VERSION,
+        ID_EDT_PUBLISHER,
+        ID_EDT_PRIMARY,
+        ID_EDT_INSTALL_LOC,
+        ID_EDT_SM_FOLDER,
+        ID_EDT_ASSOC,
+        ID_LBL_OPT_ICON,
+        ID_LBL_ICON_VALUE,
+        ID_LBL_LOC_NOTE,
+        ID_LBL_OPT_SHORTCUTS,
+        ID_CHK_DESKTOP,
+        ID_CHK_STARTMENU,
+        ID_CHK_PATH,
+        ID_LBL_LAUNCH,
+        ID_CHK_LAUNCH_OFFER,
+        ID_CHK_LAUNCH_DEFAULT,
+        ID_LBL_LOGIN,
+        ID_CHK_LOGIN_OFFER,
+        ID_CHK_LOGIN_DEFAULT,
+        ID_LBL_DATADIRS,
+        ID_EDT_DATA_DIRS,
+        ID_LBL_DATA_NOTE,
+        ID_LBL_PREVIEW_HDR,
+        ID_LBL_POWER,
+        ID_EDT_POWER,
+        ID_BTN_SCHEMA,
+        ID_BTN_PREVIEW,
+        ID_LBL_REQ_TITLE,
+        ID_LBL_REQ_SUB,
+        ID_LBL_REQ_WIN_HDR,
+        ID_CHK_WINREQ,
+        ID_LBL_WINREQ_TAG,
+        ID_LBL_REQ_RT_HDR,
+        ID_CHK_RT1,
+        ID_CHK_RT2,
+        ID_CHK_RT3,
+        ID_CHK_RT4,
+        ID_LBL_RT_TAG1,
+        ID_LBL_RT_TAG2,
+        ID_LBL_RT_TAG3,
+        ID_LBL_RT_TAG4,
+        ID_LBL_REQ_NOTE,
+        ID_BTN_REQ_BACK,
+        ID_BTN_REQ_NEXT,
+        ID_LBL_BS_TITLE,
+        ID_LBL_BS_SUB,
+        ID_LBL_BS_ARCH_HDR,
+        ID_LBL_BS_ARCH,
+        ID_LBL_BS_COMP_HDR,
+        ID_CHK_COMPRESS,
+        ID_LBL_BS_OUT_HDR,
+        ID_EDT_OUT_DIR,
+        ID_BTN_OUT_DIR,
+        ID_LBL_BS_GET_HDR,
+        ID_LBL_OUTPUTS,
+        ID_LBL_BS_CHECK_HDR,
+        ID_BTN_VALIDATE,
+        ID_BTN_VERIFY,
+        ID_CHK_SANDBOX,
+        ID_BTN_TEST,
+        ID_BTN_OPEN_OUTPUT,
+        ID_BTN_BS_BACK,
+        ID_BTN_BUILD,
+        ID_LBL_BS_CONSOLE_HDR,
+        ID_OUTPUT,
+        ID_LBL_ING_TITLE,
+        ID_LBL_ING_SUB,
+        ID_LBL_ING_PHASE,
+        ID_PROGRESS,
+        ID_LBL_ING_PCT,
+        ID_BTN_CLEAR,
+        ID_LBL_DONE_TITLE,
+        ID_LBL_DONE_SUB,
+        ID_LBL_DONE_SUMMARY,
+        ID_LBL_DONE_REASON,
+        ID_BTN_DONE_INSTALLER,
+        ID_BTN_DONE_FOLDER,
+        ID_BTN_DONE_AGAIN,
+        ID_BTN_DONE_BACK,
+        ID_LBL_SET_TITLE,
+        ID_LBL_SET_RECENTS_HDR,
+        ID_LBL_SET_RECENTS,
+        ID_LBL_SET_DIAG_HDR,
+        ID_LBL_SET_LOG,
+        ID_BTN_OPEN_LOG,
+        ID_LBL_SET_SETTINGS,
+        ID_LBL_SET_ABOUT_HDR,
+        ID_LBL_SET_VERSION,
+        ID_BTN_ABOUT,
+        ID_LBL_SET_FACTS,
+        ID_LBL_FILES_HDR,
+    ];
+
+    /// Buttons and lists disabled while a job runs (its inputs are
+    /// snapshotted when it starts; a second operation must not
+    /// begin). Cancel is the mirror image — enabled only then.
+    const ACTION_IDS: &[usize] = &[
+        ID_NAV_HOME,
+        ID_NAV_PROJECTS,
+        ID_NAV_BUILD,
+        ID_NAV_SETTINGS,
+        ID_BTN_NEW_PROJECT,
+        ID_BTN_VIEW_ALL,
+        ID_BTN_PL_OPEN,
+        ID_BTN_PL_REMOVE,
+        ID_BTN_PL_NEW,
+        ID_BTN_PL_PICK,
+        ID_BTN_NP_CANCEL,
+        ID_BTN_NP_BACK,
+        ID_BTN_NP_NEXT,
+        ID_BTN_NP_BROWSE,
+        ID_TAB_FILES,
+        ID_TAB_OPTIONS,
+        ID_TAB_REQUIREMENTS,
+        ID_BTN_TB_OPEN,
+        ID_BTN_TB_SAVE,
+        ID_BTN_TB_SAVEAS,
+        ID_BTN_TB_VALIDATE,
+        ID_BTN_PROGRAM_FOLDER,
+        ID_BTN_REMOVE,
+        ID_BTN_FILES_DIR,
+        ID_BTN_OUT_DIR,
+        ID_BTN_PREVIEW,
+        ID_BTN_SCHEMA,
+        ID_BTN_REQ_BACK,
+        ID_BTN_REQ_NEXT,
+        ID_BTN_VALIDATE,
+        ID_BTN_VERIFY,
+        ID_BTN_TEST,
+        ID_BTN_OPEN_OUTPUT,
+        ID_BTN_BS_BACK,
+        ID_BTN_BUILD,
+        ID_BTN_CLEAR,
+        ID_BTN_DONE_INSTALLER,
+        ID_BTN_DONE_FOLDER,
+        ID_BTN_DONE_AGAIN,
+        ID_BTN_DONE_BACK,
+        ID_BTN_CLEAR_RECENTS,
+        ID_BTN_OPEN_LOG,
+        ID_BTN_ABOUT,
+        ID_LIST,
+        ID_TREE,
+        ID_RECENTS,
+    ];
 
     // Messages / styles windows-sys keeps behind features this crate
     // does not enable; defined locally like the wizard does.
     const WM_APP_JOB: u32 = 0x8000 + 21;
     const WM_APP_PROGRESS: u32 = 0x8000 + 22;
-    const WM_DPICHANGED_MSG: u32 = 0x02E0;
     const EM_SETSEL_MSG: u32 = 0x00B1;
     const EM_REPLACESEL_MSG: u32 = 0x00C2;
     const EM_SCROLLCARET_MSG: u32 = 0x00B7;
@@ -903,8 +1398,6 @@ mod imp {
     const TTF_IDISHWND_FLAG: u32 = 0x0001;
     const TTF_SUBCLASS_FLAG: u32 = 0x0010;
     const BS_OWNERDRAW: u32 = 0x000B;
-    // BN_CLICKED (the notification owner-drawn checkboxes toggle on).
-    const BN_CLICKED_CODE: usize = 0;
     const ES_AUTOHSCROLL: u32 = 0x0080;
     const ES_MULTILINE: u32 = 0x0004;
     const ES_READONLY: u32 = 0x0800;
@@ -912,14 +1405,19 @@ mod imp {
     const BM_GETCHECK_MSG: u32 = 0x00F0;
     const BM_SETCHECK_MSG: u32 = 0x00F1;
     const BST_CHECKED_STATE: usize = 1;
-    const EN_CHANGE_CODE: usize = 0x0300;
     const LOGPIXELSX_INDEX: i32 = 88;
     const VK_CONTROL_KEY: i32 = 0x11;
-    // LVN_ITEMCHANGED is (-101); NMHDR.code is unsigned, compare as i32.
     const LVN_ITEMCHANGED_I32: i32 = -101;
-    // Right-aligned static text (windows-sys keeps the SS_ styles
-    // behind a feature this crate does not enable).
+    const NM_CUSTOMDRAW_I32: i32 = -12;
+    const NM_DBLCLK_I32: i32 = -3;
     const SS_RIGHT: u32 = 0x0002;
+    const SS_CENTER: u32 = 0x0001;
+    const LVS_EX_CHECKBOXES: u32 = 0x0400;
+    const LVIS_STATEIMAGEMASK: u32 = 0xF000;
+    const PBM_SETPOS_MSG: u32 = 0x0400 + 2;
+    const PBM_SETBARCOLOR_MSG: u32 = 0x0400 + 9;
+    const PBM_SETBKCOLOR_MSG: u32 = 0x2000 + 1;
+    const PBS_SMOOTH: u32 = 0x01;
 
     static WIDE_SANS: &[u16] = &[
         b'S' as u16,
@@ -976,7 +1474,10 @@ mod imp {
     }
 
     enum JobResult {
-        Scan(Result<ScanOutcome, String>),
+        Scan {
+            gen: u64,
+            result: Result<ScanOutcome, String>,
+        },
         Pack(Result<PackOutcome, PackFail>),
         Verify {
             sandbox: bool,
@@ -992,6 +1493,22 @@ mod imp {
     struct PackFail {
         message: String,
         refused_overwrite: bool,
+    }
+
+    /// What the Build Finished page shows: the summary on success,
+    /// the plain-English reason on failure.
+    struct DoneInfo {
+        ok: bool,
+        summary: String,
+        reason: String,
+    }
+
+    /// One row of the Files page's folder listing: a file (its
+    /// package-relative path) or a directory (the files beneath it,
+    /// for check toggling).
+    struct TreeRowInfo {
+        rel: Option<String>,
+        files: Vec<String>,
     }
 
     struct StudioState {
@@ -1017,25 +1534,56 @@ mod imp {
         tooltip: usize,
         /// Kept alive for the tooltip tool infos.
         tip_texts: Vec<Vec<u16>>,
-        /// Left-pane listing rows → package-relative file path
-        /// (`None` for directory rows), mirroring the tree control.
-        tree_rels: Vec<Option<String>>,
-        /// The widest left-pane row in pixels, so the listing's one
+        /// Folder-listing rows → file / directory membership, mirroring
+        /// the listing control.
+        tree_rows: Vec<TreeRowInfo>,
+        /// The widest listing row in pixels, so the listing's first
         /// column is at least that wide and long names can be
         /// scrolled to in full.
         tree_col_w: i32,
         /// The file the totals line describes (selected in either the
-        /// center table or the left listing).
+        /// table or the listing).
         selected_rel: Option<String>,
         /// The power-blocks parse error last reported to the output
-        /// strip, so a harvest that runs on every operation does not
-        /// repeat the same complaint; cleared when the text parses.
+        /// console, so a harvest that runs on every operation does
+        /// not repeat the same complaint; cleared when the text parses.
         power_error_reported: Option<String>,
+        /// The page on screen.
+        page: Page,
+        /// Builder settings (geometry, last paths, recent projects),
+        /// loaded at startup and saved as they change.
+        settings: StudioSettings,
+        /// New Project flow: the current step (0 details, 1 folder,
+        /// 2 summary), the document set aside while the flow runs,
+        /// and the page Cancel returns to.
+        np_step: usize,
+        np_backup: Option<StudioDocument>,
+        np_return: Page,
+        /// Set while programmatically changing listing check states,
+        /// so the toggle handler does not treat them as user edits.
+        suppress_tree_check: bool,
+        /// Bumped whenever a scan starts and whenever the document
+        /// is swapped out from under a running scan (New Project
+        /// cancel), so a late scan result for a folder the user has
+        /// already left is dropped instead of adopted.
+        scan_gen: u64,
+        /// When the running/last build started (Build time readout).
+        build_started: Option<std::time::Instant>,
+        /// What the Build Finished page shows.
+        done: Option<DoneInfo>,
+        /// Client-area rectangles the window paints itself (the
+        /// options page's installer preview, the finished page's
+        /// badge), recorded by layout.
+        preview_rect: Option<(i32, i32, i32, i32)>,
+        badge_rect: Option<(i32, i32, i32, i32)>,
+        /// New Project step-rail circle centers + radius, by step.
+        np_circles: Vec<(i32, i32, i32)>,
     }
 
     static STATE: Mutex<Option<StudioState>> = Mutex::new(None);
     static mut BODY_FONT: HFONT = std::ptr::null_mut();
     static mut HEADER_FONT: HFONT = std::ptr::null_mut();
+    static mut TITLE_FONT: HFONT = std::ptr::null_mut();
 
     fn scale(v: i32, dpi: u32) -> i32 {
         v * dpi as i32 / 96
@@ -1049,7 +1597,7 @@ mod imp {
         // Document: last session's manifest when it still exists, else
         // a blank one. Entries resolve from the manifest list only —
         // the folder scan (with its size estimates) runs on a worker
-        // once the window is up, so startup stays instant.
+        // once the Files page is shown, so startup stays instant.
         let settings = StudioSettings::load();
         let mut doc = StudioDocument::new_blank();
         if let Some(path) = &settings.manifest_path {
@@ -1080,10 +1628,18 @@ mod imp {
         if let Some(out) = &settings.out_dir {
             doc.out_dir = out.clone();
         }
+        // `seanpak <folder>` still lands in the editor on that
+        // folder, as it always has; a bare run opens the dashboard.
+        let from_folder = initial_folder.is_some();
         if let Some(folder) = initial_folder {
             doc.files_dir = Some(folder);
         }
         let entries_dir = doc.files_dir.clone();
+        let start_page = if from_folder {
+            Page::EditorFiles
+        } else {
+            Page::Home
+        };
 
         if let Ok(mut guard) = STATE.lock() {
             *guard = Some(StudioState {
@@ -1101,17 +1657,29 @@ mod imp {
                 status_kind: StatusKind::Neutral,
                 tooltip: 0,
                 tip_texts: Vec::new(),
-                tree_rels: Vec::new(),
+                tree_rows: Vec::new(),
                 tree_col_w: 0,
                 selected_rel: None,
                 power_error_reported: None,
+                page: start_page,
+                settings,
+                np_step: 0,
+                np_backup: None,
+                np_return: Page::Home,
+                suppress_tree_check: false,
+                scan_gen: 0,
+                build_started: None,
+                done: None,
+                preview_rect: None,
+                badge_rect: None,
+                np_circles: Vec::new(),
             });
         }
 
         unsafe {
             let init = INITCOMMONCONTROLSEX {
                 dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-                dwICC: ICC_LISTVIEW_CLASSES | ICC_WIN95_CLASSES,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_WIN95_CLASSES | ICC_PROGRESS_CLASS,
             };
             InitCommonControlsEx(&init);
 
@@ -1147,9 +1715,9 @@ mod imp {
                 }
             }
 
-            let (x, y, w, h) = match settings.window_rect {
-                Some((x, y, w, h)) => (x, y, w, h),
-                None => (CW_USEDEFAULT, CW_USEDEFAULT, 1180, 780),
+            let (x, y, w, h) = match with_state(|s| s.settings.window_rect) {
+                Some(Some(rect)) => rect,
+                _ => (CW_USEDEFAULT, CW_USEDEFAULT, 1180, 780),
             };
             let title = with_state(|s| s.doc.title_text()).unwrap_or_else(|| {
                 format!("SeanPak Builder — SeanPak {}", env!("CARGO_PKG_VERSION"))
@@ -1179,22 +1747,29 @@ mod imp {
             let dpi = current_dpi(hwnd);
             with_state(|s| s.dpi = dpi);
             create_fonts(dpi);
-            SetMenu(hwnd, build_menu());
             create_controls(hwnd, instance);
             apply_fonts(hwnd);
-            layout(hwnd);
+            create_tooltips(hwnd, instance);
             fill_controls(hwnd);
             with_state(|s| s.suppress_dirty = false);
             update_title(hwnd);
+            show_page(hwnd, start_page);
 
             ShowWindow(hwnd, SW_SHOWDEFAULT);
             UpdateWindow(hwnd);
-            let list = GetDlgItem(hwnd, ID_LIST as i32);
-            if !list.is_null() {
-                SetFocus(list);
+            if start_page == Page::EditorFiles {
+                start_scan(hwnd);
+                // The 4.x first-run guidance — only when there is
+                // no folder to scan (a running scan and the Home
+                // page speak for themselves).
+                if with_state(|s| s.doc.files_dir.is_none()).unwrap_or(false) {
+                    set_status(
+                        hwnd,
+                        StatusKind::Neutral,
+                        "Click Program Folder… and pick the folder your built program is in — its files will appear here.",
+                    );
+                }
             }
-            // First scan runs on a worker now the window is visible.
-            start_scan(hwnd);
 
             crate::diag::log("studio", "message loop entered");
             let mut msg: MSG = std::mem::zeroed();
@@ -1252,15 +1827,12 @@ mod imp {
             }
             0x4B => {
                 // Ctrl+K: jump to the files table (type to search it).
-                let list = GetDlgItem(hwnd, ID_LIST as i32);
-                if !list.is_null() {
-                    SetFocus(list);
+                if with_state(|s| s.page) == Some(Page::EditorFiles) {
+                    let list = GetDlgItem(hwnd, ID_LIST as i32);
+                    if !list.is_null() {
+                        SetFocus(list);
+                    }
                 }
-                set_status(
-                    hwnd,
-                    StatusKind::Neutral,
-                    "Files table focused — ↑↓ navigate · type to jump to a file",
-                );
                 true
             }
             _ => false,
@@ -1272,12 +1844,12 @@ mod imp {
         if hdc.is_null() {
             return 96;
         }
-        let dpi = GetDeviceCaps(hdc, LOGPIXELSX_INDEX);
+        let dpi = GetDeviceCaps(hdc, LOGPIXELSX_INDEX) as u32;
         ReleaseDC(hwnd, hdc);
-        if dpi > 0 {
-            dpi as u32
-        } else {
+        if dpi == 0 {
             96
+        } else {
+            dpi
         }
     }
 
@@ -1288,112 +1860,44 @@ mod imp {
         if !HEADER_FONT.is_null() {
             DeleteObject(HEADER_FONT as _);
         }
-        let body_h = -scale(15, dpi);
-        let header_h = -scale(14, dpi);
-        BODY_FONT = CreateFontW(
-            body_h,
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            WIDE_SANS.as_ptr(),
-        );
-        HEADER_FONT = CreateFontW(
-            header_h,
-            0,
-            0,
-            0,
-            FW_SEMIBOLD as i32,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            WIDE_SANS.as_ptr(),
-        );
+        if !TITLE_FONT.is_null() {
+            DeleteObject(TITLE_FONT as _);
+        }
+        let mk = |height: i32, weight: i32| {
+            CreateFontW(
+                -scale(height, dpi),
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                WIDE_SANS.as_ptr(),
+            )
+        };
+        BODY_FONT = mk(15, FW_NORMAL as i32);
+        HEADER_FONT = mk(14, FW_SEMIBOLD as i32);
+        TITLE_FONT = mk(27, FW_SEMIBOLD as i32);
     }
 
-    unsafe fn build_menu() -> HMENU {
-        unsafe fn submenu(items: &[(&str, usize)]) -> HMENU {
-            let menu = CreatePopupMenu();
-            for (label, id) in items {
-                if *label == "-" {
-                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-                } else {
-                    let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                    AppendMenuW(menu, MF_STRING, *id, wide.as_ptr());
-                }
-            }
-            menu
-        }
-        let bar = CreateMenu();
-        let top = |bar: HMENU, label: &str, sub: HMENU| {
-            let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-            AppendMenuW(bar, MF_POPUP, sub as usize, wide.as_ptr());
-        };
-        top(
-            bar,
-            "File",
-            submenu(&[
-                ("Open Manifest…\tCtrl+O", IDM_FILE_OPEN),
-                ("Save\tCtrl+S", IDM_FILE_SAVE),
-                ("Save As…", IDM_FILE_SAVEAS),
-                ("-", 0),
-                ("Exit", IDM_FILE_EXIT),
-            ]),
-        );
-        top(
-            bar,
-            "Project",
-            submenu(&[
-                ("Choose Program Folder…", IDM_PROJ_FILES),
-                ("Output Folder…", IDM_PROJ_OUT),
-            ]),
-        );
-        top(
-            bar,
-            "Build",
-            submenu(&[
-                ("Check Details", IDM_BUILD_VALIDATE),
-                ("Build Setup", IDM_BUILD_PACK),
-                ("Verify Package", IDM_BUILD_VERIFY),
-                ("Test Install", IDM_BUILD_TEST),
-                ("Preview Installer", IDM_BUILD_PREVIEW),
-            ]),
-        );
-        top(
-            bar,
-            "Tools",
-            submenu(&[
-                ("Show Manifest Schema", IDM_TOOLS_SCHEMA),
-                ("Open seanpak.log", IDM_TOOLS_LOG),
-            ]),
-        );
-        top(
-            bar,
-            "Help",
-            submenu(&[("About SeanPak Builder", IDM_HELP_ABOUT)]),
-        );
-        bar
-    }
+    // ---- control creation ----
 
     unsafe fn create_controls(parent: HWND, instance: HINSTANCE) {
         let static_class: Vec<u16> = "STATIC\0".encode_utf16().collect();
         let button_class: Vec<u16> = "BUTTON\0".encode_utf16().collect();
         let edit_class: Vec<u16> = "EDIT\0".encode_utf16().collect();
         let list_class: Vec<u16> = "SysListView32\0".encode_utf16().collect();
+        let progress_class: Vec<u16> = "msctls_progress32\0".encode_utf16().collect();
 
+        // Controls start hidden; layout() shows the current page's
+        // set. (Creating them visible would flash the whole shell
+        // before the first layout runs.)
         let mk = |class: &[u16], text: &str, style: u32, id: usize| -> HWND {
             let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
             unsafe {
@@ -1401,7 +1905,7 @@ mod imp {
                     0,
                     class.as_ptr(),
                     wide.as_ptr(),
-                    WS_CHILD | WS_VISIBLE | style,
+                    WS_CHILD | style,
                     0,
                     0,
                     10,
@@ -1413,79 +1917,147 @@ mod imp {
                 )
             }
         };
+        let btn = |text: &str, id: usize| mk(&button_class, text, WS_TABSTOP | BS_OWNERDRAW, id);
+        let chk = |text: &str, id: usize| mk(&button_class, text, WS_TABSTOP | BS_OWNERDRAW, id);
+        let lbl = |text: &str, id: usize| mk(&static_class, text, 0, id);
+        let edt = |id: usize| mk(&edit_class, "", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, id);
+        let setup_list = |list: HWND, cols: &[(&str, i32)], checkboxes: bool| {
+            let ext = if checkboxes {
+                LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES
+            } else {
+                LVS_EX_FULLROWSELECT
+            };
+            SendMessageW(
+                list,
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                ext as WPARAM,
+                ext as LPARAM,
+            );
+            SendMessageW(list, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
+            SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
+            SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
+            for (idx, (title, width)) in cols.iter().enumerate() {
+                let mut wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                let col = LVCOLUMNW {
+                    mask: LVCF_TEXT | LVCF_WIDTH,
+                    fmt: 0,
+                    cx: *width,
+                    pszText: wide.as_mut_ptr(),
+                    cchTextMax: 0,
+                    iSubItem: idx as i32,
+                    iImage: 0,
+                    iOrder: idx as i32,
+                    cxMin: 0,
+                    cxDefault: 0,
+                    cxIdeal: 0,
+                };
+                SendMessageW(list, LVM_INSERTCOLUMNW, idx, &col as *const _ as LPARAM);
+            }
+            // The header is painted by a subclass on the header
+            // control itself, in theme colors (owner-draw never
+            // painted — see theme::subclass_list_header).
+            theme::subclass_list_header(list);
+        };
 
-        // Toolbar strip (Design H): the everyday commands as buttons
-        // over the same handlers the menus run, plus the app · version
-        // readout at the right.
-        mk(
-            &button_class,
-            "Open…",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_TB_OPEN,
+        // Nav rail (hidden on the New Project flow, which has its
+        // own step rail).
+        btn("Home", ID_NAV_HOME);
+        btn("Projects", ID_NAV_PROJECTS);
+        btn("Build", ID_NAV_BUILD);
+        btn("Settings", ID_NAV_SETTINGS);
+
+        // Footer: separator, status line, Cancel (always present;
+        // enabled only while a job runs).
+        mk(&static_class, "", 0, ID_FOOTER_SEP);
+        lbl("", ID_LBL_STATUS);
+        btn("Cancel", ID_BTN_CANCEL);
+
+        // Home.
+        lbl("Welcome to SeanPak", ID_LBL_HOME_TITLE);
+        lbl(
+            "Create, configure and build Windows installers from your project settings.",
+            ID_LBL_HOME_SUB,
         );
-        mk(
-            &button_class,
-            "Save",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_TB_SAVE,
+        btn("+ New Project", ID_BTN_NEW_PROJECT);
+        lbl("Recent Projects", ID_LBL_RECENT_HDR);
+        btn("View all →", ID_BTN_VIEW_ALL);
+        let recents = mk(
+            &list_class,
+            "",
+            WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            ID_RECENTS,
         );
-        mk(
-            &button_class,
-            "Save As…",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_TB_SAVEAS,
+        setup_list(
+            recents,
+            &[("Project", 320), ("Version", 110), ("Modified", 170)],
+            false,
         );
-        mk(
-            &button_class,
-            "Check details",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_TB_VALIDATE,
+
+        // Projects list.
+        lbl("Projects", ID_LBL_PL_TITLE);
+        lbl(
+            "Projects you have opened or saved in the Builder. Double-click one to open it.",
+            ID_LBL_PL_SUB,
         );
+        lbl("", ID_LBL_PL_CURRENT);
+        btn("Open", ID_BTN_PL_OPEN);
+        btn("Remove from list", ID_BTN_PL_REMOVE);
+        btn("+ New Project", ID_BTN_PL_NEW);
+        btn("Open a manifest file…", ID_BTN_PL_PICK);
+
+        // New Project flow.
+        lbl("Create a New Setup Project", ID_LBL_NP_TITLE);
+        lbl("", ID_LBL_NP_SUB);
+        lbl("Project Details", ID_LBL_NP_STEP1);
+        lbl("Program Folder", ID_LBL_NP_STEP2);
+        lbl("Summary", ID_LBL_NP_STEP3);
+        lbl("Program name", ID_LBL_NP_NAME);
+        edt(ID_EDT_NP_NAME);
+        lbl("Version", ID_LBL_NP_VERSION);
+        edt(ID_EDT_NP_VERSION);
+        lbl("Publisher", ID_LBL_NP_PUBLISHER);
+        edt(ID_EDT_NP_PUBLISHER);
+        lbl("Program folder", ID_LBL_NP_FOLDER);
+        edt(ID_EDT_NP_FOLDER);
+        btn("Browse…", ID_BTN_NP_BROWSE);
+        lbl(
+            "Pick the folder your built program is in — everything in it becomes the package. SeanPak scans it on the next step.",
+            ID_LBL_NP_FOLDER_NOTE,
+        );
+        lbl("", ID_LBL_NP_SUMMARY);
+        btn("Cancel", ID_BTN_NP_CANCEL);
+        btn("← Back", ID_BTN_NP_BACK);
+        btn("Next →", ID_BTN_NP_NEXT);
+
+        // Editor chrome: tabs + the everyday commands.
+        btn("Files and Folders", ID_TAB_FILES);
+        btn("Installer Options", ID_TAB_OPTIONS);
+        btn("Requirements", ID_TAB_REQUIREMENTS);
+        btn("Open…", ID_BTN_TB_OPEN);
+        btn("Save", ID_BTN_TB_SAVE);
+        btn("Save As…", ID_BTN_TB_SAVEAS);
+        btn("Check details", ID_BTN_TB_VALIDATE);
         mk(&static_class, "", SS_RIGHT, ID_LBL_APPVER);
 
-        // Left pane: the files directory listing (directories and
-        // files, indented). Selecting a file here selects it in the
-        // center table too.
-        mk(&static_class, "PROGRAM FOLDER", 0, ID_LBL_FILES_PANE_HDR);
+        // Files page.
+        lbl("Files and Folders", ID_LBL_FILES_TITLE);
+        lbl(
+            "Select which files and folders to include in your installer, and set their destination paths.",
+            ID_LBL_FILES_SUB,
+        );
+        lbl("Program folder", ID_LBL_FOLDER_PATH_LBL);
+        edt(ID_EDT_FILES_DIR);
+        btn("Browse…", ID_BTN_FILES_DIR);
+        lbl("PROGRAM FOLDER", ID_LBL_FILES_PANE_HDR);
         let tree = mk(
             &list_class,
             "",
-            WS_TABSTOP
-                | WS_BORDER
-                | LVS_REPORT
-                | LVS_SINGLESEL
-                | LVS_SHOWSELALWAYS
-                | LVS_NOCOLUMNHEADER,
+            WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
             ID_TREE,
         );
-        SendMessageW(
-            tree,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            (LVS_EX_FULLROWSELECT) as WPARAM,
-            (LVS_EX_FULLROWSELECT) as LPARAM,
-        );
-        SendMessageW(tree, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
-        SendMessageW(tree, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
-        SendMessageW(tree, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
-        {
-            let mut wide: Vec<u16> = "Name".encode_utf16().chain(std::iter::once(0)).collect();
-            let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH,
-                fmt: 0,
-                cx: 240,
-                pszText: wide.as_mut_ptr(),
-                cchTextMax: 0,
-                iSubItem: 0,
-                iImage: 0,
-                iOrder: 0,
-                cxMin: 0,
-                cxDefault: 0,
-                cxIdeal: 0,
-            };
-            SendMessageW(tree, LVM_INSERTCOLUMNW, 0, &col as *const _ as LPARAM);
-        }
-
-        mk(&static_class, "FILES IN PACKAGE", 0, ID_LBL_FILES_HDR);
+        setup_list(tree, &[("Source", 200), ("Destination", 150)], true);
+        btn("Program Folder…", ID_BTN_PROGRAM_FOLDER);
+        lbl("FILES IN PACKAGE", ID_LBL_PACKAGE_HDR);
         let list = mk(
             &list_class,
             "",
@@ -1495,65 +2067,26 @@ mod imp {
         // No LVS_EX_GRIDLINES: the native gridline color is a fixed
         // light system color. The theme's custom draw (WM_NOTIFY)
         // paints selection and gridlines in token colors instead.
-        SendMessageW(
+        setup_list(
             list,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            (LVS_EX_FULLROWSELECT) as WPARAM,
-            (LVS_EX_FULLROWSELECT) as LPARAM,
+            &[
+                ("File", 380),
+                ("Destination", 180),
+                ("Size", 110),
+                ("Packed (est.)", 120),
+            ],
+            false,
         );
-        SendMessageW(list, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
-        for (idx, (title, _width)) in [
-            ("File", 380),
-            ("Destination", 180),
-            ("Size", 110),
-            ("Packed (est.)", 120),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let mut wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-            let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH,
-                fmt: 0,
-                cx: *_width,
-                pszText: wide.as_mut_ptr(),
-                cchTextMax: 0,
-                iSubItem: idx as i32,
-                iImage: 0,
-                iOrder: idx as i32,
-                cxMin: 0,
-                cxDefault: 0,
-                cxIdeal: 0,
-            };
-            SendMessageW(list, LVM_INSERTCOLUMNW, idx, &col as *const _ as LPARAM);
-        }
-        // The header is painted by a subclass on the header control
-        // itself, in theme colors (owner-draw never painted — see
-        // theme::subclass_list_header for the diagnosis).
-        theme::subclass_list_header(list);
-        // One door into the package: choose the folder the built
-        // program lives in. (The old Add files / Add folder buttons
-        // copied files into that folder and dead-ended with an error
-        // until a folder was chosen — removed in 4.7.2.)
-        mk(
-            &button_class,
-            "Program Folder…",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_PROGRAM_FOLDER,
-        );
-        mk(
-            &button_class,
-            "Remove selected",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_REMOVE,
-        );
-        // Totals / selection line under the center table.
-        mk(&static_class, "", 0, ID_LBL_TOTALS);
+        lbl("", ID_LBL_TOTALS);
+        btn("Remove selected", ID_BTN_REMOVE);
 
-        // Manifest panel.
-        mk(&static_class, "PROGRAM DETAILS", 0, ID_LBL_MANIFEST_HDR);
+        // Options page.
+        lbl("Installer Options", ID_LBL_OPT_TITLE);
+        lbl(
+            "Choose what the installer sets up for your users.",
+            ID_LBL_OPT_SUB,
+        );
+        lbl("PROGRAM DETAILS", ID_LBL_OPT_DETAILS);
         let fields: [(&str, usize); 7] = [
             ("Name", ID_EDT_NAME),
             ("Version", ID_EDT_VERSION),
@@ -1564,183 +2097,204 @@ mod imp {
             ("File associations", ID_EDT_ASSOC),
         ];
         for (i, (label, edit_id)) in fields.iter().enumerate() {
-            mk(&static_class, label, 0, PANEL_LABELS[i]);
-            mk(
-                &edit_class,
-                "",
-                WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-                *edit_id,
-            );
+            lbl(label, PANEL_LABELS[i]);
+            edt(*edit_id);
         }
-        mk(
-            &button_class,
-            "Desktop shortcut",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_DESKTOP,
+        lbl("Program icon", ID_LBL_OPT_ICON);
+        lbl(
+            "Built-in SeanPak icon — custom program icons are not supported yet",
+            ID_LBL_ICON_VALUE,
         );
-        mk(
-            &button_class,
-            "Start Menu",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_STARTMENU,
+        lbl("", ID_LBL_LOC_NOTE);
+        lbl("SHORTCUTS AND STARTUP", ID_LBL_OPT_SHORTCUTS);
+        chk("Desktop shortcut", ID_CHK_DESKTOP);
+        chk("Start Menu shortcut", ID_CHK_STARTMENU);
+        chk("Add to PATH", ID_CHK_PATH);
+        lbl("Launch after install", ID_LBL_LAUNCH);
+        chk("Offer", ID_CHK_LAUNCH_OFFER);
+        chk("On by default", ID_CHK_LAUNCH_DEFAULT);
+        lbl("Start at login", ID_LBL_LOGIN);
+        chk("Offer", ID_CHK_LOGIN_OFFER);
+        chk("On by default", ID_CHK_LOGIN_DEFAULT);
+        lbl("Data folders", ID_LBL_DATADIRS);
+        edt(ID_EDT_DATA_DIRS);
+        lbl(
+            "Data folders: files your program saves in its data folder are kept when the program is removed, unless the user chooses to delete them.",
+            ID_LBL_DATA_NOTE,
         );
-        mk(
-            &button_class,
-            "Add install folder to PATH",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_PATH,
+        lbl(
+            "Live preview — the installer your users will see",
+            ID_LBL_PREVIEW_HDR,
         );
-        // The 4.4.0 install options: each offer is a pair — offer the
-        // option in the installer at all, and whether it starts on.
-        mk(&static_class, "Launch after install", 0, ID_LBL_LAUNCH);
-        mk(
-            &button_class,
-            "Offer",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_LAUNCH_OFFER,
-        );
-        mk(
-            &button_class,
-            "On by default",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_LAUNCH_DEFAULT,
-        );
-        mk(&static_class, "Start at login", 0, ID_LBL_LOGIN);
-        mk(
-            &button_class,
-            "Offer",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_LOGIN_OFFER,
-        );
-        mk(
-            &button_class,
-            "On by default",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_LOGIN_DEFAULT,
-        );
-        mk(&static_class, "Data folders", 0, ID_LBL_DATADIRS);
+        lbl("Advanced options (JSON)", ID_LBL_POWER);
         mk(
             &edit_class,
             "",
-            WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            ID_EDT_DATA_DIRS,
-        );
-        // The v6 power blocks as one JSON editor (see
-        // power_blocks_text for why one editor, not five grids).
-        mk(&static_class, "Advanced options (JSON)", 0, ID_LBL_POWER);
-        mk(
-            &edit_class,
-            "",
-            WS_TABSTOP | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
+            WS_TABSTOP | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_HSCROLL,
             ID_EDT_POWER,
         );
-        mk(&static_class, "PACKAGE", 0, ID_LBL_PACKAGE_HDR);
-        mk(&static_class, "Program folder", 0, PANEL_LABELS[7]);
-        mk(
-            &edit_class,
-            "",
-            WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            ID_EDT_FILES_DIR,
-        );
-        mk(
-            &button_class,
-            "Browse…",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_FILES_DIR,
-        );
-        mk(&static_class, "Output folder", 0, PANEL_LABELS[8]);
-        mk(
-            &edit_class,
-            "",
-            WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            ID_EDT_OUT_DIR,
-        );
-        mk(
-            &button_class,
-            "Browse…",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_OUT_DIR,
-        );
+        btn("Manifest format…", ID_BTN_SCHEMA);
+        btn("Preview installer", ID_BTN_PREVIEW);
 
-        // Output strip.
-        mk(&static_class, "OUTPUT", 0, ID_LBL_OUTPUT_HDR);
-        mk(
-            &button_class,
-            "Check details",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_VALIDATE,
+        // Requirements page.
+        lbl("Program Requirements", ID_LBL_REQ_TITLE);
+        lbl(
+            "Things a computer must have before your program can run.",
+            ID_LBL_REQ_SUB,
         );
-        mk(
-            &button_class,
-            "Verify package",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_VERIFY,
+        lbl("Windows version", ID_LBL_REQ_WIN_HDR);
+        chk("Requires Windows 10 or later", ID_CHK_WINREQ);
+        lbl("Built in", ID_LBL_WINREQ_TAG);
+        lbl("Runtimes", ID_LBL_REQ_RT_HDR);
+        chk(".NET Framework 4.8 or higher", ID_CHK_RT1);
+        chk(".NET 8 Desktop Runtime", ID_CHK_RT2);
+        chk("Visual C++ Redistributable (x64)", ID_CHK_RT3);
+        chk("Microsoft Edge WebView2 Runtime", ID_CHK_RT4);
+        lbl("Coming later", ID_LBL_RT_TAG1);
+        lbl("Coming later", ID_LBL_RT_TAG2);
+        lbl("Coming later", ID_LBL_RT_TAG3);
+        lbl("Coming later", ID_LBL_RT_TAG4);
+        lbl(
+            "SeanPak can't add runtimes to an installer yet. If your program needs one, mention it in your program's readme for now.",
+            ID_LBL_REQ_NOTE,
         );
-        mk(
-            &button_class,
-            "Also test-install",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_CHK_SANDBOX,
+        btn("← Back", ID_BTN_REQ_BACK);
+        btn("Next →", ID_BTN_REQ_NEXT);
+
+        // Build Settings page.
+        lbl("Build Settings", ID_LBL_BS_TITLE);
+        lbl(
+            "Configure how your installer should be built.",
+            ID_LBL_BS_SUB,
         );
+        lbl("Architecture", ID_LBL_BS_ARCH_HDR);
+        lbl(
+            "x64 (64-bit) — SeanPak builds x64 installers.",
+            ID_LBL_BS_ARCH,
+        );
+        lbl("Compression", ID_LBL_BS_COMP_HDR);
+        chk(
+            "Compress files in the installer (smaller Setup file)",
+            ID_CHK_COMPRESS,
+        );
+        lbl("Output folder", ID_LBL_BS_OUT_HDR);
+        edt(ID_EDT_OUT_DIR);
+        btn("Browse…", ID_BTN_OUT_DIR);
+        lbl("You will get", ID_LBL_BS_GET_HDR);
+        lbl("", ID_LBL_OUTPUTS);
+        lbl("Check a built Setup file", ID_LBL_BS_CHECK_HDR);
+        btn("Check details", ID_BTN_VALIDATE);
+        btn("Verify package", ID_BTN_VERIFY);
+        chk("Also test-install", ID_CHK_SANDBOX);
+        btn("Test install", ID_BTN_TEST);
+        lbl("OUTPUT", ID_LBL_BS_CONSOLE_HDR);
         mk(
             &edit_class,
             "",
-            WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
+            WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
             ID_OUTPUT,
         );
-        mk(&static_class, "", 0, ID_LBL_FACTS);
+        btn("Open output folder", ID_BTN_OPEN_OUTPUT);
+        btn("← Back", ID_BTN_BS_BACK);
+        btn("Build Setup", ID_BTN_BUILD);
 
-        // Footer: a 1px edge separator above the status line.
-        mk(&static_class, "", 0, ID_FOOTER_SEP);
-        mk(&static_class, "Ready", 0, ID_LBL_STATUS);
-        mk(
-            &button_class,
-            "Open output folder",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_OPEN_OUTPUT,
+        // Building page.
+        lbl("Building Installer", ID_LBL_ING_TITLE);
+        lbl(
+            "Please wait while your project is compiled and packaged.",
+            ID_LBL_ING_SUB,
         );
-        mk(
-            &button_class,
-            "Preview installer",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_PREVIEW,
+        lbl("Building…", ID_LBL_ING_PHASE);
+        mk(&static_class, "", SS_RIGHT, ID_LBL_ING_PCT);
+        let progress = mk(&progress_class, "", PBS_SMOOTH, ID_PROGRESS);
+        SendMessageW(
+            progress,
+            PBM_SETBARCOLOR_MSG,
+            0,
+            theme::SELECTION_INDICATOR as LPARAM,
         );
-        mk(
-            &button_class,
-            "Test install",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_TEST,
-        );
-        mk(
-            &button_class,
-            "Build Setup",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_BUILD,
-        );
-        // Cancel is enabled only while a job runs (set_busy owns its
-        // state from here on).
-        let cancel_btn = mk(
-            &button_class,
-            "Cancel",
-            WS_TABSTOP | BS_OWNERDRAW,
-            ID_BTN_CANCEL,
-        );
-        EnableWindow(cancel_btn, 0);
+        SendMessageW(progress, PBM_SETBKCOLOR_MSG, 0, theme::SURFACE as LPARAM);
+        btn("Clear", ID_BTN_CLEAR);
 
-        create_tooltips(parent, instance);
+        // Build Finished page (title, sub, and the summary/reason
+        // block are centered, as drawn in the approved mockup).
+        mk(&static_class, "", SS_CENTER, ID_LBL_DONE_TITLE);
+        mk(&static_class, "", SS_CENTER, ID_LBL_DONE_SUB);
+        mk(&static_class, "", SS_CENTER, ID_LBL_DONE_SUMMARY);
+        mk(&static_class, "", SS_CENTER, ID_LBL_DONE_REASON);
+        btn("Open the Installer", ID_BTN_DONE_INSTALLER);
+        btn("Open Folder", ID_BTN_DONE_FOLDER);
+        btn("Build Another", ID_BTN_DONE_AGAIN);
+        btn("Back to Build Settings", ID_BTN_DONE_BACK);
+
+        // Settings page.
+        lbl("Settings", ID_LBL_SET_TITLE);
+        lbl("RECENT PROJECTS", ID_LBL_SET_RECENTS_HDR);
+        lbl("", ID_LBL_SET_RECENTS);
+        btn("Clear the list", ID_BTN_CLEAR_RECENTS);
+        lbl("DIAGNOSTICS", ID_LBL_SET_DIAG_HDR);
+        lbl("", ID_LBL_SET_LOG);
+        btn("Open the log", ID_BTN_OPEN_LOG);
+        lbl("", ID_LBL_SET_SETTINGS);
+        lbl("ABOUT", ID_LBL_SET_ABOUT_HDR);
+        lbl("", ID_LBL_SET_VERSION);
+        btn("About SeanPak Builder…", ID_BTN_ABOUT);
+        lbl("", ID_LBL_SET_FACTS);
+
+        // Fixed states that are displays, not choices: the Windows
+        // requirement is built into every SeanPak installer, the
+        // runtime rows are not available yet, and compression is
+        // always on (each file is compressed only when smaller).
+        // Disabled controls say so honestly instead of pretending
+        // to be settings.
+        set_check(parent, ID_CHK_WINREQ, true);
+        set_check(parent, ID_CHK_COMPRESS, true);
+        for id in [
+            ID_CHK_WINREQ,
+            ID_CHK_RT1,
+            ID_CHK_RT2,
+            ID_CHK_RT3,
+            ID_CHK_RT4,
+            ID_CHK_COMPRESS,
+        ] {
+            set_enabled(parent, id, false);
+        }
+        set_enabled(parent, ID_BTN_CANCEL, false);
     }
 
     unsafe fn create_tooltips(parent: HWND, instance: HINSTANCE) {
         // One short plain-English line per main control — what it
         // does, in the words a first-time user would use. ("Program",
         // not "payload"; "Setup file", not "artifact".)
-        let tips: [(usize, &str); 36] = [
-            (ID_LIST, "The files that will be packed into the Setup file. Select files and click Remove selected to leave them out"),
-            (ID_TREE, "Everything in the program folder, folders included. Selecting a file here selects it in the table too"),
+        let tips: [(usize, &str); 73] = [
+            (ID_NAV_HOME, "The dashboard: start a new project or reopen a recent one"),
+            (ID_NAV_PROJECTS, "Your projects, and the one you are editing"),
+            (ID_NAV_BUILD, "Build settings, the build itself, and checking a built Setup file"),
+            (ID_NAV_SETTINGS, "Builder settings: recent projects, the diagnostics log, about"),
+            (ID_BTN_NEW_PROJECT, "Start a new installer project, step by step"),
+            (ID_BTN_VIEW_ALL, "See the full list of recent projects"),
+            (ID_RECENTS, "Projects you have opened or saved. Double-click one to open it"),
+            (ID_BTN_PL_OPEN, "Open the selected project in the editor"),
+            (ID_BTN_PL_REMOVE, "Take the selected project off this list — the project files stay where they are"),
+            (ID_BTN_PL_NEW, "Start a new installer project, step by step"),
+            (ID_BTN_PL_PICK, "Open a manifest file from anywhere on this computer"),
+            (ID_EDT_NP_NAME, "Your program's name — shown in the installer and used in the Setup file name"),
+            (ID_EDT_NP_VERSION, "Your program's version, like 1.2.0 — used in the Setup file name"),
+            (ID_EDT_NP_PUBLISHER, "Your name or your company — shown in the installer"),
+            (ID_EDT_NP_FOLDER, "The folder your built program is in — everything in it is packed into the Setup file"),
+            (ID_BTN_NP_BROWSE, "Browse for the program folder"),
+            (ID_BTN_NP_BACK, "Back to the previous step"),
+            (ID_BTN_NP_NEXT, "Continue to the next step"),
+            (ID_BTN_NP_CANCEL, "Stop making this project — nothing is created"),
+            (ID_TAB_FILES, "Choose which files go into the installer"),
+            (ID_TAB_OPTIONS, "Program details, shortcuts, startup options, and advanced extras"),
+            (ID_TAB_REQUIREMENTS, "What a computer needs before your program can run"),
             (ID_BTN_TB_OPEN, "Open a manifest file — the file that describes your program"),
             (ID_BTN_TB_SAVE, "Save the manifest file"),
             (ID_BTN_TB_SAVEAS, "Save the manifest file under a new name"),
             (ID_BTN_TB_VALIDATE, "Check the program details for mistakes before building"),
+            (ID_LIST, "The files that will be packed into the Setup file. Select files and click Remove selected to leave them out"),
+            (ID_TREE, "Everything in the program folder, folders included. Tick a box to include that file or folder; selecting a file here selects it in the table too"),
             (ID_BTN_PROGRAM_FOLDER, "Choose the folder your built program is in — everything in it becomes the package"),
             (ID_BTN_REMOVE, "Remove the selected files from the package — the files themselves stay in the folder"),
             (ID_EDT_NAME, "Your program's name — shown in the installer and used in the Setup file name"),
@@ -1759,10 +2313,14 @@ mod imp {
             (ID_CHK_LOGIN_DEFAULT, "On by default: that 'Start at login' box starts out ticked"),
             (ID_EDT_DATA_DIRS, "The program's own data folders, semicolon-separated, like %APPDATA%/My App. Uninstall asks before deleting them, and the box starts unticked"),
             (ID_EDT_POWER, "Advanced extras as one JSON block: optional components, install hooks (commands run during install), registry and environment values the installer writes and later restores, and extra shortcuts. Leave it as {} if you don't need any of them"),
+            (ID_BTN_SCHEMA, "Show the manifest format — every field a manifest can carry"),
             (ID_EDT_FILES_DIR, "The folder your built program is in — everything in it is packed into the Setup file"),
             (ID_BTN_FILES_DIR, "Browse for the program folder"),
             (ID_EDT_OUT_DIR, "The folder the finished Setup file, portable .zip, and SHA256SUMS.txt are written to"),
             (ID_BTN_OUT_DIR, "Browse for the output folder"),
+            (ID_CHK_WINREQ, "Every SeanPak installer already needs Windows 10 or later — this is built in, not a choice"),
+            (ID_CHK_RT1, "Not available yet — SeanPak can't add runtimes to an installer"),
+            (ID_CHK_COMPRESS, "Always on — SeanPak compresses each file only when that makes it smaller, so there is nothing to choose"),
             (ID_BTN_VALIDATE, "Check the program details for mistakes — the same check the build runs first"),
             (ID_BTN_VERIFY, "Check a built Setup file: read it back and prove every file inside is intact"),
             (ID_CHK_SANDBOX, "Also test-install: verifying first installs into a temp folder, checks every file, then uninstalls and checks nothing is left behind"),
@@ -1770,7 +2328,18 @@ mod imp {
             (ID_BTN_BUILD, "Build the Setup file, the portable .zip, and SHA256SUMS.txt into the output folder"),
             (ID_BTN_OPEN_OUTPUT, "Open the folder where the Setup file is built"),
             (ID_BTN_PREVIEW, "Open the Setup file you built, to see the installer your users will see"),
+            (ID_BTN_REQ_BACK, "Back to Installer Options"),
+            (ID_BTN_REQ_NEXT, "Continue to Build Settings"),
+            (ID_BTN_BS_BACK, "Back to the project editor"),
+            (ID_BTN_CLEAR, "Clear the build log"),
             (ID_BTN_CANCEL, "Stop the running operation. A stopped build removes its unfinished files"),
+            (ID_BTN_DONE_INSTALLER, "Open the Setup file you just built, to see the installer your users will see"),
+            (ID_BTN_DONE_FOLDER, "Open the output folder in Explorer"),
+            (ID_BTN_DONE_AGAIN, "Build again — back to Build Settings"),
+            (ID_BTN_DONE_BACK, "Back to Build Settings"),
+            (ID_BTN_CLEAR_RECENTS, "Empty the recent projects list — the project files stay where they are"),
+            (ID_BTN_OPEN_LOG, "Open SeanPak's diagnostics log in your text editor"),
+            (ID_BTN_ABOUT, "What SeanPak Builder is, in plain words"),
         ];
         let tooltip = CreateWindowExW(
             WS_EX_TOPMOST,
@@ -1881,12 +2450,37 @@ mod imp {
     }
 
     unsafe fn apply_fonts(hwnd: HWND) {
+        let title_ids = [
+            ID_LBL_HOME_TITLE,
+            ID_LBL_PL_TITLE,
+            ID_LBL_NP_TITLE,
+            ID_LBL_FILES_TITLE,
+            ID_LBL_OPT_TITLE,
+            ID_LBL_REQ_TITLE,
+            ID_LBL_BS_TITLE,
+            ID_LBL_ING_TITLE,
+            ID_LBL_DONE_TITLE,
+            ID_LBL_SET_TITLE,
+        ];
         let header_ids = [
-            ID_LBL_FILES_HDR,
+            ID_LBL_RECENT_HDR,
             ID_LBL_FILES_PANE_HDR,
-            ID_LBL_MANIFEST_HDR,
-            ID_LBL_OUTPUT_HDR,
             ID_LBL_PACKAGE_HDR,
+            ID_LBL_OPT_DETAILS,
+            ID_LBL_OPT_SHORTCUTS,
+            ID_LBL_POWER,
+            ID_LBL_REQ_WIN_HDR,
+            ID_LBL_REQ_RT_HDR,
+            ID_LBL_BS_ARCH_HDR,
+            ID_LBL_BS_COMP_HDR,
+            ID_LBL_BS_OUT_HDR,
+            ID_LBL_BS_GET_HDR,
+            ID_LBL_BS_CHECK_HDR,
+            ID_LBL_BS_CONSOLE_HDR,
+            ID_LBL_SET_RECENTS_HDR,
+            ID_LBL_SET_DIAG_HDR,
+            ID_LBL_SET_ABOUT_HDR,
+            ID_LBL_PREVIEW_HDR,
         ];
         unsafe fn set_font(hwnd: HWND, id: usize, font: HFONT) {
             let ctrl = GetDlgItem(hwnd, id as i32);
@@ -1894,379 +2488,18 @@ mod imp {
                 SendMessageW(ctrl, WM_SETFONT, font as WPARAM, 1);
             }
         }
-        let all_ids: &[usize] = &[
-            ID_LIST,
-            ID_TREE,
-            ID_BTN_TB_OPEN,
-            ID_BTN_TB_SAVE,
-            ID_BTN_TB_SAVEAS,
-            ID_BTN_TB_VALIDATE,
-            ID_LBL_APPVER,
-            ID_LBL_FILES_PANE_HDR,
-            ID_LBL_TOTALS,
-            ID_BTN_PROGRAM_FOLDER,
-            ID_BTN_REMOVE,
-            ID_EDT_NAME,
-            ID_EDT_VERSION,
-            ID_EDT_PUBLISHER,
-            ID_EDT_PRIMARY,
-            ID_EDT_INSTALL_LOC,
-            ID_EDT_SM_FOLDER,
-            ID_EDT_ASSOC,
-            ID_CHK_DESKTOP,
-            ID_CHK_STARTMENU,
-            ID_CHK_PATH,
-            ID_CHK_LAUNCH_OFFER,
-            ID_CHK_LAUNCH_DEFAULT,
-            ID_CHK_LOGIN_OFFER,
-            ID_CHK_LOGIN_DEFAULT,
-            ID_LBL_LAUNCH,
-            ID_LBL_LOGIN,
-            ID_LBL_DATADIRS,
-            ID_EDT_DATA_DIRS,
-            ID_LBL_POWER,
-            ID_EDT_POWER,
-            ID_EDT_FILES_DIR,
-            ID_BTN_FILES_DIR,
-            ID_EDT_OUT_DIR,
-            ID_BTN_OUT_DIR,
-            ID_OUTPUT,
-            ID_BTN_VALIDATE,
-            ID_BTN_VERIFY,
-            ID_CHK_SANDBOX,
-            ID_LBL_STATUS,
-            ID_BTN_TEST,
-            ID_BTN_BUILD,
-            ID_BTN_OPEN_OUTPUT,
-            ID_BTN_PREVIEW,
-            ID_BTN_CANCEL,
-            ID_LBL_FACTS,
-            PANEL_LABELS[0],
-            PANEL_LABELS[1],
-            PANEL_LABELS[2],
-            PANEL_LABELS[3],
-            PANEL_LABELS[4],
-            PANEL_LABELS[5],
-            PANEL_LABELS[6],
-            PANEL_LABELS[7],
-            PANEL_LABELS[8],
-            ID_LBL_FILES_HDR,
-            ID_LBL_MANIFEST_HDR,
-            ID_LBL_OUTPUT_HDR,
-            ID_LBL_PACKAGE_HDR,
-        ];
-        for id in all_ids {
-            let font = if header_ids.contains(id) {
+        for id in ALL_PAGE_CONTROLS {
+            let font = if title_ids.contains(id) {
+                TITLE_FONT
+            } else if header_ids.contains(id) {
                 HEADER_FONT
             } else {
                 BODY_FONT
             };
             set_font(hwnd, *id, font);
         }
-    }
-
-    /// Positions every control from the client size and the current
-    /// DPI scale (Design H): toolbar strip fixed at the top, output
-    /// strip and footer fixed at the bottom; between them the left
-    /// listing pane and the manifest pane keep their widths while the
-    /// center files table absorbs the slack.
-    unsafe fn layout(hwnd: HWND) {
-        let dpi = with_state(|s| s.dpi).unwrap_or(96);
-        let s = |v: i32| scale(v, dpi);
-        let mut rect: RECT = std::mem::zeroed();
-        GetClientRect(hwnd, &mut rect);
-        let w = rect.right;
-        let h = rect.bottom;
-        if w <= 0 || h <= 0 {
-            return;
-        }
-        let m = s(16);
-        let toolbar_h = s(40);
-        let footer_h = s(52);
-        let strip_h = s(150);
-        let left_w = s(250);
-        let panel_w = s(404);
-        let footer_top = h - footer_h;
-        let strip_y = footer_top - strip_h - s(8);
-        let main_top = toolbar_h;
-        let main_h = (strip_y - s(8) - main_top).max(s(60));
-        let btn_row_h = s(30);
-
-        unsafe fn mv(hwnd: HWND, id: usize, x: i32, y: i32, w: i32, h: i32) {
-            let ctrl = GetDlgItem(hwnd, id as i32);
-            if !ctrl.is_null() {
-                MoveWindow(ctrl, x, y, w.max(0), h.max(0), 1);
-            }
-        }
-
-        // Toolbar strip.
-        let tb_y = s(6);
-        mv(hwnd, ID_BTN_TB_OPEN, m, tb_y, s(84), s(28));
-        mv(hwnd, ID_BTN_TB_SAVE, m + s(92), tb_y, s(72), s(28));
-        mv(hwnd, ID_BTN_TB_SAVEAS, m + s(172), tb_y, s(92), s(28));
-        mv(hwnd, ID_BTN_TB_VALIDATE, m + s(272), tb_y, s(116), s(28));
-        mv(
-            hwnd,
-            ID_LBL_APPVER,
-            w - m - s(320),
-            tb_y + s(4),
-            s(320),
-            s(20),
-        );
-
-        // Left pane: the files directory listing.
-        mv(hwnd, ID_LBL_FILES_PANE_HDR, m, main_top, left_w, s(20));
-        mv(hwnd, ID_TREE, m, main_top + s(26), left_w, main_h - s(26));
-        let tree = GetDlgItem(hwnd, ID_TREE as i32);
-        if !tree.is_null() {
-            // The column is at least as wide as the widest row
-            // (measured when the listing was filled), so long names
-            // can be scrolled to in full instead of ending under the
-            // pane's edge.
-            let content_w = with_state(|s| s.tree_col_w).unwrap_or(0);
-            SendMessageW(
-                tree,
-                LVM_SETCOLUMNWIDTH,
-                0,
-                (left_w.max(content_w)).max(s(120)) as LPARAM,
-            );
-        }
-
-        // Center: files table + its buttons + the totals line.
-        let cx = m + left_w + s(12);
-        let center_w = (w - m - panel_w - s(12) - cx).max(s(200));
-        // Two full lines of body text: at s(38) the second line (the
-        // stub / selected-file line) was clipped by the output strip.
-        let totals_h = s(48);
-        mv(hwnd, ID_LBL_FILES_HDR, cx, main_top, center_w, s(20));
-        mv(
-            hwnd,
-            ID_LIST,
-            cx,
-            main_top + s(26),
-            center_w,
-            main_h - s(26) - btn_row_h - s(8) - totals_h,
-        );
-        let btn_y = main_top + main_h - totals_h - btn_row_h;
-        mv(hwnd, ID_BTN_PROGRAM_FOLDER, cx, btn_y, s(160), btn_row_h);
-        mv(hwnd, ID_BTN_REMOVE, cx + s(168), btn_y, s(150), btn_row_h);
-        mv(
-            hwnd,
-            ID_LBL_TOTALS,
-            cx,
-            btn_y + btn_row_h + s(4),
-            center_w,
-            s(42),
-        );
-        // Column widths: the path column absorbs the slack, and the
-        // fixed columns are sized so every header label fits whole
-        // at the default window size, with the vertical scrollbar's
-        // width reserved so the last column is not clipped by it.
-        let list = GetDlgItem(hwnd, ID_LIST as i32);
-        if !list.is_null() {
-            let fixed = s(150) + s(95) + s(115);
-            SendMessageW(
-                list,
-                LVM_SETCOLUMNWIDTH,
-                0,
-                (center_w - fixed - s(20)).max(s(100)) as LPARAM,
-            );
-            SendMessageW(list, LVM_SETCOLUMNWIDTH, 1, s(150) as LPARAM);
-            SendMessageW(list, LVM_SETCOLUMNWIDTH, 2, s(95) as LPARAM);
-            SendMessageW(list, LVM_SETCOLUMNWIDTH, 3, s(115) as LPARAM);
-        }
-
-        // Right pane: the manifest editor.
-        let px = w - m - panel_w;
-        let label_w = s(140);
-        let edit_x = px + label_w + s(8);
-        let edit_w = panel_w - label_w - s(8);
-        mv(hwnd, ID_LBL_MANIFEST_HDR, px, main_top, panel_w, s(20));
-        let mut row_y = main_top + s(26);
-        let edit_ids = [
-            ID_EDT_NAME,
-            ID_EDT_VERSION,
-            ID_EDT_PUBLISHER,
-            ID_EDT_PRIMARY,
-            ID_EDT_INSTALL_LOC,
-            ID_EDT_SM_FOLDER,
-            ID_EDT_ASSOC,
-        ];
-        for (i, edit_id) in edit_ids.iter().enumerate() {
-            mv(hwnd, PANEL_LABELS[i], px, row_y + s(2), label_w, s(20));
-            mv(hwnd, *edit_id, edit_x, row_y, edit_w, s(25));
-            row_y += s(29);
-        }
-        mv(hwnd, ID_CHK_DESKTOP, px, row_y, panel_w / 2, s(24));
-        mv(
-            hwnd,
-            ID_CHK_STARTMENU,
-            px + panel_w / 2,
-            row_y,
-            panel_w / 2,
-            s(24),
-        );
-        row_y += s(27);
-        mv(hwnd, ID_CHK_PATH, px, row_y, panel_w, s(24));
-        row_y += s(27);
-        // Offer pairs: label at the left, "Offer" and "On by default"
-        // checkboxes sharing the edit column.
-        let half = edit_w / 2;
-        mv(hwnd, ID_LBL_LAUNCH, px, row_y + s(2), label_w, s(20));
-        mv(hwnd, ID_CHK_LAUNCH_OFFER, edit_x, row_y, half, s(24));
-        mv(
-            hwnd,
-            ID_CHK_LAUNCH_DEFAULT,
-            edit_x + half,
-            row_y,
-            edit_w - half,
-            s(24),
-        );
-        row_y += s(29);
-        mv(hwnd, ID_LBL_LOGIN, px, row_y + s(2), label_w, s(20));
-        mv(hwnd, ID_CHK_LOGIN_OFFER, edit_x, row_y, half, s(24));
-        mv(
-            hwnd,
-            ID_CHK_LOGIN_DEFAULT,
-            edit_x + half,
-            row_y,
-            edit_w - half,
-            s(24),
-        );
-        row_y += s(29);
-        mv(hwnd, ID_LBL_DATADIRS, px, row_y + s(2), label_w, s(20));
-        mv(hwnd, ID_EDT_DATA_DIRS, edit_x, row_y, edit_w, s(25));
-        row_y += s(31);
-        // The manifest pane runs down to the footer — the output
-        // strip occupies only the left/center columns — so the
-        // PACKAGE cluster anchors to the pane's bottom and the Power
-        // blocks editor flexes in the space between. Before this the
-        // pane flowed top-down into the strip's rows at ordinary
-        // window sizes, and the cluster collided with the strip's
-        // buttons and the facts text.
-        let pane_bottom = footer_top - s(8);
-        let cluster_h = s(23) + s(29) + s(29);
-        let cluster_top = pane_bottom - cluster_h;
-        // "Advanced options (JSON)" is too long for the label column,
-        // so its label takes the pane's full width and the editor
-        // sits below it, still in the edit column.
-        let power_h = (cluster_top - s(6) - row_y).clamp(s(58), s(142));
-        mv(hwnd, ID_LBL_POWER, px, row_y, panel_w, s(20));
-        mv(
-            hwnd,
-            ID_EDT_POWER,
-            edit_x,
-            row_y + s(22),
-            edit_w,
-            power_h - s(22),
-        );
-        mv(hwnd, ID_LBL_PACKAGE_HDR, px, cluster_top, panel_w, s(20));
-        // Program folder row (+ Browse… button, wide enough to carry
-        // its word — a bare "…" was neither plain English nor a
-        // usable accessible name).
-        let files_y = cluster_top + s(23);
-        mv(hwnd, PANEL_LABELS[7], px, files_y + s(2), label_w, s(20));
-        mv(
-            hwnd,
-            ID_EDT_FILES_DIR,
-            edit_x,
-            files_y,
-            edit_w - s(70),
-            s(25),
-        );
-        mv(
-            hwnd,
-            ID_BTN_FILES_DIR,
-            edit_x + edit_w - s(64),
-            files_y,
-            s(64),
-            s(25),
-        );
-        // Output folder row (+ browse button).
-        let out_y = files_y + s(29);
-        mv(hwnd, PANEL_LABELS[8], px, out_y + s(2), label_w, s(20));
-        mv(hwnd, ID_EDT_OUT_DIR, edit_x, out_y, edit_w - s(70), s(25));
-        mv(
-            hwnd,
-            ID_BTN_OUT_DIR,
-            edit_x + edit_w - s(64),
-            out_y,
-            s(64),
-            s(25),
-        );
-
-        // Output strip: the left/center columns only — its right
-        // edge stops at the manifest pane, so nothing here can meet
-        // the PACKAGE cluster. The facts line runs under the output
-        // edit instead of in a right-hand column of its own.
-        let strip_right = px - s(12);
-        mv(hwnd, ID_LBL_OUTPUT_HDR, m, strip_y, s(120), s(20));
-        mv(
-            hwnd,
-            ID_CHK_SANDBOX,
-            strip_right - s(394),
-            strip_y,
-            s(148),
-            s(24),
-        );
-        mv(
-            hwnd,
-            ID_BTN_VERIFY,
-            strip_right - s(238),
-            strip_y,
-            s(130),
-            s(26),
-        );
-        mv(
-            hwnd,
-            ID_BTN_VALIDATE,
-            strip_right - s(100),
-            strip_y,
-            s(100),
-            s(26),
-        );
-        mv(
-            hwnd,
-            ID_OUTPUT,
-            m,
-            strip_y + s(30),
-            strip_right - m,
-            strip_h - s(74),
-        );
-        mv(
-            hwnd,
-            ID_LBL_FACTS,
-            m,
-            strip_y + strip_h - s(40),
-            strip_right - m,
-            s(38),
-        );
-
-        // Footer: the status line, then the action row — Cancel,
-        // Open output folder, Preview installer, Test install, and
-        // the one primary action, Build Setup.
-        mv(hwnd, ID_FOOTER_SEP, 0, footer_top - s(2), w, s(1));
-        let btn_y2 = footer_top + s(10);
-        mv(hwnd, ID_BTN_BUILD, w - m - s(160), btn_y2, s(160), s(32));
-        mv(hwnd, ID_BTN_TEST, w - m - s(308), btn_y2, s(140), s(32));
-        mv(hwnd, ID_BTN_PREVIEW, w - m - s(456), btn_y2, s(140), s(32));
-        mv(
-            hwnd,
-            ID_BTN_OPEN_OUTPUT,
-            w - m - s(614),
-            btn_y2,
-            s(150),
-            s(32),
-        );
-        mv(hwnd, ID_BTN_CANCEL, w - m - s(718), btn_y2, s(96), s(32));
-        mv(
-            hwnd,
-            ID_LBL_STATUS,
-            m,
-            footer_top + s(16),
-            (w - m - s(718) - s(8) - m).max(s(80)),
-            s(22),
-        );
+        set_font(hwnd, ID_LBL_STATUS, BODY_FONT);
+        set_font(hwnd, ID_BTN_CANCEL, BODY_FONT);
     }
 
     // ---- small control helpers (wizard idioms) ----
@@ -2321,13 +2554,16 @@ mod imp {
         }
     }
 
+    unsafe fn set_vis(hwnd: HWND, id: usize, show: bool) {
+        let ctrl = GetDlgItem(hwnd, id as i32);
+        if !ctrl.is_null() {
+            ShowWindow(ctrl, if show { SW_SHOW } else { SW_HIDE });
+        }
+    }
+
     fn set_status(hwnd: HWND, kind: StatusKind, text: &str) {
         with_state(|s| s.status_kind = kind);
         unsafe { set_text(hwnd, ID_LBL_STATUS, text) };
-    }
-
-    fn set_facts(hwnd: HWND, text: &str) {
-        unsafe { set_text(hwnd, ID_LBL_FACTS, text) };
     }
 
     fn default_facts() -> String {
@@ -2348,8 +2584,8 @@ mod imp {
         }
     }
 
-    /// Appends one line to the output strip. The edit is read-only for
-    /// typing but fully selectable/copyable.
+    /// Appends one line to the output console. The edit is read-only
+    /// for typing but fully selectable/copyable.
     fn append_output(hwnd: HWND, line: &str) {
         unsafe {
             let edit = GetDlgItem(hwnd, ID_OUTPUT as i32);
@@ -2365,6 +2601,22 @@ mod imp {
             SendMessageW(edit, EM_REPLACESEL_MSG, 0, wide.as_ptr() as LPARAM);
             SendMessageW(edit, EM_SCROLLCARET_MSG, 0, 0);
         }
+    }
+
+    /// A console line with a wall-clock timestamp — the Building
+    /// page's log style.
+    fn append_build_log(hwnd: HWND, line: &str) {
+        let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe {
+            windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut st);
+        }
+        append_output(
+            hwnd,
+            &format!(
+                "[{:02}:{:02}:{:02}] {}",
+                st.wHour, st.wMinute, st.wSecond, line
+            ),
+        );
     }
 
     fn mark_dirty(hwnd: HWND) {
@@ -2444,16 +2696,49 @@ mod imp {
         with_state(|s| s.suppress_dirty = false);
         update_path_tips(hwnd);
         refresh_appver(hwnd);
+        refresh_loc_note(hwnd);
     }
 
-    /// The toolbar strip's right-hand readout: "<app name> · <version>"
-    /// from the document (refreshed when controls are filled and after
-    /// a harvest, so it follows the Name/Version fields).
+    /// The editor toolbar's right-hand readout: "<app name> ·
+    /// <version>" from the document.
     fn refresh_appver(hwnd: HWND) {
         let text =
             with_state(|s| format!("{} · {}", s.doc.manifest.app_name, s.doc.manifest.version))
                 .unwrap_or_default();
         unsafe { set_text(hwnd, ID_LBL_APPVER, &text) };
+    }
+
+    /// The Options page's install-location note: what the wizard
+    /// will use as the default folder, in plain words.
+    fn refresh_loc_note(hwnd: HWND) {
+        let text = with_state(|s| {
+            let m = &s.doc.manifest;
+            match &m.install_location {
+                Some(loc) if !loc.trim().is_empty() => {
+                    format!("Install location default: {loc}")
+                }
+                _ => format!(
+                    "Installs go to each user's own folder — no admin rights needed (AppData\\Local\\Programs\\{})",
+                    m.app_name
+                ),
+            }
+        })
+        .unwrap_or_default();
+        unsafe { set_text(hwnd, ID_LBL_LOC_NOTE, &text) };
+    }
+
+    /// The Build Settings page's "You will get" list: the three file
+    /// names the build writes, from the document as harvested.
+    fn refresh_outputs_label(hwnd: HWND) {
+        let text = with_state(|s| {
+            format!(
+                "{}\r\n{}\r\nSHA256SUMS.txt",
+                s.doc.manifest.setup_file_name(),
+                s.doc.manifest.portable_file_name()
+            )
+        })
+        .unwrap_or_default();
+        unsafe { set_text(hwnd, ID_LBL_OUTPUTS, &text) };
     }
 
     /// Controls → document. Called before every operation and on
@@ -2481,8 +2766,8 @@ mod imp {
         // fields are replaced wholesale (the pane edits the same
         // model the manifest file carries). On failure the document
         // keeps its previous blocks and the error is reported to the
-        // output strip once per distinct error — harvest runs before
-        // every operation, so a standing typo must not spam it.
+        // output console once per distinct error — harvest runs
+        // before every operation, so a standing typo must not spam.
         let power_result = parse_power_blocks(&power_raw);
         match &power_result {
             Ok(_) => {
@@ -2490,7 +2775,7 @@ mod imp {
             }
             Err(errors) => {
                 let message = format!(
-                    "Power blocks not applied (previous value kept): {}",
+                    "Advanced options not applied (previous value kept): {}",
                     errors.join("; ")
                 );
                 let fresh = with_state(|s| {
@@ -2536,30 +2821,918 @@ mod imp {
             m.start_at_login_offered = login_offer;
             m.start_at_login_default = login_default;
             m.data_dirs = parse_data_dirs(&data_dirs_raw);
-            if let Ok(spec) = &power_result {
-                m.components = spec.components.clone();
-                m.pre_hooks = spec.pre_hooks.clone();
-                m.post_hooks = spec.post_hooks.clone();
-                m.registry_writes = spec.registry_writes.clone();
-                m.env_writes = spec.env_writes.clone();
-                m.shortcuts = spec.shortcuts.clone();
+            if let Ok(power) = &power_result {
+                m.components = power.components.clone();
+                m.pre_hooks = power.pre_hooks.clone();
+                m.post_hooks = power.post_hooks.clone();
+                m.registry_writes = power.registry_writes.clone();
+                m.env_writes = power.env_writes.clone();
+                m.shortcuts = power.shortcuts.clone();
             }
-            let fd = files_dir.trim().to_string();
+            let fd = files_dir.trim();
             s.doc.files_dir = if fd.is_empty() {
                 None
             } else {
                 Some(PathBuf::from(fd))
             };
-            let od = out_dir.trim().to_string();
+            let od = out_dir.trim();
             if !od.is_empty() {
                 s.doc.out_dir = PathBuf::from(od);
             }
         });
         update_path_tips(hwnd);
         refresh_appver(hwnd);
+        refresh_loc_note(hwnd);
     }
 
-    /// Rebuilds the files table from the document entries + last scan.
+    // ---- pages ----
+
+    /// The controls a page shows (before the step/state adjustments
+    /// layout applies for the New Project steps and the Finished
+    /// page's success/failure variants).
+    fn visible_set(page: Page) -> Vec<usize> {
+        let nav = [ID_NAV_HOME, ID_NAV_PROJECTS, ID_NAV_BUILD, ID_NAV_SETTINGS];
+        let chrome = [
+            ID_TAB_FILES,
+            ID_TAB_OPTIONS,
+            ID_TAB_REQUIREMENTS,
+            ID_BTN_TB_OPEN,
+            ID_BTN_TB_SAVE,
+            ID_BTN_TB_SAVEAS,
+            ID_BTN_TB_VALIDATE,
+            ID_LBL_APPVER,
+        ];
+        let mut v: Vec<usize> = Vec::new();
+        match page {
+            Page::Home => {
+                v.extend(nav);
+                v.extend([
+                    ID_LBL_HOME_TITLE,
+                    ID_LBL_HOME_SUB,
+                    ID_BTN_NEW_PROJECT,
+                    ID_LBL_RECENT_HDR,
+                    ID_BTN_VIEW_ALL,
+                    ID_RECENTS,
+                ]);
+            }
+            Page::ProjectList => {
+                v.extend(nav);
+                v.extend([
+                    ID_LBL_PL_TITLE,
+                    ID_LBL_PL_SUB,
+                    ID_LBL_PL_CURRENT,
+                    ID_RECENTS,
+                    ID_BTN_PL_OPEN,
+                    ID_BTN_PL_REMOVE,
+                    ID_BTN_PL_NEW,
+                    ID_BTN_PL_PICK,
+                ]);
+            }
+            Page::NewProject => {
+                v.extend([
+                    ID_LBL_NP_TITLE,
+                    ID_LBL_NP_SUB,
+                    ID_LBL_NP_STEP1,
+                    ID_LBL_NP_STEP2,
+                    ID_LBL_NP_STEP3,
+                    ID_LBL_NP_NAME,
+                    ID_EDT_NP_NAME,
+                    ID_LBL_NP_VERSION,
+                    ID_EDT_NP_VERSION,
+                    ID_LBL_NP_PUBLISHER,
+                    ID_EDT_NP_PUBLISHER,
+                    ID_LBL_NP_FOLDER,
+                    ID_EDT_NP_FOLDER,
+                    ID_BTN_NP_BROWSE,
+                    ID_LBL_NP_FOLDER_NOTE,
+                    ID_LBL_NP_SUMMARY,
+                    ID_BTN_NP_CANCEL,
+                    ID_BTN_NP_BACK,
+                    ID_BTN_NP_NEXT,
+                ]);
+            }
+            Page::EditorFiles => {
+                v.extend(nav);
+                v.extend(chrome);
+                v.extend([
+                    ID_LBL_FILES_TITLE,
+                    ID_LBL_FILES_SUB,
+                    ID_LBL_FOLDER_PATH_LBL,
+                    ID_EDT_FILES_DIR,
+                    ID_BTN_FILES_DIR,
+                    ID_LBL_FILES_PANE_HDR,
+                    ID_TREE,
+                    ID_BTN_PROGRAM_FOLDER,
+                    ID_LBL_PACKAGE_HDR,
+                    ID_LIST,
+                    ID_LBL_TOTALS,
+                    ID_BTN_REMOVE,
+                    ID_OUTPUT,
+                ]);
+            }
+            Page::EditorOptions => {
+                v.extend(nav);
+                v.extend(chrome);
+                v.extend([
+                    ID_LBL_OPT_TITLE,
+                    ID_LBL_OPT_SUB,
+                    ID_LBL_OPT_DETAILS,
+                    PANEL_LABELS[0],
+                    PANEL_LABELS[1],
+                    PANEL_LABELS[2],
+                    PANEL_LABELS[3],
+                    PANEL_LABELS[4],
+                    PANEL_LABELS[5],
+                    PANEL_LABELS[6],
+                    ID_EDT_NAME,
+                    ID_EDT_VERSION,
+                    ID_EDT_PUBLISHER,
+                    ID_EDT_PRIMARY,
+                    ID_EDT_INSTALL_LOC,
+                    ID_EDT_SM_FOLDER,
+                    ID_EDT_ASSOC,
+                    ID_LBL_OPT_ICON,
+                    ID_LBL_ICON_VALUE,
+                    ID_LBL_LOC_NOTE,
+                    ID_LBL_OPT_SHORTCUTS,
+                    ID_CHK_DESKTOP,
+                    ID_CHK_STARTMENU,
+                    ID_CHK_PATH,
+                    ID_LBL_LAUNCH,
+                    ID_CHK_LAUNCH_OFFER,
+                    ID_CHK_LAUNCH_DEFAULT,
+                    ID_LBL_LOGIN,
+                    ID_CHK_LOGIN_OFFER,
+                    ID_CHK_LOGIN_DEFAULT,
+                    ID_LBL_DATADIRS,
+                    ID_EDT_DATA_DIRS,
+                    ID_LBL_DATA_NOTE,
+                    ID_LBL_PREVIEW_HDR,
+                    ID_LBL_POWER,
+                    ID_EDT_POWER,
+                    ID_BTN_SCHEMA,
+                    ID_BTN_PREVIEW,
+                ]);
+            }
+            Page::EditorRequirements => {
+                v.extend(nav);
+                v.extend(chrome);
+                v.extend([
+                    ID_LBL_REQ_TITLE,
+                    ID_LBL_REQ_SUB,
+                    ID_LBL_REQ_WIN_HDR,
+                    ID_CHK_WINREQ,
+                    ID_LBL_WINREQ_TAG,
+                    ID_LBL_REQ_RT_HDR,
+                    ID_CHK_RT1,
+                    ID_CHK_RT2,
+                    ID_CHK_RT3,
+                    ID_CHK_RT4,
+                    ID_LBL_RT_TAG1,
+                    ID_LBL_RT_TAG2,
+                    ID_LBL_RT_TAG3,
+                    ID_LBL_RT_TAG4,
+                    ID_LBL_REQ_NOTE,
+                    ID_BTN_REQ_BACK,
+                    ID_BTN_REQ_NEXT,
+                ]);
+            }
+            Page::BuildSettings => {
+                v.extend(nav);
+                v.extend([
+                    ID_LBL_BS_TITLE,
+                    ID_LBL_BS_SUB,
+                    ID_LBL_BS_ARCH_HDR,
+                    ID_LBL_BS_ARCH,
+                    ID_LBL_BS_COMP_HDR,
+                    ID_CHK_COMPRESS,
+                    ID_LBL_BS_OUT_HDR,
+                    ID_EDT_OUT_DIR,
+                    ID_BTN_OUT_DIR,
+                    ID_LBL_BS_GET_HDR,
+                    ID_LBL_OUTPUTS,
+                    ID_LBL_BS_CHECK_HDR,
+                    ID_BTN_VALIDATE,
+                    ID_BTN_VERIFY,
+                    ID_CHK_SANDBOX,
+                    ID_BTN_TEST,
+                    ID_LBL_BS_CONSOLE_HDR,
+                    ID_OUTPUT,
+                    ID_BTN_OPEN_OUTPUT,
+                    ID_BTN_BS_BACK,
+                    ID_BTN_BUILD,
+                ]);
+            }
+            Page::Building => {
+                v.extend(nav);
+                v.extend([
+                    ID_LBL_ING_TITLE,
+                    ID_LBL_ING_SUB,
+                    ID_LBL_ING_PHASE,
+                    ID_PROGRESS,
+                    ID_LBL_ING_PCT,
+                    ID_OUTPUT,
+                    ID_BTN_CLEAR,
+                ]);
+            }
+            Page::BuildDone => {
+                v.extend(nav);
+                v.extend([
+                    ID_LBL_DONE_TITLE,
+                    ID_LBL_DONE_SUB,
+                    ID_LBL_DONE_SUMMARY,
+                    ID_LBL_DONE_REASON,
+                    ID_BTN_DONE_INSTALLER,
+                    ID_BTN_DONE_FOLDER,
+                    ID_BTN_DONE_AGAIN,
+                    ID_BTN_DONE_BACK,
+                ]);
+            }
+            Page::Settings => {
+                v.extend(nav);
+                v.extend([
+                    ID_LBL_SET_TITLE,
+                    ID_LBL_SET_RECENTS_HDR,
+                    ID_LBL_SET_RECENTS,
+                    ID_BTN_CLEAR_RECENTS,
+                    ID_LBL_SET_DIAG_HDR,
+                    ID_LBL_SET_LOG,
+                    ID_BTN_OPEN_LOG,
+                    ID_LBL_SET_SETTINGS,
+                    ID_LBL_SET_ABOUT_HDR,
+                    ID_LBL_SET_VERSION,
+                    ID_BTN_ABOUT,
+                    ID_LBL_SET_FACTS,
+                ]);
+            }
+        }
+        v
+    }
+
+    /// Switches the window to a page: records it, runs the page's
+    /// entry refresh, then lays out (which shows/hides and
+    /// positions) and repaints.
+    fn show_page(hwnd: HWND, page: Page) {
+        with_state(|s| s.page = page);
+        match page {
+            Page::Home | Page::ProjectList => fill_recents(hwnd),
+            Page::EditorFiles => ensure_scan(hwnd),
+            Page::EditorOptions => refresh_loc_note(hwnd),
+            Page::BuildSettings => {
+                unsafe { harvest_fields(hwnd) };
+                refresh_outputs_label(hwnd);
+            }
+            Page::BuildDone => fill_done(hwnd),
+            Page::Settings => fill_settings_page(hwnd),
+            Page::NewProject => refresh_np(hwnd),
+            _ => {}
+        }
+        unsafe { layout(hwnd) };
+        unsafe {
+            InvalidateRect(hwnd, std::ptr::null(), 1);
+        }
+    }
+
+    /// Starts the folder scan when the Files page is entered with a
+    /// folder that has not been scanned (or has changed).
+    fn ensure_scan(hwnd: HWND) {
+        if is_busy() {
+            return;
+        }
+        let stale = with_state(|s| {
+            s.doc.files_dir.is_some() && (s.scan.is_none() || s.entries_dir != s.doc.files_dir)
+        })
+        .unwrap_or(false);
+        if stale {
+            start_scan(hwnd);
+        }
+    }
+
+    /// Positions every control from the client size, the current
+    /// DPI scale, and the current page. Also the visibility pass:
+    /// controls not in the page's set are hidden.
+    unsafe fn layout(hwnd: HWND) {
+        let dpi = with_state(|s| s.dpi).unwrap_or(96);
+        let s = |v: i32| scale(v, dpi);
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut client);
+        let (w, h) = (client.right, client.bottom);
+        let page = with_state(|s| s.page).unwrap_or(Page::Home);
+
+        unsafe fn mv(hwnd: HWND, id: usize, x: i32, y: i32, w: i32, h: i32) {
+            let ctrl = GetDlgItem(hwnd, id as i32);
+            if !ctrl.is_null() {
+                MoveWindow(ctrl, x, y, w.max(0), h.max(0), 1);
+            }
+        }
+        unsafe fn set_col(hwnd: HWND, id: usize, col: usize, width: i32) {
+            let ctrl = GetDlgItem(hwnd, id as i32);
+            if !ctrl.is_null() {
+                SendMessageW(ctrl, LVM_SETCOLUMNWIDTH, col, width.max(0) as LPARAM);
+            }
+        }
+
+        // Visibility first.
+        let visible = visible_set(page);
+        for id in ALL_PAGE_CONTROLS {
+            set_vis(hwnd, *id, visible.contains(id));
+        }
+        // The New Project steps and the Finished page's variants
+        // narrow the set further.
+        if page == Page::NewProject {
+            let step = with_state(|s| s.np_step).unwrap_or(0);
+            for id in [
+                ID_LBL_NP_NAME,
+                ID_EDT_NP_NAME,
+                ID_LBL_NP_VERSION,
+                ID_EDT_NP_VERSION,
+                ID_LBL_NP_PUBLISHER,
+                ID_EDT_NP_PUBLISHER,
+            ] {
+                set_vis(hwnd, id, step == 0);
+            }
+            for id in [
+                ID_LBL_NP_FOLDER,
+                ID_EDT_NP_FOLDER,
+                ID_BTN_NP_BROWSE,
+                ID_LBL_NP_FOLDER_NOTE,
+            ] {
+                set_vis(hwnd, id, step == 1);
+            }
+            set_vis(hwnd, ID_LBL_NP_SUMMARY, step == 2);
+            set_vis(hwnd, ID_BTN_NP_BACK, step > 0);
+        }
+        if page == Page::BuildDone {
+            let ok = with_state(|s| s.done.as_ref().map(|d| d.ok))
+                .flatten()
+                .unwrap_or(true);
+            set_vis(hwnd, ID_LBL_DONE_SUMMARY, ok);
+            set_vis(hwnd, ID_BTN_DONE_INSTALLER, ok);
+            set_vis(hwnd, ID_BTN_DONE_AGAIN, ok);
+            set_vis(hwnd, ID_LBL_DONE_REASON, !ok);
+            set_vis(hwnd, ID_BTN_DONE_BACK, !ok);
+        }
+
+        // Footer: separator, status line, Cancel.
+        let footer_top = h - s(48);
+        mv(hwnd, ID_FOOTER_SEP, 0, footer_top, w, s(1));
+        mv(
+            hwnd,
+            ID_LBL_STATUS,
+            s(16),
+            footer_top + s(14),
+            (w - s(140)).max(s(80)),
+            s(20),
+        );
+        mv(
+            hwnd,
+            ID_BTN_CANCEL,
+            w - s(120),
+            footer_top + s(8),
+            s(104),
+            s(32),
+        );
+        let content_bottom = footer_top - s(16);
+
+        // Nav rail (the New Project flow replaces it with its step
+        // rail).
+        let rail_w = if page == Page::NewProject { 0 } else { s(176) };
+        if rail_w > 0 {
+            for (i, id) in [ID_NAV_HOME, ID_NAV_PROJECTS, ID_NAV_BUILD, ID_NAV_SETTINGS]
+                .iter()
+                .enumerate()
+            {
+                mv(
+                    hwnd,
+                    *id,
+                    s(12),
+                    s(20) + i as i32 * s(44),
+                    rail_w - s(24),
+                    s(36),
+                );
+            }
+        }
+        let cx = rail_w + s(28);
+        let cw = (w - cx - s(24)).max(s(200));
+
+        // Editor chrome geometry (tabs left, commands right, title
+        // block under them).
+        let editor_chrome = |hwnd: HWND| {
+            mv(hwnd, ID_TAB_FILES, cx, s(8), s(160), s(30));
+            mv(hwnd, ID_TAB_OPTIONS, cx + s(168), s(8), s(170), s(30));
+            mv(hwnd, ID_TAB_REQUIREMENTS, cx + s(346), s(8), s(150), s(30));
+            mv(
+                hwnd,
+                ID_BTN_TB_VALIDATE,
+                cx + cw - s(128),
+                s(8),
+                s(128),
+                s(30),
+            );
+            mv(
+                hwnd,
+                ID_BTN_TB_SAVEAS,
+                cx + cw - s(236),
+                s(8),
+                s(100),
+                s(30),
+            );
+            mv(hwnd, ID_BTN_TB_SAVE, cx + cw - s(328), s(8), s(84), s(30));
+            mv(hwnd, ID_BTN_TB_OPEN, cx + cw - s(432), s(8), s(96), s(30));
+            mv(hwnd, ID_LBL_APPVER, cx, s(44), cw, s(18));
+        };
+
+        match page {
+            Page::Home => {
+                mv(hwnd, ID_LBL_HOME_TITLE, cx, s(12), cw, s(38));
+                mv(hwnd, ID_LBL_HOME_SUB, cx, s(54), cw, s(20));
+                mv(hwnd, ID_BTN_NEW_PROJECT, cx, s(94), s(170), s(38));
+                mv(hwnd, ID_LBL_RECENT_HDR, cx, s(162), s(240), s(24));
+                mv(
+                    hwnd,
+                    ID_BTN_VIEW_ALL,
+                    cx + cw - s(110),
+                    s(158),
+                    s(110),
+                    s(28),
+                );
+                let list_h = (content_bottom - s(196)).clamp(s(120), s(280));
+                mv(hwnd, ID_RECENTS, cx, s(196), cw, list_h);
+                set_col(hwnd, ID_RECENTS, 1, s(110));
+                set_col(hwnd, ID_RECENTS, 2, s(170));
+                set_col(hwnd, ID_RECENTS, 0, cw - s(110) - s(170) - s(17));
+            }
+            Page::ProjectList => {
+                mv(hwnd, ID_LBL_PL_TITLE, cx, s(12), cw, s(38));
+                mv(hwnd, ID_LBL_PL_SUB, cx, s(54), cw, s(20));
+                mv(hwnd, ID_LBL_PL_CURRENT, cx, s(86), cw, s(20));
+                let list_h = content_bottom - s(118) - s(52);
+                mv(hwnd, ID_RECENTS, cx, s(118), cw, list_h);
+                set_col(hwnd, ID_RECENTS, 1, s(110));
+                set_col(hwnd, ID_RECENTS, 2, s(170));
+                set_col(hwnd, ID_RECENTS, 0, cw - s(110) - s(170) - s(17));
+                let by = content_bottom - s(40);
+                mv(hwnd, ID_BTN_PL_OPEN, cx, by, s(120), s(32));
+                mv(hwnd, ID_BTN_PL_REMOVE, cx + s(132), by, s(180), s(32));
+                mv(hwnd, ID_BTN_PL_PICK, cx + s(324), by, s(220), s(32));
+                mv(hwnd, ID_BTN_PL_NEW, cx + cw - s(170), by, s(170), s(32));
+            }
+            Page::NewProject => {
+                let mx = s(48);
+                let form_x = mx + s(250);
+                let form_w = (w - form_x - mx).max(s(200));
+                mv(hwnd, ID_LBL_NP_TITLE, form_x, s(12), form_w, s(38));
+                mv(hwnd, ID_LBL_NP_SUB, form_x, s(54), form_w, s(20));
+                // Step rail: labels here, circles painted in WM_PAINT.
+                let mut circles = Vec::new();
+                for (i, id) in [ID_LBL_NP_STEP1, ID_LBL_NP_STEP2, ID_LBL_NP_STEP3]
+                    .iter()
+                    .enumerate()
+                {
+                    let y = s(120) + i as i32 * s(44);
+                    mv(hwnd, *id, mx + s(36), y, s(200), s(24));
+                    circles.push((mx + s(12), y + s(12), s(11)));
+                }
+                with_state(|s| s.np_circles = circles);
+                // Step 1 fields.
+                mv(hwnd, ID_LBL_NP_NAME, form_x, s(120), form_w, s(20));
+                mv(
+                    hwnd,
+                    ID_EDT_NP_NAME,
+                    form_x,
+                    s(146),
+                    form_w.min(s(480)),
+                    s(28),
+                );
+                mv(hwnd, ID_LBL_NP_VERSION, form_x, s(190), form_w, s(20));
+                mv(hwnd, ID_EDT_NP_VERSION, form_x, s(216), s(220), s(28));
+                mv(hwnd, ID_LBL_NP_PUBLISHER, form_x, s(262), form_w, s(20));
+                mv(
+                    hwnd,
+                    ID_EDT_NP_PUBLISHER,
+                    form_x,
+                    s(288),
+                    form_w.min(s(480)),
+                    s(28),
+                );
+                // Step 2 fields.
+                mv(hwnd, ID_LBL_NP_FOLDER, form_x, s(120), form_w, s(20));
+                mv(
+                    hwnd,
+                    ID_EDT_NP_FOLDER,
+                    form_x,
+                    s(146),
+                    form_w - s(112),
+                    s(28),
+                );
+                mv(
+                    hwnd,
+                    ID_BTN_NP_BROWSE,
+                    form_x + form_w - s(100),
+                    s(146),
+                    s(100),
+                    s(28),
+                );
+                mv(hwnd, ID_LBL_NP_FOLDER_NOTE, form_x, s(190), form_w, s(44));
+                // Step 3.
+                mv(hwnd, ID_LBL_NP_SUMMARY, form_x, s(120), form_w, s(240));
+                // Flow footer.
+                let by = content_bottom - s(38);
+                mv(hwnd, ID_BTN_NP_CANCEL, mx, by, s(110), s(34));
+                mv(hwnd, ID_BTN_NP_BACK, w - mx - s(240), by, s(110), s(34));
+                mv(hwnd, ID_BTN_NP_NEXT, w - mx - s(118), by, s(118), s(34));
+            }
+            Page::EditorFiles => {
+                editor_chrome(hwnd);
+                mv(hwnd, ID_LBL_FILES_TITLE, cx, s(72), cw, s(38));
+                mv(hwnd, ID_LBL_FILES_SUB, cx, s(114), cw, s(20));
+                let left_w = s(340);
+                mv(hwnd, ID_LBL_FOLDER_PATH_LBL, cx, s(148), left_w, s(20));
+                mv(hwnd, ID_EDT_FILES_DIR, cx, s(172), left_w - s(96), s(26));
+                mv(
+                    hwnd,
+                    ID_BTN_FILES_DIR,
+                    cx + left_w - s(88),
+                    s(172),
+                    s(88),
+                    s(26),
+                );
+                mv(hwnd, ID_LBL_FILES_PANE_HDR, cx, s(210), left_w, s(20));
+                let tree_h = content_bottom - s(234) - s(48);
+                mv(hwnd, ID_TREE, cx, s(234), left_w, tree_h);
+                {
+                    let dest_w = s(128);
+                    let measured = with_state(|s| s.tree_col_w).unwrap_or(0);
+                    let col0 = (left_w - dest_w).max(measured);
+                    set_col(hwnd, ID_TREE, 0, col0);
+                    set_col(hwnd, ID_TREE, 1, dest_w);
+                }
+                mv(
+                    hwnd,
+                    ID_BTN_PROGRAM_FOLDER,
+                    cx,
+                    content_bottom - s(40),
+                    s(170),
+                    s(32),
+                );
+                let x2 = cx + left_w + s(24);
+                let w2 = (cw - left_w - s(24)).max(s(200));
+                mv(hwnd, ID_LBL_PACKAGE_HDR, x2, s(148), w2, s(20));
+                let list_h = content_bottom - s(172) - s(150);
+                mv(hwnd, ID_LIST, x2, s(172), w2, list_h);
+                {
+                    let total = w2 - s(17);
+                    set_col(hwnd, ID_LIST, 1, s(150));
+                    set_col(hwnd, ID_LIST, 2, s(95));
+                    set_col(hwnd, ID_LIST, 3, s(115));
+                    set_col(hwnd, ID_LIST, 0, total - s(150) - s(95) - s(115));
+                }
+                mv(hwnd, ID_LBL_TOTALS, x2, content_bottom - s(142), w2, s(38));
+                // A mini console under the table: scan warnings and
+                // open/save reports land here (the same control is
+                // the full log on the Build pages).
+                mv(hwnd, ID_OUTPUT, x2, content_bottom - s(96), w2, s(56));
+                mv(
+                    hwnd,
+                    ID_BTN_REMOVE,
+                    x2 + w2 - s(160),
+                    content_bottom - s(40),
+                    s(160),
+                    s(32),
+                );
+            }
+            Page::EditorOptions => {
+                editor_chrome(hwnd);
+                mv(hwnd, ID_LBL_OPT_TITLE, cx, s(72), cw, s(38));
+                mv(hwnd, ID_LBL_OPT_SUB, cx, s(114), cw, s(20));
+                let right_w = s(364);
+                let form_w = (cw - right_w - s(24)).max(s(300));
+                let rx = cx + form_w + s(24);
+                let label_w = s(150);
+                let edit_x = cx + label_w + s(6);
+                let edit_w = form_w - label_w - s(6);
+                mv(hwnd, ID_LBL_OPT_DETAILS, cx, s(148), form_w, s(20));
+                for (i, label_id) in PANEL_LABELS.iter().enumerate() {
+                    let y = s(176) + i as i32 * s(29);
+                    mv(hwnd, *label_id, cx, y + s(3), label_w, s(20));
+                    let edit_id = [
+                        ID_EDT_NAME,
+                        ID_EDT_VERSION,
+                        ID_EDT_PUBLISHER,
+                        ID_EDT_PRIMARY,
+                        ID_EDT_INSTALL_LOC,
+                        ID_EDT_SM_FOLDER,
+                        ID_EDT_ASSOC,
+                    ][i];
+                    mv(hwnd, edit_id, edit_x, y, edit_w, s(26));
+                }
+                let icon_y = s(176) + 7 * s(29);
+                mv(hwnd, ID_LBL_OPT_ICON, cx, icon_y + s(3), label_w, s(20));
+                mv(
+                    hwnd,
+                    ID_LBL_ICON_VALUE,
+                    edit_x,
+                    icon_y + s(3),
+                    edit_w,
+                    s(20),
+                );
+                mv(hwnd, ID_LBL_LOC_NOTE, cx, icon_y + s(28), form_w, s(20));
+                let sc_y = icon_y + s(56);
+                mv(hwnd, ID_LBL_OPT_SHORTCUTS, cx, sc_y, form_w, s(20));
+                mv(hwnd, ID_CHK_DESKTOP, cx, sc_y + s(26), form_w / 2, s(24));
+                mv(
+                    hwnd,
+                    ID_CHK_STARTMENU,
+                    cx + form_w / 2,
+                    sc_y + s(26),
+                    form_w - form_w / 2,
+                    s(24),
+                );
+                mv(hwnd, ID_CHK_PATH, cx, sc_y + s(52), form_w, s(24));
+                mv(hwnd, ID_LBL_LAUNCH, cx, sc_y + s(82), label_w, s(20));
+                mv(
+                    hwnd,
+                    ID_CHK_LAUNCH_OFFER,
+                    edit_x,
+                    sc_y + s(80),
+                    s(104),
+                    s(24),
+                );
+                mv(
+                    hwnd,
+                    ID_CHK_LAUNCH_DEFAULT,
+                    edit_x + s(112),
+                    sc_y + s(80),
+                    edit_w - s(112),
+                    s(24),
+                );
+                mv(hwnd, ID_LBL_LOGIN, cx, sc_y + s(110), label_w, s(20));
+                mv(
+                    hwnd,
+                    ID_CHK_LOGIN_OFFER,
+                    edit_x,
+                    sc_y + s(108),
+                    s(104),
+                    s(24),
+                );
+                mv(
+                    hwnd,
+                    ID_CHK_LOGIN_DEFAULT,
+                    edit_x + s(112),
+                    sc_y + s(108),
+                    edit_w - s(112),
+                    s(24),
+                );
+                let dd_y = sc_y + s(138);
+                mv(hwnd, ID_LBL_DATADIRS, cx, dd_y + s(3), label_w, s(20));
+                mv(hwnd, ID_EDT_DATA_DIRS, edit_x, dd_y, edit_w, s(26));
+                mv(hwnd, ID_LBL_DATA_NOTE, cx, dd_y + s(34), form_w, s(38));
+                // Right column: live preview, then the advanced
+                // editor flexing to the bottom.
+                mv(hwnd, ID_LBL_PREVIEW_HDR, rx, s(148), right_w, s(20));
+                let preview_rect = (rx, s(174), right_w, s(252));
+                with_state(|st| {
+                    st.preview_rect = Some(preview_rect);
+                });
+                let power_y = s(442);
+                mv(hwnd, ID_LBL_POWER, rx, power_y, right_w, s(20));
+                mv(
+                    hwnd,
+                    ID_EDT_POWER,
+                    rx,
+                    power_y + s(24),
+                    right_w,
+                    (content_bottom - power_y - s(24)).max(s(40)),
+                );
+                mv(
+                    hwnd,
+                    ID_BTN_PREVIEW,
+                    cx,
+                    content_bottom - s(40),
+                    s(180),
+                    s(32),
+                );
+                mv(
+                    hwnd,
+                    ID_BTN_SCHEMA,
+                    cx + s(192),
+                    content_bottom - s(40),
+                    s(180),
+                    s(32),
+                );
+            }
+            Page::EditorRequirements => {
+                editor_chrome(hwnd);
+                mv(hwnd, ID_LBL_REQ_TITLE, cx, s(72), cw, s(38));
+                mv(hwnd, ID_LBL_REQ_SUB, cx, s(114), cw, s(20));
+                mv(hwnd, ID_LBL_REQ_WIN_HDR, cx, s(148), cw, s(20));
+                mv(hwnd, ID_CHK_WINREQ, cx, s(176), s(340), s(26));
+                mv(hwnd, ID_LBL_WINREQ_TAG, cx + s(352), s(176), s(100), s(26));
+                mv(hwnd, ID_LBL_REQ_RT_HDR, cx, s(228), cw, s(20));
+                for (i, (chk_id, tag_id)) in [
+                    (ID_CHK_RT1, ID_LBL_RT_TAG1),
+                    (ID_CHK_RT2, ID_LBL_RT_TAG2),
+                    (ID_CHK_RT3, ID_LBL_RT_TAG3),
+                    (ID_CHK_RT4, ID_LBL_RT_TAG4),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let y = s(256) + i as i32 * s(34);
+                    mv(hwnd, *chk_id, cx, y, s(400), s(26));
+                    mv(hwnd, *tag_id, cx + s(412), y, s(110), s(26));
+                }
+                mv(hwnd, ID_LBL_REQ_NOTE, cx, s(404), cw.min(s(620)), s(46));
+                mv(
+                    hwnd,
+                    ID_BTN_REQ_BACK,
+                    cx,
+                    content_bottom - s(40),
+                    s(110),
+                    s(32),
+                );
+                mv(
+                    hwnd,
+                    ID_BTN_REQ_NEXT,
+                    cx + cw - s(130),
+                    content_bottom - s(40),
+                    s(130),
+                    s(32),
+                );
+            }
+            Page::BuildSettings => {
+                mv(hwnd, ID_LBL_BS_TITLE, cx, s(12), cw, s(38));
+                mv(hwnd, ID_LBL_BS_SUB, cx, s(54), cw, s(20));
+                mv(hwnd, ID_LBL_BS_ARCH_HDR, cx, s(92), cw, s(20));
+                mv(hwnd, ID_LBL_BS_ARCH, cx, s(118), cw, s(22));
+                mv(hwnd, ID_LBL_BS_COMP_HDR, cx, s(156), cw, s(20));
+                mv(hwnd, ID_CHK_COMPRESS, cx, s(182), s(480), s(26));
+                mv(hwnd, ID_LBL_BS_OUT_HDR, cx, s(224), cw, s(20));
+                mv(hwnd, ID_EDT_OUT_DIR, cx, s(250), cw - s(112), s(26));
+                mv(
+                    hwnd,
+                    ID_BTN_OUT_DIR,
+                    cx + cw - s(100),
+                    s(250),
+                    s(100),
+                    s(26),
+                );
+                mv(hwnd, ID_LBL_BS_GET_HDR, cx, s(292), cw, s(20));
+                mv(hwnd, ID_LBL_OUTPUTS, cx, s(318), cw, s(62));
+                mv(hwnd, ID_LBL_BS_CHECK_HDR, cx, s(396), cw, s(20));
+                mv(hwnd, ID_BTN_VALIDATE, cx, s(422), s(150), s(30));
+                mv(hwnd, ID_CHK_SANDBOX, cx + s(162), s(422), s(190), s(30));
+                mv(hwnd, ID_BTN_VERIFY, cx + s(364), s(422), s(150), s(30));
+                mv(hwnd, ID_BTN_TEST, cx + s(526), s(422), s(140), s(30));
+                mv(hwnd, ID_LBL_BS_CONSOLE_HDR, cx, s(470), cw, s(20));
+                mv(
+                    hwnd,
+                    ID_OUTPUT,
+                    cx,
+                    s(496),
+                    cw,
+                    (content_bottom - s(496) - s(52)).max(s(40)),
+                );
+                let by = content_bottom - s(40);
+                mv(hwnd, ID_BTN_BS_BACK, cx, by, s(110), s(32));
+                mv(
+                    hwnd,
+                    ID_BTN_OPEN_OUTPUT,
+                    cx + cw - s(360),
+                    by,
+                    s(180),
+                    s(32),
+                );
+                mv(hwnd, ID_BTN_BUILD, cx + cw - s(168), by, s(168), s(32));
+            }
+            Page::Building => {
+                mv(hwnd, ID_LBL_ING_TITLE, cx, s(12), cw, s(38));
+                mv(hwnd, ID_LBL_ING_SUB, cx, s(54), cw, s(20));
+                mv(hwnd, ID_LBL_ING_PHASE, cx, s(108), cw - s(70), s(22));
+                mv(hwnd, ID_LBL_ING_PCT, cx + cw - s(60), s(108), s(60), s(22));
+                mv(hwnd, ID_PROGRESS, cx, s(136), cw, s(22));
+                mv(
+                    hwnd,
+                    ID_OUTPUT,
+                    cx,
+                    s(178),
+                    cw,
+                    (content_bottom - s(178) - s(52)).max(s(40)),
+                );
+                mv(
+                    hwnd,
+                    ID_BTN_CLEAR,
+                    cx,
+                    content_bottom - s(40),
+                    s(100),
+                    s(32),
+                );
+            }
+            Page::BuildDone => {
+                let badge = s(68);
+                let bx = cx + (cw - badge) / 2;
+                let badge_rect = (bx, s(84), badge, badge);
+                with_state(|st| st.badge_rect = Some(badge_rect));
+                mv(hwnd, ID_LBL_DONE_TITLE, cx, s(172), cw, s(38));
+                mv(hwnd, ID_LBL_DONE_SUB, cx, s(214), cw, s(20));
+                let sum_w = s(560).min(cw);
+                mv(
+                    hwnd,
+                    ID_LBL_DONE_SUMMARY,
+                    cx + (cw - sum_w) / 2,
+                    s(256),
+                    sum_w,
+                    s(130),
+                );
+                mv(
+                    hwnd,
+                    ID_LBL_DONE_REASON,
+                    cx + (cw - sum_w) / 2,
+                    s(256),
+                    sum_w,
+                    s(130),
+                );
+                let ok = with_state(|s| s.done.as_ref().map(|d| d.ok))
+                    .flatten()
+                    .unwrap_or(true);
+                if ok {
+                    let total = s(190) + s(12) + s(140) + s(12) + s(140);
+                    let x0 = cx + (cw - total) / 2;
+                    mv(hwnd, ID_BTN_DONE_INSTALLER, x0, s(410), s(190), s(34));
+                    mv(hwnd, ID_BTN_DONE_FOLDER, x0 + s(202), s(410), s(140), s(34));
+                    mv(hwnd, ID_BTN_DONE_AGAIN, x0 + s(354), s(410), s(140), s(34));
+                } else {
+                    let total = s(200) + s(12) + s(140);
+                    let x0 = cx + (cw - total) / 2;
+                    mv(hwnd, ID_BTN_DONE_BACK, x0, s(410), s(200), s(34));
+                    mv(hwnd, ID_BTN_DONE_FOLDER, x0 + s(212), s(410), s(140), s(34));
+                }
+            }
+            Page::Settings => {
+                mv(hwnd, ID_LBL_SET_TITLE, cx, s(12), cw, s(38));
+                mv(hwnd, ID_LBL_SET_RECENTS_HDR, cx, s(72), cw, s(20));
+                mv(hwnd, ID_LBL_SET_RECENTS, cx, s(100), cw, s(20));
+                mv(hwnd, ID_BTN_CLEAR_RECENTS, cx, s(128), s(150), s(30));
+                mv(hwnd, ID_LBL_SET_DIAG_HDR, cx, s(178), cw, s(20));
+                mv(hwnd, ID_LBL_SET_LOG, cx, s(206), cw, s(20));
+                mv(hwnd, ID_BTN_OPEN_LOG, cx, s(234), s(150), s(30));
+                mv(hwnd, ID_LBL_SET_SETTINGS, cx, s(272), cw, s(20));
+                mv(hwnd, ID_LBL_SET_ABOUT_HDR, cx, s(312), cw, s(20));
+                mv(hwnd, ID_LBL_SET_VERSION, cx, s(340), cw, s(20));
+                mv(hwnd, ID_BTN_ABOUT, cx, s(368), s(220), s(30));
+                mv(hwnd, ID_LBL_SET_FACTS, cx, s(416), cw, s(40));
+            }
+        }
+    }
+
+    // ---- list helpers ----
+
+    /// Inserts one list-view row (cell 0 inserts, the rest set text).
+    unsafe fn lv_insert(list: HWND, row: i32, cells: &[String]) {
+        for (col_idx, cell) in cells.iter().enumerate() {
+            let mut wide: Vec<u16> = cell.encode_utf16().chain(std::iter::once(0)).collect();
+            let item = LVITEMW {
+                mask: LVIF_TEXT,
+                iItem: row,
+                iSubItem: col_idx as i32,
+                state: 0,
+                stateMask: 0,
+                pszText: wide.as_mut_ptr(),
+                cchTextMax: 0,
+                iImage: 0,
+                lParam: 0,
+                iIndent: 0,
+                iGroupId: 0,
+                cColumns: 0,
+                puColumns: std::ptr::null_mut(),
+                piColFmt: std::ptr::null_mut(),
+                iGroup: 0,
+            };
+            if col_idx == 0 {
+                SendMessageW(list, LVM_INSERTITEMW, 0, &item as *const _ as LPARAM);
+            } else {
+                SendMessageW(
+                    list,
+                    LVM_SETITEMTEXTW,
+                    row as usize,
+                    &item as *const _ as LPARAM,
+                );
+            }
+        }
+    }
+
+    /// The destination column's text for a package-relative folder
+    /// ("" = the program folder itself).
+    fn dest_text(dir: &str) -> String {
+        if dir.is_empty() {
+            "Program folder".to_string()
+        } else {
+            format!("Program folder\\{}", dir.replace('/', "\\"))
+        }
+    }
+
+    // ---- files table + folder listing ----
+
     unsafe fn fill_list(hwnd: HWND) {
         let list = GetDlgItem(hwnd, ID_LIST as i32);
         if list.is_null() {
@@ -2595,62 +3768,72 @@ mod imp {
             "—".to_string(),
         ]);
         for (row_idx, row) in display.iter().enumerate() {
-            for (col_idx, cell) in row.iter().enumerate() {
-                let mut wide: Vec<u16> = cell.encode_utf16().chain(std::iter::once(0)).collect();
-                let item = LVITEMW {
-                    mask: LVIF_TEXT,
-                    iItem: row_idx as i32,
-                    iSubItem: col_idx as i32,
-                    state: 0,
-                    stateMask: 0,
-                    pszText: wide.as_mut_ptr(),
-                    cchTextMax: 0,
-                    iImage: 0,
-                    lParam: 0,
-                    iIndent: 0,
-                    iGroupId: 0,
-                    cColumns: 0,
-                    puColumns: std::ptr::null_mut(),
-                    piColFmt: std::ptr::null_mut(),
-                    iGroup: 0,
-                };
-                if col_idx == 0 {
-                    SendMessageW(list, LVM_INSERTITEMW, 0, &item as *const _ as LPARAM);
-                } else {
-                    SendMessageW(list, LVM_SETITEMTEXTW, row_idx, &item as *const _ as LPARAM);
-                }
-            }
+            lv_insert(list, row_idx as i32, row);
         }
         fill_tree(hwnd);
         update_totals(hwnd);
     }
 
-    /// Rebuilds the left pane's listing from the last scan (falling
-    /// back to the document entries before the first scan lands):
-    /// the whole files directory, directories included — the center
-    /// table shows only what will be packed.
+    /// Rebuilds the Files page's folder listing from the last scan
+    /// (falling back to the document entries before the first scan
+    /// lands): the whole program folder, directories included, each
+    /// row carrying a tick box for inclusion in the package. The
+    /// center table shows only what will be packed.
     unsafe fn fill_tree(hwnd: HWND) {
         let tree = GetDlgItem(hwnd, ID_TREE as i32);
         if tree.is_null() {
             return;
         }
-        let entries = with_state(|s| {
+        let (all_files, entries) = with_state(|s| {
             let files = match &s.scan {
                 Some(scan) => scan.all_files.clone(),
                 None => s.doc.entries.clone(),
             };
-            tree_entries(&files)
+            (files, s.doc.entries.clone())
         })
         .unwrap_or_default();
+        let listing = tree_entries(&all_files);
         SendMessageW(tree, LVM_DELETEALLITEMS, 0, 0);
-        let mut rels: Vec<Option<String>> = Vec::with_capacity(entries.len());
-        // Measure the widest row (text + indent) so the listing's
-        // one column can be made wide enough for every name to be
-        // scrolled to in full.
+        with_state(|s| s.suppress_tree_check = true);
         let dpi = with_state(|s| s.dpi).unwrap_or(96);
+        let mut rows: Vec<TreeRowInfo> = Vec::with_capacity(listing.len());
+        let mut dir_stack: Vec<(usize, String)> = Vec::new();
         let mut widest: i32 = 0;
-        for (idx, entry) in entries.iter().enumerate() {
-            rels.push(entry.rel.clone());
+        for (idx, entry) in listing.iter().enumerate() {
+            while dir_stack
+                .last()
+                .map(|(d, _)| *d >= entry.depth)
+                .unwrap_or(false)
+            {
+                dir_stack.pop();
+            }
+            let (info, dest) = if let Some(rel) = &entry.rel {
+                let dir = match rel.rfind('/') {
+                    Some(i) => rel[..i].to_string(),
+                    None => String::new(),
+                };
+                (
+                    TreeRowInfo {
+                        rel: Some(rel.clone()),
+                        files: vec![rel.clone()],
+                    },
+                    dest_text(&dir),
+                )
+            } else {
+                let name = entry.label.trim_end_matches('/');
+                let prefix = match dir_stack.last() {
+                    Some((_, p)) => format!("{p}/{name}"),
+                    None => name.to_string(),
+                };
+                let files: Vec<String> = all_files
+                    .iter()
+                    .filter(|f| f.starts_with(&format!("{prefix}/")))
+                    .cloned()
+                    .collect();
+                dir_stack.push((entry.depth, prefix.clone()));
+                (TreeRowInfo { rel: None, files }, dest_text(&prefix))
+            };
+            let checked = !info.files.is_empty() && info.files.iter().all(|f| entries.contains(f));
             let mut wide: Vec<u16> = entry
                 .label
                 .encode_utf16()
@@ -2660,11 +3843,11 @@ mod imp {
             let row_w = text_w as i32 + scale(20, dpi) * entry.depth as i32 + scale(16, dpi);
             widest = widest.max(row_w);
             let item = LVITEMW {
-                mask: LVIF_TEXT | LVIF_INDENT,
+                mask: LVIF_TEXT | LVIF_INDENT | LVIF_STATE,
                 iItem: idx as i32,
                 iSubItem: 0,
-                state: 0,
-                stateMask: 0,
+                state: (if checked { 2 } else { 1 }) << 12,
+                stateMask: LVIS_STATEIMAGEMASK,
                 pszText: wide.as_mut_ptr(),
                 cchTextMax: 0,
                 iImage: 0,
@@ -2677,21 +3860,42 @@ mod imp {
                 iGroup: 0,
             };
             SendMessageW(tree, LVM_INSERTITEMW, 0, &item as *const _ as LPARAM);
+            let mut dest_wide: Vec<u16> = dest.encode_utf16().chain(std::iter::once(0)).collect();
+            let sub = LVITEMW {
+                mask: LVIF_TEXT,
+                iItem: idx as i32,
+                iSubItem: 1,
+                state: 0,
+                stateMask: 0,
+                pszText: dest_wide.as_mut_ptr(),
+                cchTextMax: 0,
+                iImage: 0,
+                lParam: 0,
+                iIndent: 0,
+                iGroupId: 0,
+                cColumns: 0,
+                puColumns: std::ptr::null_mut(),
+                piColFmt: std::ptr::null_mut(),
+                iGroup: 0,
+            };
+            SendMessageW(tree, LVM_SETITEMTEXTW, idx, &sub as *const _ as LPARAM);
+            rows.push(info);
         }
         with_state(|s| {
-            s.tree_rels = rels;
+            s.tree_rows = rows;
             s.tree_col_w = widest;
+            s.suppress_tree_check = false;
         });
-        // Apply the measured width right away (layout does the same
-        // on the next resize): the column is never narrower than the
-        // pane, and wider when a name needs it.
+        // Apply the measured first-column width right away (layout
+        // does the same on the next resize).
         let mut tree_rect: RECT = std::mem::zeroed();
         GetClientRect(tree, &mut tree_rect);
+        let dpi2 = dpi;
         SendMessageW(
             tree,
             LVM_SETCOLUMNWIDTH,
             0,
-            (tree_rect.right.max(widest)) as LPARAM,
+            ((tree_rect.right - scale(128, dpi2)).max(widest)) as LPARAM,
         );
     }
 
@@ -2741,7 +3945,7 @@ mod imp {
         unsafe { set_text(hwnd, ID_LBL_TOTALS, &text) };
     }
 
-    /// Center-table selection: remember the file so the totals line
+    /// Table selection: remember the file so the totals line
     /// describes it.
     fn on_list_selection(hwnd: HWND, index: i32) {
         if index < 0 {
@@ -2758,13 +3962,14 @@ mod imp {
         }
     }
 
-    /// Left-listing selection: remember the file, mirror the
-    /// selection into the center table, and scroll it into view.
+    /// Listing selection: remember the file, mirror the selection
+    /// into the table, and scroll it into view.
     unsafe fn on_tree_selection(hwnd: HWND, index: i32) {
         if index < 0 {
             return;
         }
-        let rel = with_state(|s| s.tree_rels.get(index as usize).cloned().flatten()).flatten();
+        let rel =
+            with_state(|s| s.tree_rows.get(index as usize).and_then(|r| r.rel.clone())).flatten();
         let Some(rel) = rel else {
             return; // a directory row: nothing to select in the table
         };
@@ -2810,29 +4015,151 @@ mod imp {
         update_totals(hwnd);
     }
 
-    /// Buttons that start work or change the job's inputs: all
-    /// disabled while a job runs (its inputs are snapshotted when it
-    /// starts; a second operation must not begin). Cancel is the
-    /// mirror image — enabled only while a job runs.
-    const ACTION_IDS: [usize; 12] = [
-        ID_BTN_PROGRAM_FOLDER,
-        ID_BTN_REMOVE,
-        ID_BTN_TB_OPEN,
-        ID_BTN_TB_SAVE,
-        ID_BTN_TB_SAVEAS,
-        ID_BTN_TB_VALIDATE,
-        ID_BTN_VALIDATE,
-        ID_BTN_VERIFY,
-        ID_BTN_TEST,
-        ID_BTN_BUILD,
-        ID_BTN_OPEN_OUTPUT,
-        ID_BTN_PREVIEW,
-    ];
+    /// A listing tick box changed: add or remove that file (or every
+    /// file under that folder) from the package list.
+    fn on_tree_check(hwnd: HWND, index: i32, checked: bool) {
+        if index < 0 || with_state(|s| s.suppress_tree_check).unwrap_or(false) {
+            return;
+        }
+        let changed = with_state(|s| {
+            let Some(row) = s.tree_rows.get(index as usize) else {
+                return false;
+            };
+            let files = row.files.clone();
+            if files.is_empty() {
+                return false;
+            }
+            if checked {
+                for f in &files {
+                    if !s.doc.entries.contains(f) {
+                        s.doc.entries.push(f.clone());
+                    }
+                }
+            } else {
+                s.doc.entries.retain(|e| !files.contains(e));
+            }
+            s.doc.entries.sort();
+            true
+        })
+        .unwrap_or(false);
+        if !changed {
+            return;
+        }
+        let all = with_state(|s| s.scan.as_ref().map(|sc| sc.all_files.clone())).flatten();
+        if let Some(all) = all {
+            with_state(|s| s.doc.sync_files_field(&all));
+        }
+        mark_dirty(hwnd);
+        unsafe { fill_list(hwnd) };
+        let count = with_state(|s| s.doc.entries.len()).unwrap_or(0);
+        set_status(
+            hwnd,
+            StatusKind::Neutral,
+            &format!("{count} files in the package"),
+        );
+    }
+
+    // ---- recent projects ----
+
+    /// Fills the shared recents list (the Home page shows the first
+    /// five; the Projects page shows them all), and the Projects
+    /// page's "currently open" line.
+    fn fill_recents(hwnd: HWND) {
+        let list = unsafe { GetDlgItem(hwnd, ID_RECENTS as i32) };
+        if list.is_null() {
+            return;
+        }
+        let (recents, current, page) = with_state(|s| {
+            (
+                s.settings.recents.clone(),
+                s.doc.manifest_path.clone(),
+                s.page,
+            )
+        })
+        .unwrap_or_else(|| (Vec::new(), None, Page::Home));
+        unsafe {
+            SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        let limit = if page == Page::Home { 5 } else { recents.len() };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for (i, r) in recents.iter().take(limit).enumerate() {
+            let name = if r.name.is_empty() {
+                r.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| r.path.display().to_string())
+            } else {
+                r.name.clone()
+            };
+            let modified = std::fs::metadata(&r.path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| format!("Modified {}", relative_time_text(now, d.as_secs())))
+                .unwrap_or_else(|| "—".to_string());
+            let cells = [name, r.version.clone(), modified];
+            unsafe { lv_insert(list, i as i32, &cells) };
+        }
+        if page == Page::ProjectList {
+            let text = match &current {
+                Some(p) => format!("Currently open: {}", p.display()),
+                None => {
+                    "No project file is open yet — pick one above, open a manifest file, or start a new project."
+                        .to_string()
+                }
+            };
+            unsafe { set_text(hwnd, ID_LBL_PL_CURRENT, &text) };
+        }
+    }
+
+    /// Records a project in the recent list (front, fresh
+    /// name/version) and saves the settings right away, so the list
+    /// survives even if the Builder is closed uncleanly.
+    fn touch_recent(hwnd: HWND, path: &std::path::Path) {
+        let (name, version) = with_state(|s| {
+            (
+                s.doc.manifest.app_name.clone(),
+                s.doc.manifest.version.clone(),
+            )
+        })
+        .unwrap_or_default();
+        with_state(|s| {
+            s.settings.touch_recent(path, &name, &version);
+            s.settings.save();
+        });
+        let _ = hwnd;
+    }
+
+    /// The recents row the user selected, if any.
+    fn selected_recent_index(hwnd: HWND) -> Option<usize> {
+        let list = unsafe { GetDlgItem(hwnd, ID_RECENTS as i32) };
+        if list.is_null() {
+            return None;
+        }
+        let idx = unsafe {
+            SendMessageW(
+                list,
+                LVM_GETNEXTITEM,
+                -1isize as WPARAM,
+                LVNI_SELECTED as LPARAM,
+            )
+        };
+        if idx < 0 {
+            None
+        } else {
+            Some(idx as usize)
+        }
+    }
+
+    // ---- jobs ----
 
     fn set_busy(hwnd: HWND, busy: bool) {
         with_state(|s| s.busy = busy);
         for id in ACTION_IDS {
-            unsafe { set_enabled(hwnd, id, !busy) };
+            unsafe { set_enabled(hwnd, *id, !busy) };
         }
         unsafe { set_enabled(hwnd, ID_BTN_CANCEL, busy) };
     }
@@ -2899,6 +4226,17 @@ mod imp {
         if let Some((kind, Some((done, total)))) = snapshot {
             if is_busy() {
                 set_status(hwnd, StatusKind::Neutral, &kind.progress_text(done, total));
+                if with_state(|s| s.page) == Some(Page::Building) && total > 0 {
+                    let pct = (done * 100 / total) as i32;
+                    unsafe {
+                        let bar = GetDlgItem(hwnd, ID_PROGRESS as i32);
+                        if !bar.is_null() {
+                            SendMessageW(bar, PBM_SETPOS_MSG, pct as WPARAM, 0);
+                        }
+                        set_text(hwnd, ID_LBL_ING_PCT, &format!("{pct}%"));
+                        set_text(hwnd, ID_LBL_ING_PHASE, &kind.progress_text(done, total));
+                    }
+                }
             }
         }
     }
@@ -2920,14 +4258,18 @@ mod imp {
                     StatusKind::Neutral,
                     "Scan cancelled — previous contents kept",
                 );
+                if with_state(|s| s.page) == Some(Page::NewProject) {
+                    refresh_np(hwnd);
+                }
             }
             JobKind::Pack => {
-                append_output(hwnd, "Build cancelled — the unfinished files were removed.");
+                append_build_log(hwnd, "Build cancelled — the unfinished files were removed.");
                 set_status(
                     hwnd,
                     StatusKind::Neutral,
                     "Build cancelled — the unfinished files were removed",
                 );
+                show_page(hwnd, Page::BuildSettings);
             }
             JobKind::Verify => {
                 append_output(hwnd, "Verify cancelled.");
@@ -2959,7 +4301,6 @@ mod imp {
         }
         let files_dir = with_state(|s| s.doc.files_dir.clone()).flatten();
         let Some(dir) = files_dir else {
-            set_facts(hwnd, &default_facts());
             set_status(
                 hwnd,
                 StatusKind::Neutral,
@@ -2970,6 +4311,11 @@ mod imp {
         let Some(hooks) = begin_job(hwnd, JobKind::Scan) else {
             return;
         };
+        let gen = with_state(|s| {
+            s.scan_gen += 1;
+            s.scan_gen
+        })
+        .unwrap_or(0);
         let hwnd_value = hwnd as usize;
         let JobHooks { job, cancel, .. } = hooks;
         std::thread::spawn(move || {
@@ -2978,17 +4324,24 @@ mod imp {
             let result = if cancel.load(Ordering::Relaxed) {
                 JobResult::Cancelled(JobKind::Scan)
             } else {
-                JobResult::Scan(result)
+                JobResult::Scan { gen, result }
             };
             post_job(hwnd_value, &job, result);
         });
     }
 
-    unsafe fn on_scan_done(hwnd: HWND, result: Result<ScanOutcome, String>) {
+    unsafe fn on_scan_done(hwnd: HWND, gen: u64, result: Result<ScanOutcome, String>) {
+        // A scan for a document the user has already left (the New
+        // Project flow was cancelled, another scan superseded it)
+        // must not land on the current document.
+        if with_state(|s| s.scan_gen) != Some(gen) {
+            set_busy(hwnd, false);
+            return;
+        }
         set_busy(hwnd, false);
         match result {
             Ok(scan) => {
-                let (count, total, packed_total, missing) = with_state(|s| {
+                let (count, missing) = with_state(|s| {
                     let dir_changed = s.entries_dir != s.doc.files_dir;
                     if s.doc.entries.is_empty() || dir_changed {
                         s.doc.entries = scan.all_files.clone();
@@ -2997,23 +4350,12 @@ mod imp {
                     s.doc.sync_files_field(&scan.all_files);
                     let rows = build_rows(&s.doc.entries, Some(&scan));
                     let missing = rows.iter().filter(|r| !r.on_disk).count();
-                    let total: u64 = rows.iter().map(|r| r.size).sum();
-                    let packed_total: u64 = rows.iter().filter_map(|r| r.packed).sum();
                     let count = rows.len();
                     s.scan = Some(scan);
-                    (count, total, packed_total, missing)
+                    (count, missing)
                 })
-                .unwrap_or((0, 0, 0, 0));
+                .unwrap_or((0, 0));
                 fill_list(hwnd);
-                set_facts(
-                    hwnd,
-                    &format!(
-                        "{count} files · {} total\r\nPacked estimate: {}\r\n{}",
-                        format_bytes(total),
-                        format_bytes(packed_total),
-                        default_facts()
-                    ),
-                );
                 if missing > 0 {
                     append_output(
                         hwnd,
@@ -3033,6 +4375,9 @@ mod imp {
                         &format!("{count} files in the package"),
                     );
                 }
+                if with_state(|s| s.page) == Some(Page::NewProject) {
+                    refresh_np(hwnd);
+                }
             }
             Err(e) => {
                 append_output(hwnd, &format!("Error: {e}"));
@@ -3041,27 +4386,27 @@ mod imp {
                     StatusKind::Error,
                     "Scan failed — see the output above",
                 );
+                if with_state(|s| s.page) == Some(Page::NewProject) {
+                    refresh_np(hwnd);
+                }
             }
         }
     }
 
     // ---- actions ----
 
-    unsafe fn on_open_manifest(hwnd: HWND) {
+    /// Opens a manifest file by path: reads it, swaps the document,
+    /// records it in the recent projects, scans its folder, and
+    /// lands in the editor. Shared by the file picker and the
+    /// recent-projects list.
+    unsafe fn open_manifest_path(hwnd: HWND, path: &std::path::Path) {
         if is_busy() {
             return;
         }
-        let Some(path) = crate::native_dialog::pick_open_file(
-            "Open SeanPak manifest",
-            "JSON files (*.json)",
-            "*.json",
-        ) else {
-            return;
-        };
         // Build the document by hand (not via open_manifest) so the
         // folder scan — with its size estimates — happens once, on
         // the window's worker, instead of blocking the open.
-        let text = match std::fs::read_to_string(&path) {
+        let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
                 append_output(hwnd, &format!("Cannot open {}: {e}", path.display()));
@@ -3083,7 +4428,7 @@ mod imp {
                     .map(|d| d.join("dist"))
                     .unwrap_or_else(|| PathBuf::from("dist"));
                 doc.manifest = manifest;
-                doc.manifest_path = Some(path.clone());
+                doc.manifest_path = Some(path.to_path_buf());
                 let entries_dir = doc.files_dir.clone();
                 with_state(|s| {
                     s.doc = doc;
@@ -3094,7 +4439,8 @@ mod imp {
                 fill_controls(hwnd);
                 update_title(hwnd);
                 append_output(hwnd, &format!("Opened {}", path.display()));
-                start_scan(hwnd);
+                touch_recent(hwnd, path);
+                show_page(hwnd, Page::EditorFiles);
             }
             Err(errors) => {
                 append_output(hwnd, &format!("Cannot open {}:", path.display()));
@@ -3108,6 +4454,92 @@ mod imp {
                 );
             }
         }
+    }
+
+    unsafe fn on_open_manifest(hwnd: HWND) {
+        if is_busy() {
+            return;
+        }
+        let Some(path) = crate::native_dialog::pick_open_file(
+            "Open SeanPak manifest",
+            "JSON files (*.json)",
+            "*.json",
+        ) else {
+            return;
+        };
+        open_manifest_path(hwnd, &path);
+    }
+
+    /// Opens the recent project at `index` in the shared recents
+    /// list (Home shows the first five, the Projects page all — the
+    /// list is most-recent-first on both, so the index is the same).
+    unsafe fn on_open_recent(hwnd: HWND, index: usize) {
+        let path = with_state(|s| s.settings.recents.get(index).map(|r| r.path.clone())).flatten();
+        let Some(path) = path else {
+            set_status(
+                hwnd,
+                StatusKind::Neutral,
+                "Select a project in the list first",
+            );
+            return;
+        };
+        if !path.is_file() {
+            append_output(
+                hwnd,
+                &format!(
+                    "That project file is gone: {} — you can take it off the list with Remove from list.",
+                    path.display()
+                ),
+            );
+            set_status(
+                hwnd,
+                StatusKind::Error,
+                "That project file no longer exists",
+            );
+            return;
+        }
+        open_manifest_path(hwnd, &path);
+    }
+
+    unsafe fn on_remove_recent(hwnd: HWND) {
+        let Some(index) = selected_recent_index(hwnd) else {
+            set_status(
+                hwnd,
+                StatusKind::Neutral,
+                "Select a project in the list first",
+            );
+            return;
+        };
+        let removed = with_state(|s| {
+            let path = s.settings.recents.get(index).map(|r| r.path.clone());
+            if let Some(p) = &path {
+                s.settings.remove_recent(p);
+                s.settings.save();
+            }
+            path
+        })
+        .flatten();
+        if let Some(p) = removed {
+            set_status(
+                hwnd,
+                StatusKind::Neutral,
+                &format!(
+                    "Removed {} from the list — the file stays where it is",
+                    p.display()
+                ),
+            );
+        }
+        fill_recents(hwnd);
+    }
+
+    unsafe fn on_clear_recents(hwnd: HWND) {
+        with_state(|s| {
+            s.settings.recents.clear();
+            s.settings.save();
+        });
+        fill_recents(hwnd);
+        fill_settings_page(hwnd);
+        set_status(hwnd, StatusKind::Neutral, "Recent projects list cleared");
     }
 
     unsafe fn on_save(hwnd: HWND, save_as: bool) {
@@ -3143,6 +4575,7 @@ mod imp {
         match result {
             Some(Ok(())) => {
                 update_title(hwnd);
+                touch_recent(hwnd, &path);
                 set_status(hwnd, StatusKind::Ok, &format!("Saved {}", path.display()));
                 append_output(hwnd, &format!("Saved manifest to {}", path.display()));
             }
@@ -3177,6 +4610,7 @@ mod imp {
         };
         set_text(hwnd, ID_EDT_OUT_DIR, &folder.to_string_lossy());
         harvest_fields(hwnd);
+        refresh_outputs_label(hwnd);
     }
 
     unsafe fn on_remove_selected(hwnd: HWND) {
@@ -3340,14 +4774,27 @@ mod imp {
         let Some(hooks) = begin_job(hwnd, JobKind::Pack) else {
             return;
         };
-        append_output(
+        with_state(|s| s.build_started = Some(std::time::Instant::now()));
+        // The Building page starts from a clean progress readout.
+        unsafe {
+            let bar = GetDlgItem(hwnd, ID_PROGRESS as i32);
+            if !bar.is_null() {
+                SendMessageW(bar, PBM_SETPOS_MSG, 0, 0);
+            }
+            set_text(hwnd, ID_LBL_ING_PCT, "0%");
+            set_text(hwnd, ID_LBL_ING_PHASE, "Building…");
+        }
+        show_page(hwnd, Page::Building);
+        append_build_log(
             hwnd,
             &format!(
-                "Packing {} {} from {} …",
-                manifest.app_name,
-                manifest.version,
-                files_dir.display()
+                "Starting build of {} {}…",
+                manifest.app_name, manifest.version
             ),
+        );
+        append_build_log(
+            hwnd,
+            &format!("Reading project settings from {}", files_dir.display()),
         );
         let hwnd_value = hwnd as usize;
         let JobHooks {
@@ -3383,6 +4830,16 @@ mod imp {
         });
     }
 
+    /// "2m 34s" / "48s" — the Finished page's Build time readout.
+    fn format_duration(d: std::time::Duration) -> String {
+        let secs = d.as_secs();
+        if secs < 60 {
+            format!("{secs}s")
+        } else {
+            format!("{}m {:02}s", secs / 60, secs % 60)
+        }
+    }
+
     unsafe fn on_pack_done(hwnd: HWND, result: Result<PackOutcome, PackFail>) {
         set_busy(hwnd, false);
         match result {
@@ -3401,58 +4858,65 @@ mod imp {
                         ("stubBytes", JsonValue::Number(outcome.stub_bytes as f64)),
                     ],
                 );
-                append_output(
+                append_build_log(
                     hwnd,
                     &format!(
-                        "  {} ({} bytes, sha256 {})",
+                        "Wrote {} ({} bytes, sha256 {})",
                         outcome.setup.path.display(),
                         outcome.setup.size,
                         outcome.setup.sha256
                     ),
                 );
-                append_output(
+                append_build_log(
                     hwnd,
                     &format!(
-                        "  {} ({} bytes, sha256 {})",
+                        "Wrote {} ({} bytes, sha256 {})",
                         outcome.portable.path.display(),
                         outcome.portable.size,
                         outcome.portable.sha256
                     ),
                 );
-                append_output(hwnd, &format!("  {}", outcome.sums_path.display()));
-                set_facts(
-                    hwnd,
-                    &format!(
-                        "Stub size: {} · {} files packed\r\nPayload: {} · {}",
-                        format_bytes(outcome.stub_bytes),
-                        outcome.file_count,
-                        format_bytes(outcome.total_payload_bytes),
-                        default_facts()
-                    ),
-                );
-                with_state(|s| s.last_setup = Some(outcome.setup.path.clone()));
-                // Name what was built and where — no guessing.
-                let out_folder = outcome
+                append_build_log(hwnd, &format!("Wrote {}", outcome.sums_path.display()));
+                append_build_log(hwnd, "Build completed successfully.");
+                let build_time = with_state(|s| s.build_started.take())
+                    .flatten()
+                    .map(|t| format_duration(t.elapsed()))
+                    .unwrap_or_else(|| "—".to_string());
+                let (app_name, version) = with_state(|s| {
+                    (
+                        s.doc.manifest.app_name.clone(),
+                        s.doc.manifest.version.clone(),
+                    )
+                })
+                .unwrap_or_default();
+                let out_location = outcome
                     .sums_path
                     .parent()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "the output folder".to_string());
+                with_state(|s| {
+                    s.last_setup = Some(outcome.setup.path.clone());
+                    s.done = Some(DoneInfo {
+                        ok: true,
+                        summary: format!(
+                            "Project: {app_name}\r\nVersion: {version}\r\nArchitecture: x64\r\nOutput location: {out_location}\r\nBuild time: {build_time}"
+                        ),
+                        reason: String::new(),
+                    });
+                });
+                // Name what was built and where — no guessing.
                 set_status(
                     hwnd,
                     StatusKind::Ok,
                     &format!(
                         "Built: {}, the portable .zip, and SHA256SUMS.txt in {}",
-                        outcome.setup.name, out_folder
+                        outcome.setup.name, out_location
                     ),
                 );
+                show_page(hwnd, Page::BuildDone);
             }
             Err(fail) => {
-                append_output(hwnd, &format!("Error: {}", fail.message));
-                set_status(
-                    hwnd,
-                    StatusKind::Error,
-                    "Pack failed — see the output above",
-                );
+                append_build_log(hwnd, &format!("Error: {}", fail.message));
                 if fail.refused_overwrite {
                     let text: Vec<u16> = "An output file already exists with different contents.\n\nOverwrite it with the new package?"
                         .encode_utf16()
@@ -3467,8 +4931,22 @@ mod imp {
                     );
                     if answer == IDYES {
                         on_pack(hwnd, true);
+                        return;
                     }
                 }
+                with_state(|s| {
+                    s.done = Some(DoneInfo {
+                        ok: false,
+                        summary: String::new(),
+                        reason: fail.message.clone(),
+                    });
+                });
+                set_status(
+                    hwnd,
+                    StatusKind::Error,
+                    "Pack failed — the reason is on the results page",
+                );
+                show_page(hwnd, Page::BuildDone);
             }
         }
     }
@@ -3723,7 +5201,7 @@ mod imp {
             return;
         };
         if !out_dir.is_dir() {
-            append_output(hwnd, "The output folder does not exist yet — it is created when you build. If the path looks wrong, fix it in the Output folder field under PACKAGE.");
+            append_output(hwnd, "The output folder does not exist yet — it is created when you build. If the path looks wrong, fix it in the Output folder field on the Build Settings page.");
             set_status(
                 hwnd,
                 StatusKind::Error,
@@ -3775,7 +5253,7 @@ mod imp {
     unsafe fn on_job_message(hwnd: HWND) {
         let taken = with_state(|s| s.job.lock().ok().and_then(|mut slot| slot.take())).flatten();
         match taken {
-            Some(JobResult::Scan(result)) => on_scan_done(hwnd, result),
+            Some(JobResult::Scan { gen, result }) => on_scan_done(hwnd, gen, result),
             Some(JobResult::Pack(result)) => on_pack_done(hwnd, result),
             Some(JobResult::Verify {
                 sandbox,
@@ -3796,10 +5274,11 @@ mod imp {
         for line in MANIFEST_SCHEMA_JSON.lines() {
             append_output(hwnd, line);
         }
+        show_page(hwnd, Page::BuildSettings);
         set_status(
             hwnd,
             StatusKind::Neutral,
-            "Schema shown in the output strip",
+            "Manifest format shown in the output console on the Build page",
         );
     }
 
@@ -3825,7 +5304,7 @@ mod imp {
 
     unsafe fn on_about(hwnd: HWND) {
         let text: Vec<u16> = format!(
-            "SeanPak Builder {}\n\nThe studio is a view over the same operations the seanpak CLI runs — pack, validate, and verify behave identically here. Fully offline; nothing is sent anywhere.",
+            "SeanPak Builder {}\n\nThe Builder is a view over the same operations the seanpak CLI runs — pack, validate, and verify behave identically here. Fully offline; nothing is sent anywhere.",
             env!("CARGO_PKG_VERSION")
         )
         .encode_utf16()
@@ -3835,26 +5314,317 @@ mod imp {
         MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_OK);
     }
 
-    /// Saves geometry + last-used paths. Called from WM_CLOSE, before
-    /// the window is destroyed.
+    // ---- New Project flow ----
+
+    /// Enters the flow: fields cleared (version prefilled with the
+    /// house default), the current document left untouched until
+    /// Create Project replaces it.
+    fn on_np_start(hwnd: HWND, from: Page) {
+        with_state(|s| {
+            s.np_step = 0;
+            s.np_return = from;
+            s.np_backup = None;
+        });
+        unsafe {
+            set_text(hwnd, ID_EDT_NP_NAME, "");
+            set_text(hwnd, ID_EDT_NP_VERSION, "1.0.0");
+            set_text(hwnd, ID_EDT_NP_PUBLISHER, "");
+            set_text(hwnd, ID_EDT_NP_FOLDER, "");
+        }
+        show_page(hwnd, Page::NewProject);
+    }
+
+    /// Refreshes the flow's step-dependent texts: the subtitle, the
+    /// Next button's caption, and (on step 3) the summary.
+    fn refresh_np(hwnd: HWND) {
+        let step = with_state(|s| s.np_step).unwrap_or(0);
+        let sub = match step {
+            0 => "Provide basic information about your program.",
+            1 => "Pick the folder your built program is in.",
+            _ => "Check the details, then create the project.",
+        };
+        unsafe {
+            set_text(hwnd, ID_LBL_NP_SUB, sub);
+            set_text(
+                hwnd,
+                ID_BTN_NP_NEXT,
+                if step == 2 {
+                    "Create Project"
+                } else {
+                    "Next →"
+                },
+            );
+        }
+        if step == 2 {
+            let summary = with_state(|s| {
+                let m = &s.doc.manifest;
+                let folder = s
+                    .doc
+                    .files_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let files_line = match &s.scan {
+                    Some(scan) => {
+                        let total: u64 = scan.rows_by_rel.iter().map(|r| r.size).sum();
+                        format!(
+                            "Program folder: {folder}\r\nFiles found: {} ({})",
+                            scan.all_files.len(),
+                            format_bytes(total)
+                        )
+                    }
+                    None => {
+                        if s.busy {
+                            format!("Program folder: {folder}\r\nFiles found: scanning…")
+                        } else {
+                            format!("Program folder: {folder}\r\nFiles found: —")
+                        }
+                    }
+                };
+                format!(
+                    "Program name: {}\r\nVersion: {}\r\nPublisher: {}\r\n{files_line}\r\n\r\nThe project is not saved yet — after creating it, use Save in the editor to keep it as a file.",
+                    m.app_name, m.version, m.publisher
+                )
+            })
+            .unwrap_or_default();
+            unsafe { set_text(hwnd, ID_LBL_NP_SUMMARY, &summary) };
+        }
+        unsafe {
+            InvalidateRect(hwnd, std::ptr::null(), 1);
+        }
+    }
+
+    unsafe fn on_np_browse(hwnd: HWND) {
+        let Some(folder) = crate::native_dialog::pick_folder() else {
+            return;
+        };
+        set_text(hwnd, ID_EDT_NP_FOLDER, &folder.to_string_lossy());
+    }
+
+    /// Next: step 1 → 2 (details into the scratch fields), step 2 →
+    /// 3 (build the new document from the fields, set the current
+    /// one aside, scan the folder), step 3 = Create Project.
+    unsafe fn on_np_next(hwnd: HWND) {
+        let step = with_state(|s| s.np_step).unwrap_or(0);
+        match step {
+            0 => {
+                if get_text(hwnd, ID_EDT_NP_NAME).trim().is_empty() {
+                    set_status(hwnd, StatusKind::Error, "Give the program a name first");
+                    return;
+                }
+                with_state(|s| s.np_step = 1);
+                show_page(hwnd, Page::NewProject);
+            }
+            1 => {
+                let folder_text = get_text(hwnd, ID_EDT_NP_FOLDER);
+                let folder = folder_text.trim();
+                if folder.is_empty() {
+                    set_status(
+                        hwnd,
+                        StatusKind::Error,
+                        "Choose the program folder first — Browse… finds it",
+                    );
+                    return;
+                }
+                let folder = PathBuf::from(folder);
+                if !folder.is_dir() {
+                    set_status(
+                        hwnd,
+                        StatusKind::Error,
+                        "That folder does not exist — pick another one",
+                    );
+                    return;
+                }
+                let name = get_text(hwnd, ID_EDT_NP_NAME);
+                let version = get_text(hwnd, ID_EDT_NP_VERSION);
+                let publisher = get_text(hwnd, ID_EDT_NP_PUBLISHER);
+                let value = jobj(vec![
+                    ("appName", jstr(name.trim().to_string())),
+                    (
+                        "version",
+                        jstr(if version.trim().is_empty() {
+                            "1.0.0".to_string()
+                        } else {
+                            version.trim().to_string()
+                        }),
+                    ),
+                    ("publisher", jstr(publisher.trim().to_string())),
+                ]);
+                let manifest = match AppManifest::from_json(&value.render()) {
+                    Ok(m) => m,
+                    Err(errors) => {
+                        set_status(
+                            hwnd,
+                            StatusKind::Error,
+                            &format!("Check the details: {}", errors.join("; ")),
+                        );
+                        return;
+                    }
+                };
+                let mut doc = StudioDocument::new_blank();
+                doc.manifest = manifest;
+                doc.out_dir = folder.join("dist");
+                doc.files_dir = Some(folder);
+                with_state(|s| {
+                    // Set the current document aside exactly once;
+                    // Back/Cancel restore it.
+                    if s.np_backup.is_none() {
+                        s.np_backup = Some(std::mem::replace(&mut s.doc, doc));
+                    } else {
+                        s.doc = doc;
+                    }
+                    s.scan = None;
+                    s.entries_dir = None;
+                    s.last_setup = None;
+                    s.np_step = 2;
+                });
+                show_page(hwnd, Page::NewProject);
+                start_scan(hwnd);
+            }
+            _ => {
+                // Create Project: keep the new document, drop the
+                // set-aside one, land in the editor.
+                with_state(|s| {
+                    s.np_backup = None;
+                    s.doc.dirty = true;
+                });
+                fill_controls(hwnd);
+                fill_list(hwnd);
+                update_title(hwnd);
+                show_page(hwnd, Page::EditorFiles);
+                set_status(
+                    hwnd,
+                    StatusKind::Ok,
+                    "Project created — check the files, then Save to keep it as a file",
+                );
+            }
+        }
+    }
+
+    unsafe fn on_np_back(hwnd: HWND) {
+        let step = with_state(|s| s.np_step).unwrap_or(0);
+        if step > 0 {
+            with_state(|s| s.np_step = step - 1);
+            show_page(hwnd, Page::NewProject);
+        }
+    }
+
+    /// Cancel: stop any scan the flow started, restore the document
+    /// that was set aside, and return to where the flow began.
+    unsafe fn on_np_cancel(hwnd: HWND) {
+        if is_busy() {
+            with_state(|s| s.cancel.store(true, Ordering::Relaxed));
+        }
+        let back = with_state(|s| {
+            if let Some(doc) = s.np_backup.take() {
+                s.doc = doc;
+            }
+            s.scan = None;
+            // Any scan still running belongs to the abandoned
+            // document — its result must not land on the restored one.
+            s.scan_gen += 1;
+            s.entries_dir = s.doc.files_dir.clone();
+            s.np_step = 0;
+            s.np_return
+        })
+        .unwrap_or(Page::Home);
+        fill_controls(hwnd);
+        fill_list(hwnd);
+        update_title(hwnd);
+        show_page(hwnd, back);
+        set_status(
+            hwnd,
+            StatusKind::Neutral,
+            "New project cancelled — nothing was created",
+        );
+    }
+
+    // ---- Build Finished + Settings fills ----
+
+    fn fill_done(hwnd: HWND) {
+        let done = with_state(|s| {
+            s.done
+                .as_ref()
+                .map(|d| (d.ok, d.summary.clone(), d.reason.clone()))
+        })
+        .flatten();
+        let (ok, summary, reason) = done.unwrap_or((true, String::new(), String::new()));
+        unsafe {
+            if ok {
+                set_text(hwnd, ID_LBL_DONE_TITLE, "Build Finished!");
+                set_text(
+                    hwnd,
+                    ID_LBL_DONE_SUB,
+                    "Your installer has been created and is ready to use.",
+                );
+                set_text(hwnd, ID_LBL_DONE_SUMMARY, &summary);
+            } else {
+                set_text(hwnd, ID_LBL_DONE_TITLE, "Build Failed");
+                set_text(
+                    hwnd,
+                    ID_LBL_DONE_SUB,
+                    "The build did not finish. Nothing outside the output folder was changed.",
+                );
+                set_text(hwnd, ID_LBL_DONE_REASON, &reason);
+            }
+        }
+    }
+
+    fn fill_settings_page(hwnd: HWND) {
+        let (count, log, settings_file) = with_state(|s| {
+            (
+                s.settings.recents.len(),
+                crate::diag::log_path().display().to_string(),
+                super::settings_path().display().to_string(),
+            )
+        })
+        .unwrap_or_default();
+        unsafe {
+            set_text(
+                hwnd,
+                ID_LBL_SET_RECENTS,
+                &format!(
+                    "{count} project{} in the list — the newest {} are kept.",
+                    if count == 1 { "" } else { "s" },
+                    super::MAX_RECENT_PROJECTS
+                ),
+            );
+            set_text(hwnd, ID_LBL_SET_LOG, &format!("Diagnostics log: {log}"));
+            set_text(
+                hwnd,
+                ID_LBL_SET_SETTINGS,
+                &format!("Builder settings file: {settings_file}"),
+            );
+            set_text(
+                hwnd,
+                ID_LBL_SET_VERSION,
+                &format!(
+                    "SeanPak Builder {} — a view over the same operations the seanpak command line runs.",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+            set_text(hwnd, ID_LBL_SET_FACTS, &default_facts());
+        }
+    }
+
+    /// Saves geometry + last-used paths + recents. Called from
+    /// WM_CLOSE, before the window is destroyed.
     unsafe fn save_settings(hwnd: HWND) {
         harvest_fields(hwnd);
         let mut rect: RECT = std::mem::zeroed();
         GetWindowRect(hwnd, &mut rect);
-        let settings = with_state(|s| StudioSettings {
-            window_rect: Some((
+        with_state(|s| {
+            s.settings.window_rect = Some((
                 rect.left,
                 rect.top,
                 (rect.right - rect.left).max(400),
                 (rect.bottom - rect.top).max(300),
-            )),
-            manifest_path: s.doc.manifest_path.clone(),
-            files_dir: s.doc.files_dir.clone(),
-            out_dir: Some(s.doc.out_dir.clone()),
+            ));
+            s.settings.manifest_path = s.doc.manifest_path.clone();
+            s.settings.files_dir = s.doc.files_dir.clone();
+            s.settings.out_dir = Some(s.doc.out_dir.clone());
+            s.settings.save();
         });
-        if let Some(settings) = settings {
-            settings.save();
-        }
     }
 
     /// Returns true when the window may close (running operations and
@@ -3896,6 +5666,464 @@ mod imp {
         true
     }
 
+    // ---- painting ----
+
+    /// Text of a child control (the theme's own helper is private
+    /// to theme.rs; this is the same read).
+    unsafe fn control_text(ctrl: HWND) -> String {
+        let len = GetWindowTextLengthW(ctrl);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let got = GetWindowTextW(ctrl, buf.as_mut_ptr(), buf.len() as i32);
+        if got <= 0 {
+            return String::new();
+        }
+        buf.truncate(got as usize);
+        String::from_utf16_lossy(&buf)
+    }
+
+    unsafe fn select_body_font(hdc: HDC) {
+        let font = BODY_FONT;
+        if !font.is_null() {
+            SelectObject(hdc, font as _);
+        }
+    }
+
+    /// Left-nav button: flat over the rail, the selected section
+    /// raised with a blue bar at its left edge.
+    unsafe fn draw_nav_button(hwnd: HWND, dis: *const DRAWITEMSTRUCT) {
+        let rc = (*dis).rcItem;
+        let id = (*dis).CtlID as usize;
+        let page = with_state(|s| s.page).unwrap_or(Page::Home);
+        let selected = matches!(
+            (id, page),
+            (ID_NAV_HOME, Page::Home)
+                | (ID_NAV_PROJECTS, Page::ProjectList)
+                | (
+                    ID_NAV_PROJECTS,
+                    Page::EditorFiles | Page::EditorOptions | Page::EditorRequirements
+                )
+                | (
+                    ID_NAV_BUILD,
+                    Page::BuildSettings | Page::Building | Page::BuildDone
+                )
+                | (ID_NAV_SETTINGS, Page::Settings)
+        );
+        let disabled = (*dis).itemState & ODS_DISABLED != 0;
+        let pressed = (*dis).itemState & ODS_SELECTED != 0;
+        let hdc = (*dis).hDC;
+        let fill = if selected {
+            theme::SELECTED
+        } else if pressed {
+            theme::PRESSED_FILL
+        } else {
+            theme::SURFACE
+        };
+        FillRect(hdc, &rc, theme::brush(fill));
+        if selected {
+            let bar = RECT {
+                left: rc.left,
+                top: rc.top,
+                right: rc.left + 3,
+                bottom: rc.bottom,
+            };
+            FillRect(hdc, &bar, theme::brush(theme::SELECTION_INDICATOR));
+        }
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(
+            hdc,
+            if disabled {
+                theme::DISABLED_FOREGROUND
+            } else if selected {
+                theme::FOREGROUND
+            } else {
+                theme::MUTED
+            },
+        );
+        select_body_font(hdc);
+        let label = control_text((*dis).hwndItem);
+        let mut wide: Vec<u16> = label.encode_utf16().collect();
+        let mut text_rc = RECT {
+            left: rc.left + 16,
+            top: rc.top,
+            right: rc.right - 6,
+            bottom: rc.bottom,
+        };
+        DrawTextW(
+            hdc,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+            &mut text_rc,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        if (*dis).itemState & ODS_FOCUS != 0 && !disabled {
+            DrawFocusRect(hdc, &rc);
+        }
+        let _ = hwnd;
+    }
+
+    /// Editor tab: the current page raised with a blue underline,
+    /// the others flat and muted.
+    unsafe fn draw_tab_button(hwnd: HWND, dis: *const DRAWITEMSTRUCT) {
+        let rc = (*dis).rcItem;
+        let id = (*dis).CtlID as usize;
+        let page = with_state(|s| s.page).unwrap_or(Page::Home);
+        let selected = matches!(
+            (id, page),
+            (ID_TAB_FILES, Page::EditorFiles)
+                | (ID_TAB_OPTIONS, Page::EditorOptions)
+                | (ID_TAB_REQUIREMENTS, Page::EditorRequirements)
+        );
+        let hdc = (*dis).hDC;
+        FillRect(
+            hdc,
+            &rc,
+            theme::brush(if selected {
+                theme::RAISED
+            } else {
+                theme::BACKGROUND
+            }),
+        );
+        if selected {
+            let bar = RECT {
+                left: rc.left,
+                top: rc.bottom - 2,
+                right: rc.right,
+                bottom: rc.bottom,
+            };
+            FillRect(hdc, &bar, theme::brush(theme::SELECTION_INDICATOR));
+        }
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(
+            hdc,
+            if selected {
+                theme::FOREGROUND
+            } else {
+                theme::MUTED
+            },
+        );
+        select_body_font(hdc);
+        let label = control_text((*dis).hwndItem);
+        let mut wide: Vec<u16> = label.encode_utf16().collect();
+        let mut text_rc = rc;
+        DrawTextW(
+            hdc,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+            &mut text_rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        if (*dis).itemState & ODS_FOCUS != 0 {
+            DrawFocusRect(hdc, &rc);
+        }
+        let _ = hwnd;
+    }
+
+    /// The page-specific painting: the nav rail, the New Project
+    /// step rail, the Installer Options preview panel, and the
+    /// Build Finished badge. Child controls paint themselves; this
+    /// is only what no control covers.
+    unsafe fn paint_custom(hwnd: HWND, hdc: HDC) {
+        let (page, scale) =
+            with_state(|s| (s.page, s.dpi as f32 / 96.0)).unwrap_or((Page::Home, 1.0));
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut client);
+        FillRect(hdc, &client, theme::brush(theme::BACKGROUND));
+        match page {
+            Page::NewProject => paint_np_rail(hwnd, hdc, scale),
+            Page::EditorOptions => paint_preview(hwnd, hdc),
+            Page::BuildDone => paint_badge(hwnd, hdc),
+            _ => {
+                // The nav rail: a surface strip with a hairline at
+                // its right edge.
+                let rail = RECT {
+                    left: 0,
+                    top: 0,
+                    right: (176.0 * scale) as i32,
+                    bottom: client.bottom,
+                };
+                FillRect(hdc, &rail, theme::brush(theme::SURFACE));
+                let edge = RECT {
+                    left: rail.right - 1,
+                    top: 0,
+                    right: rail.right,
+                    bottom: client.bottom,
+                };
+                FillRect(hdc, &edge, theme::brush(theme::EDGE));
+            }
+        }
+    }
+
+    unsafe fn paint_np_rail(hwnd: HWND, hdc: HDC, scale: f32) {
+        let (circles, step) =
+            with_state(|s| (s.np_circles.clone(), s.np_step)).unwrap_or((Vec::new(), 0));
+        if circles.len() < 2 {
+            return;
+        }
+        // The connecting line behind the circles.
+        let pen = CreatePen(PS_SOLID, 1, theme::EDGE);
+        let old_pen = SelectObject(hdc, pen as _);
+        let (x0, y_first, _) = circles[0];
+        let (_, y_last, _) = circles[circles.len() - 1];
+        MoveToEx(hdc, x0, y_first, std::ptr::null_mut());
+        LineTo(hdc, x0, y_last);
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen as _);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        select_body_font(hdc);
+        for (i, (cx, cy, r)) in circles.iter().enumerate() {
+            let (fill, text_color) = if i < step {
+                (theme::SUCCESS, 0x00FF_FFFF)
+            } else if i == step {
+                (theme::SELECTION_INDICATOR, 0x00FF_FFFF)
+            } else {
+                (theme::RAISED, theme::MUTED)
+            };
+            let rect = RECT {
+                left: cx - r,
+                top: cy - r,
+                right: cx + r,
+                bottom: cy + r,
+            };
+            let brush = theme::brush(fill);
+            let old_brush = SelectObject(hdc, brush as _);
+            let null_pen = GetStockObject(NULL_PEN);
+            let prev_pen = SelectObject(hdc, null_pen as _);
+            Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+            SelectObject(hdc, prev_pen);
+            SelectObject(hdc, old_brush);
+            SetTextColor(hdc, text_color);
+            let label = format!("{}", i + 1);
+            let mut wide: Vec<u16> = label.encode_utf16().collect();
+            let mut text_rc = rect;
+            DrawTextW(
+                hdc,
+                wide.as_mut_ptr(),
+                wide.len() as i32,
+                &mut text_rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+        let _ = (hwnd, scale);
+    }
+
+    /// A static sketch of the installer's first page with the
+    /// project's name — what the Preview installer button opens for
+    /// real. Drawn, not a control, so it can never be clicked by
+    /// mistake.
+    unsafe fn paint_preview(hwnd: HWND, hdc: HDC) {
+        let Some((Some(rect), app_name)) = with_state(|s| {
+            (
+                s.preview_rect,
+                if s.doc.manifest.app_name.trim().is_empty() {
+                    "Your Program".to_string()
+                } else {
+                    s.doc.manifest.app_name.clone()
+                },
+            )
+        }) else {
+            return;
+        };
+        let (x, y, w, _h) = rect;
+        let panel = RECT {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + 252,
+        };
+        FillRect(hdc, &panel, theme::brush(theme::RAISED));
+        FrameRect(hdc, &panel, theme::brush(theme::EDGE));
+        SetBkMode(hdc, TRANSPARENT as i32);
+        // Window title.
+        let font = HEADER_FONT;
+        let old_font = if !font.is_null() {
+            SelectObject(hdc, font as _)
+        } else {
+            std::ptr::null_mut()
+        };
+        SetTextColor(hdc, theme::FOREGROUND);
+        let title = format!("{app_name} Setup");
+        let mut wide: Vec<u16> = title.encode_utf16().collect();
+        let mut rc = RECT {
+            left: x + 14,
+            top: y + 10,
+            right: x + w - 12,
+            bottom: y + 32,
+        };
+        DrawTextW(
+            hdc,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+            &mut rc,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        if !old_font.is_null() {
+            SelectObject(hdc, old_font);
+        }
+        select_body_font(hdc);
+        // The wizard's step rail.
+        let steps = ["Welcome", "Location", "Review", "Install", "Finish"];
+        for (i, name) in steps.iter().enumerate() {
+            let sy = y + 52 + (i as i32) * 26;
+            if i == 0 {
+                let dot = RECT {
+                    left: x + 14,
+                    top: sy + 4,
+                    right: x + 22,
+                    bottom: sy + 12,
+                };
+                let old_brush = SelectObject(hdc, theme::brush(theme::SELECTION_INDICATOR) as _);
+                let null_pen = GetStockObject(NULL_PEN);
+                let prev_pen = SelectObject(hdc, null_pen as _);
+                Ellipse(hdc, dot.left, dot.top, dot.right, dot.bottom);
+                SelectObject(hdc, prev_pen);
+                SelectObject(hdc, old_brush);
+            }
+            SetTextColor(
+                hdc,
+                if i == 0 {
+                    theme::FOREGROUND
+                } else {
+                    theme::MUTED
+                },
+            );
+            let mut wide: Vec<u16> = name.encode_utf16().collect();
+            let mut rc = RECT {
+                left: x + 30,
+                top: sy,
+                right: x + 110,
+                bottom: sy + 18,
+            };
+            DrawTextW(
+                hdc,
+                wide.as_mut_ptr(),
+                wide.len() as i32,
+                &mut rc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+        // Body copy + the two wizard buttons.
+        SetTextColor(hdc, theme::MUTED);
+        let body = format!(
+            "Welcome\r\n\r\nThis wizard will guide you through the installation of {app_name}."
+        );
+        let mut wide: Vec<u16> = body.encode_utf16().collect();
+        let mut rc = RECT {
+            left: x + 118,
+            top: y + 52,
+            right: x + w - 14,
+            bottom: y + 150,
+        };
+        DrawTextW(
+            hdc,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+            &mut rc,
+            DT_LEFT | DT_TOP | DT_WORDBREAK,
+        );
+        let by = y + 252 - 44;
+        let next_rc = RECT {
+            left: x + w - 14 - 76,
+            top: by,
+            right: x + w - 14,
+            bottom: by + 30,
+        };
+        FillRect(hdc, &next_rc, theme::brush(theme::ACTION));
+        SetTextColor(hdc, 0x00FF_FFFF);
+        let mut wide: Vec<u16> = "Next".encode_utf16().collect();
+        let mut rc = next_rc;
+        DrawTextW(
+            hdc,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        let cancel_rc = RECT {
+            left: next_rc.left - 84,
+            top: by,
+            right: next_rc.left - 8,
+            bottom: by + 30,
+        };
+        FillRect(hdc, &cancel_rc, theme::brush(theme::RAISED));
+        FrameRect(hdc, &cancel_rc, theme::brush(theme::EDGE));
+        SetTextColor(hdc, theme::FOREGROUND);
+        let mut wide: Vec<u16> = "Cancel".encode_utf16().collect();
+        let mut rc = cancel_rc;
+        DrawTextW(
+            hdc,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        let _ = hwnd;
+    }
+
+    unsafe fn paint_badge(hwnd: HWND, hdc: HDC) {
+        let Some((Some(rect), ok)) =
+            with_state(|s| (s.badge_rect, s.done.as_ref().map(|d| d.ok).unwrap_or(true)))
+        else {
+            return;
+        };
+        let (x, y, w, h) = rect;
+        let circle = RECT {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        };
+        let fill = if ok {
+            theme::SUCCESS
+        } else {
+            theme::DANGER_FILL
+        };
+        let old_brush = SelectObject(hdc, theme::brush(fill) as _);
+        let null_pen = GetStockObject(NULL_PEN);
+        let prev_pen = SelectObject(hdc, null_pen as _);
+        Ellipse(hdc, circle.left, circle.top, circle.right, circle.bottom);
+        SelectObject(hdc, prev_pen);
+        SelectObject(hdc, old_brush);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        if ok {
+            // A white check mark.
+            let pen = CreatePen(PS_SOLID, 5, 0x00FF_FFFF);
+            let old_pen = SelectObject(hdc, pen as _);
+            let cx = x + w / 2;
+            let cy = y + h / 2;
+            MoveToEx(hdc, cx - 16, cy, std::ptr::null_mut());
+            LineTo(hdc, cx - 5, cy + 11);
+            LineTo(hdc, cx + 17, cy - 12);
+            SelectObject(hdc, old_pen);
+            DeleteObject(pen as _);
+        } else {
+            SetTextColor(hdc, 0x00FF_FFFF);
+            let font = TITLE_FONT;
+            let old_font = if !font.is_null() {
+                SelectObject(hdc, font as _)
+            } else {
+                std::ptr::null_mut()
+            };
+            let mut wide: Vec<u16> = "!".encode_utf16().collect();
+            let mut rc = circle;
+            DrawTextW(
+                hdc,
+                wide.as_mut_ptr(),
+                wide.len() as i32,
+                &mut rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            if !old_font.is_null() {
+                SelectObject(hdc, old_font);
+            }
+        }
+        let _ = hwnd;
+    }
+
+    // ---- window procedure ----
+
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
         msg: u32,
@@ -3905,27 +6133,18 @@ mod imp {
         match msg {
             WM_CTLCOLORSTATIC => {
                 let hdc = wparam as HDC;
-                let ctrl = lparam as HWND;
-                let id = GetWindowLongW(ctrl, GWL_ID) as usize;
+                let id = GetDlgCtrlID(lparam as HWND) as usize;
+                SetBkMode(hdc, TRANSPARENT as i32);
                 if id == ID_FOOTER_SEP {
-                    // The footer's 1px edge separator: an empty
-                    // static filled edge-to-edge with the edge brush.
-                    SetBkMode(hdc, OPAQUE as i32);
                     SetBkColor(hdc, theme::EDGE);
                     return theme::brush(theme::EDGE) as LRESULT;
                 }
                 if id == ID_OUTPUT {
-                    // A read-only edit reports as a static, not via
-                    // WM_CTLCOLOREDIT. It takes the read-only fill —
-                    // letting it fall through to the window brush was
-                    // what made the output panel a different dark
-                    // than every edit field above it.
-                    SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, theme::READ_ONLY_FILL);
+                    // A read-only edit reports here, not CTLCOLOREDIT.
                     SetTextColor(hdc, theme::FOREGROUND);
+                    SetBkColor(hdc, theme::READ_ONLY_FILL);
                     return theme::brush(theme::READ_ONLY_FILL) as LRESULT;
                 }
-                SetBkMode(hdc, TRANSPARENT as i32);
                 if id == ID_LBL_STATUS {
                     let kind = with_state(|s| s.status_kind).unwrap_or(StatusKind::Neutral);
                     SetTextColor(
@@ -3936,20 +6155,98 @@ mod imp {
                             StatusKind::Neutral => theme::MUTED,
                         },
                     );
-                } else if id == ID_LBL_FILES_HDR
-                    || id == ID_LBL_FILES_PANE_HDR
-                    || id == ID_LBL_MANIFEST_HDR
-                    || id == ID_LBL_OUTPUT_HDR
-                    || id == ID_LBL_PACKAGE_HDR
-                    || id == ID_LBL_FACTS
-                    || id == ID_LBL_TOTALS
-                    || id == ID_LBL_APPVER
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
+                }
+                if id == ID_LBL_DATA_NOTE || id == ID_LBL_REQ_NOTE {
+                    SetTextColor(hdc, theme::INFO);
+                    SetBkMode(hdc, OPAQUE as i32);
+                    SetBkColor(hdc, theme::INFO_FILL);
+                    return theme::brush(theme::INFO_FILL) as LRESULT;
+                }
+                if id == ID_LBL_WINREQ_TAG {
+                    SetTextColor(hdc, theme::SUCCESS);
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
+                }
+                if id == ID_LBL_RT_TAG1
+                    || id == ID_LBL_RT_TAG2
+                    || id == ID_LBL_RT_TAG3
+                    || id == ID_LBL_RT_TAG4
                 {
-                    // Section captions and genuinely secondary text.
+                    SetTextColor(hdc, theme::WARNING);
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
+                }
+                if id == ID_LBL_DONE_REASON {
+                    SetTextColor(hdc, theme::DANGER);
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
+                }
+                if id == ID_LBL_NP_STEP1 || id == ID_LBL_NP_STEP2 || id == ID_LBL_NP_STEP3 {
+                    let idx = id - ID_LBL_NP_STEP1;
+                    let step = with_state(|s| s.np_step).unwrap_or(0);
+                    SetTextColor(
+                        hdc,
+                        if idx < step {
+                            theme::SUCCESS
+                        } else if idx == step {
+                            theme::FOREGROUND
+                        } else {
+                            theme::MUTED
+                        },
+                    );
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
+                }
+                const MUTED_IDS: &[usize] = &[
+                    ID_LBL_HOME_SUB,
+                    ID_LBL_RECENT_HDR,
+                    ID_LBL_PL_SUB,
+                    ID_LBL_NP_SUB,
+                    ID_LBL_NP_FOLDER_NOTE,
+                    ID_LBL_FILES_HDR,
+                    ID_LBL_PACKAGE_HDR,
+                    ID_LBL_FILES_PANE_HDR,
+                    ID_LBL_FILES_SUB,
+                    ID_LBL_FOLDER_PATH_LBL,
+                    ID_LBL_OPT_SUB,
+                    ID_LBL_OPT_DETAILS,
+                    ID_LBL_OPT_ICON,
+                    ID_LBL_ICON_VALUE,
+                    ID_LBL_OPT_SHORTCUTS,
+                    ID_LBL_LOC_NOTE,
+                    ID_LBL_LAUNCH,
+                    ID_LBL_LOGIN,
+                    ID_LBL_DATADIRS,
+                    ID_LBL_PREVIEW_HDR,
+                    ID_LBL_POWER,
+                    ID_LBL_APPVER,
+                    ID_LBL_TOTALS,
+                    ID_LBL_PL_CURRENT,
+                    ID_LBL_REQ_SUB,
+                    ID_LBL_REQ_WIN_HDR,
+                    ID_LBL_REQ_RT_HDR,
+                    ID_LBL_BS_SUB,
+                    ID_LBL_BS_ARCH_HDR,
+                    ID_LBL_BS_ARCH,
+                    ID_LBL_BS_COMP_HDR,
+                    ID_LBL_BS_OUT_HDR,
+                    ID_LBL_BS_GET_HDR,
+                    ID_LBL_OUTPUTS,
+                    ID_LBL_BS_CHECK_HDR,
+                    ID_LBL_BS_CONSOLE_HDR,
+                    ID_LBL_ING_SUB,
+                    ID_LBL_ING_PHASE,
+                    ID_LBL_DONE_SUB,
+                    ID_LBL_SET_RECENTS_HDR,
+                    ID_LBL_SET_RECENTS,
+                    ID_LBL_SET_DIAG_HDR,
+                    ID_LBL_SET_LOG,
+                    ID_LBL_SET_SETTINGS,
+                    ID_LBL_SET_ABOUT_HDR,
+                    ID_LBL_SET_VERSION,
+                    ID_LBL_SET_FACTS,
+                    ID_LBL_NP_SUMMARY,
+                ];
+                if MUTED_IDS.contains(&id) || PANEL_LABELS.contains(&id) {
                     SetTextColor(hdc, theme::MUTED);
                 } else {
-                    // Everything else is an enabled control's label
-                    // (the manifest field labels, the option rows).
                     SetTextColor(hdc, theme::FOREGROUND);
                 }
                 theme::brush(theme::BACKGROUND) as LRESULT
@@ -3957,189 +6254,260 @@ mod imp {
             WM_CTLCOLOREDIT => {
                 let hdc = wparam as HDC;
                 let ctrl = lparam as HWND;
-                SetBkMode(hdc, OPAQUE as i32);
-                if IsWindowEnabled(ctrl) == 0 {
-                    SetBkColor(hdc, theme::DISABLED_FILL);
+                if !ctrl.is_null() && IsWindowEnabled(ctrl) == 0 {
                     SetTextColor(hdc, theme::DISABLED_FOREGROUND);
-                    theme::brush(theme::DISABLED_FILL) as LRESULT
-                } else {
-                    SetBkColor(hdc, theme::SURFACE);
-                    SetTextColor(hdc, theme::FOREGROUND);
-                    theme::brush(theme::SURFACE) as LRESULT
+                    SetBkColor(hdc, theme::DISABLED_FILL);
+                    return theme::brush(theme::DISABLED_FILL) as LRESULT;
                 }
+                SetTextColor(hdc, theme::FOREGROUND);
+                SetBkColor(hdc, theme::SURFACE);
+                theme::brush(theme::SURFACE) as LRESULT
             }
             WM_DRAWITEM => {
                 let dis = lparam as *const DRAWITEMSTRUCT;
-                if dis.is_null() {
-                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                if dis.is_null() || (*dis).CtlType != ODT_BUTTON {
+                    return 0;
                 }
-                let dis = &*dis;
-                // No header arm: the list headers are painted by
-                // their subclass (theme::subclass_list_header) —
-                // header draw-item messages never reach this window.
-                match dis.CtlID as usize {
-                    ID_BTN_BUILD => theme::draw_push_button(dis, true),
-                    ID_BTN_TB_OPEN
-                    | ID_BTN_TB_SAVE
-                    | ID_BTN_TB_SAVEAS
-                    | ID_BTN_TB_VALIDATE
-                    | ID_BTN_PROGRAM_FOLDER
-                    | ID_BTN_REMOVE
-                    | ID_BTN_FILES_DIR
-                    | ID_BTN_OUT_DIR
-                    | ID_BTN_VALIDATE
-                    | ID_BTN_VERIFY
-                    | ID_BTN_TEST
-                    | ID_BTN_OPEN_OUTPUT
-                    | ID_BTN_PREVIEW
-                    | ID_BTN_CANCEL => theme::draw_push_button(dis, false),
-                    id if CHECKBOX_IDS.contains(&id) => theme::draw_checkbox(dis),
-                    _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                let id = (*dis).CtlID as usize;
+                const PRIMARY_IDS: &[usize] = &[
+                    ID_BTN_BUILD,
+                    ID_BTN_NEW_PROJECT,
+                    ID_BTN_PL_NEW,
+                    ID_BTN_NP_NEXT,
+                    ID_BTN_DONE_INSTALLER,
+                    ID_BTN_REQ_NEXT,
+                ];
+                if CHECKBOX_IDS.contains(&id) {
+                    theme::draw_checkbox(&*dis);
+                } else if id == ID_NAV_HOME
+                    || id == ID_NAV_PROJECTS
+                    || id == ID_NAV_BUILD
+                    || id == ID_NAV_SETTINGS
+                {
+                    draw_nav_button(hwnd, dis);
+                } else if id == ID_TAB_FILES || id == ID_TAB_OPTIONS || id == ID_TAB_REQUIREMENTS {
+                    draw_tab_button(hwnd, dis);
+                } else {
+                    theme::draw_push_button(&*dis, PRIMARY_IDS.contains(&id));
                 }
                 1
             }
             WM_COMMAND => {
-                let control_id = wparam & 0xFFFF;
-                let notify = (wparam >> 16) & 0xFFFF;
-                // Owner-drawn checkboxes do not toggle themselves —
-                // a click flips the stored check state here, and the
-                // arms below react exactly as they did for native
-                // auto-checkboxes (dirty tracking).
-                if notify == BN_CLICKED_CODE && CHECKBOX_IDS.contains(&control_id) {
-                    let now = get_check(hwnd, control_id);
-                    set_check(hwnd, control_id, !now);
+                let id = wparam & 0xFFFF;
+                let code = ((wparam >> 16) & 0xFFFF) as u32;
+                // Owner-drawn checkboxes do not toggle themselves.
+                if code == BN_CLICKED && CHECKBOX_IDS.contains(&id) {
+                    let ctrl = GetDlgItem(hwnd, id as i32);
+                    if !ctrl.is_null() && IsWindowEnabled(ctrl) != 0 {
+                        let now = SendMessageW(ctrl, BM_GETCHECK, 0, 0);
+                        SendMessageW(
+                            ctrl,
+                            BM_SETCHECK,
+                            if now == BST_CHECKED as isize { 0 } else { 1 },
+                            0,
+                        );
+                    }
                 }
-                match control_id {
-                    IDM_FILE_OPEN => on_open_manifest(hwnd),
-                    IDM_FILE_SAVE => on_save(hwnd, false),
-                    IDM_FILE_SAVEAS => on_save(hwnd, true),
-                    IDM_FILE_EXIT => {
-                        SendMessageW(hwnd, WM_CLOSE, 0, 0);
+                if code == EN_CHANGE {
+                    const FIELD_IDS: &[usize] = &[
+                        ID_EDT_NAME,
+                        ID_EDT_VERSION,
+                        ID_EDT_PUBLISHER,
+                        ID_EDT_PRIMARY,
+                        ID_EDT_INSTALL_LOC,
+                        ID_EDT_SM_FOLDER,
+                        ID_EDT_ASSOC,
+                        ID_EDT_FILES_DIR,
+                        ID_EDT_OUT_DIR,
+                        ID_EDT_DATA_DIRS,
+                        ID_EDT_POWER,
+                    ];
+                    if FIELD_IDS.contains(&id) {
+                        mark_dirty(hwnd);
+                        if id == ID_EDT_OUT_DIR
+                            && with_state(|s| s.page).unwrap_or(Page::Home) == Page::BuildSettings
+                        {
+                            refresh_outputs_label(hwnd);
+                        }
                     }
-                    IDM_PROJ_FILES => on_choose_files_dir(hwnd),
-                    IDM_PROJ_OUT => on_choose_out_dir(hwnd),
-                    IDM_BUILD_VALIDATE | ID_BTN_VALIDATE => on_validate(hwnd),
-                    IDM_BUILD_PACK => on_pack(hwnd, false),
-                    IDM_BUILD_VERIFY => {
-                        let sandbox = get_check(hwnd, ID_CHK_SANDBOX);
-                        on_verify(hwnd, sandbox);
+                    return 0;
+                }
+                match id {
+                    ID_NAV_HOME => show_page(hwnd, Page::Home),
+                    ID_NAV_PROJECTS => show_page(hwnd, Page::ProjectList),
+                    ID_NAV_BUILD => show_page(hwnd, Page::BuildSettings),
+                    ID_NAV_SETTINGS => show_page(hwnd, Page::Settings),
+                    ID_TAB_FILES => show_page(hwnd, Page::EditorFiles),
+                    ID_TAB_OPTIONS => show_page(hwnd, Page::EditorOptions),
+                    ID_TAB_REQUIREMENTS => show_page(hwnd, Page::EditorRequirements),
+                    ID_BTN_NEW_PROJECT => on_np_start(hwnd, Page::Home),
+                    ID_BTN_PL_NEW => on_np_start(hwnd, Page::ProjectList),
+                    ID_BTN_VIEW_ALL => show_page(hwnd, Page::ProjectList),
+                    ID_BTN_PL_PICK => on_open_manifest(hwnd),
+                    ID_BTN_PL_OPEN => {
+                        if let Some(i) = selected_recent_index(hwnd) {
+                            on_open_recent(hwnd, i)
+                        }
                     }
-                    IDM_BUILD_TEST => on_verify(hwnd, true),
-                    IDM_BUILD_PREVIEW => on_preview_installer(hwnd),
-                    IDM_TOOLS_SCHEMA => on_schema(hwnd),
-                    IDM_TOOLS_LOG => on_open_log(hwnd),
-                    IDM_HELP_ABOUT => on_about(hwnd),
+                    ID_BTN_PL_REMOVE => on_remove_recent(hwnd),
+                    ID_BTN_NP_BROWSE => on_np_browse(hwnd),
+                    ID_BTN_NP_NEXT => on_np_next(hwnd),
+                    ID_BTN_NP_BACK => on_np_back(hwnd),
+                    ID_BTN_NP_CANCEL => on_np_cancel(hwnd),
                     ID_BTN_TB_OPEN => on_open_manifest(hwnd),
                     ID_BTN_TB_SAVE => on_save(hwnd, false),
                     ID_BTN_TB_SAVEAS => on_save(hwnd, true),
-                    ID_BTN_TB_VALIDATE => on_validate(hwnd),
-                    ID_BTN_PROGRAM_FOLDER => on_choose_files_dir(hwnd),
-                    ID_BTN_REMOVE => on_remove_selected(hwnd),
-                    ID_BTN_CANCEL => on_cancel_job(hwnd),
-                    ID_BTN_OPEN_OUTPUT => on_open_output_folder(hwnd),
-                    ID_BTN_PREVIEW => on_preview_installer(hwnd),
-                    // Esc (delivered as IDCANCEL by the dialog-message
-                    // handling) cancels a running job, like the
-                    // wizard's progress page.
-                    2 if is_busy() => on_cancel_job(hwnd),
-                    ID_BTN_FILES_DIR => on_choose_files_dir(hwnd),
+                    ID_BTN_TB_VALIDATE | ID_BTN_VALIDATE => on_validate(hwnd),
+                    ID_BTN_SCHEMA => on_schema(hwnd),
+                    ID_BTN_FILES_DIR | ID_BTN_PROGRAM_FOLDER => on_choose_files_dir(hwnd),
                     ID_BTN_OUT_DIR => on_choose_out_dir(hwnd),
-                    ID_BTN_VERIFY => {
-                        let sandbox = get_check(hwnd, ID_CHK_SANDBOX);
-                        on_verify(hwnd, sandbox);
-                    }
-                    ID_BTN_TEST => on_verify(hwnd, true),
+                    ID_BTN_REMOVE => on_remove_selected(hwnd),
                     ID_BTN_BUILD => on_pack(hwnd, false),
-                    ID_EDT_NAME | ID_EDT_VERSION | ID_EDT_PUBLISHER | ID_EDT_PRIMARY
-                    | ID_EDT_INSTALL_LOC | ID_EDT_SM_FOLDER | ID_EDT_ASSOC | ID_EDT_FILES_DIR
-                    | ID_EDT_OUT_DIR | ID_EDT_DATA_DIRS | ID_EDT_POWER => {
-                        if notify == EN_CHANGE_CODE {
-                            mark_dirty(hwnd);
+                    ID_BTN_VERIFY => on_verify(hwnd, get_check(hwnd, ID_CHK_SANDBOX)),
+                    ID_BTN_TEST => on_verify(hwnd, true),
+                    ID_BTN_OPEN_OUTPUT | ID_BTN_DONE_FOLDER => on_open_output_folder(hwnd),
+                    ID_BTN_PREVIEW | ID_BTN_DONE_INSTALLER => on_preview_installer(hwnd),
+                    ID_BTN_CLEAR => set_text(hwnd, ID_OUTPUT, ""),
+                    ID_BTN_CANCEL => on_cancel_job(hwnd),
+                    ID_BTN_REQ_BACK => show_page(hwnd, Page::EditorOptions),
+                    ID_BTN_REQ_NEXT => {
+                        harvest_fields(hwnd);
+                        show_page(hwnd, Page::BuildSettings);
+                    }
+                    ID_BTN_BS_BACK => show_page(hwnd, Page::EditorFiles),
+                    ID_BTN_DONE_AGAIN | ID_BTN_DONE_BACK => show_page(hwnd, Page::BuildSettings),
+                    ID_BTN_CLEAR_RECENTS => on_clear_recents(hwnd),
+                    ID_BTN_OPEN_LOG => on_open_log(hwnd),
+                    ID_BTN_ABOUT => on_about(hwnd),
+                    2 => {
+                        // Esc arrives as IDCANCEL: cancel a running
+                        // job; on the New Project flow, leave it.
+                        if is_busy() {
+                            on_cancel_job(hwnd);
+                        } else if with_state(|s| s.page).unwrap_or(Page::Home) == Page::NewProject {
+                            on_np_cancel(hwnd);
                         }
                     }
-                    ID_CHK_DESKTOP
-                    | ID_CHK_STARTMENU
-                    | ID_CHK_PATH
-                    | ID_CHK_LAUNCH_OFFER
-                    | ID_CHK_LAUNCH_DEFAULT
-                    | ID_CHK_LOGIN_OFFER
-                    | ID_CHK_LOGIN_DEFAULT => {
-                        mark_dirty(hwnd);
+                    _ => {
+                        if code == BN_CLICKED {
+                            const OPTION_CHECKS: &[usize] = &[
+                                ID_CHK_DESKTOP,
+                                ID_CHK_STARTMENU,
+                                ID_CHK_PATH,
+                                ID_CHK_LAUNCH_OFFER,
+                                ID_CHK_LAUNCH_DEFAULT,
+                                ID_CHK_LOGIN_OFFER,
+                                ID_CHK_LOGIN_DEFAULT,
+                            ];
+                            if OPTION_CHECKS.contains(&id) {
+                                mark_dirty(hwnd);
+                            }
+                        }
                     }
-                    ID_CHK_SANDBOX => {
-                        // A verify option, not a manifest field: no dirty.
-                    }
-                    _ => {}
                 }
                 0
             }
             WM_NOTIFY => {
                 let hdr = lparam as *const NMHDR;
-                if !hdr.is_null() {
-                    // Theme custom draw (selection fill, gridlines)
-                    // for the two list views.
-                    let custom = match (*hdr).idFrom {
+                if hdr.is_null() {
+                    return 0;
+                }
+                let code = (*hdr).code as i32;
+                let from = (*hdr).idFrom;
+                if code == NM_CUSTOMDRAW_I32 {
+                    let drawn = match from {
                         ID_LIST => theme::listview_custom_draw(lparam, true),
-                        ID_TREE => theme::listview_custom_draw(lparam, false),
+                        ID_TREE | ID_RECENTS => theme::listview_custom_draw(lparam, false),
                         _ => None,
                     };
-                    if let Some(result) = custom {
+                    if let Some(result) = drawn {
                         return result;
                     }
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
-                if !hdr.is_null() && (*hdr).code as i32 == LVN_ITEMCHANGED_I32 {
+                if code == LVN_ITEMCHANGED_I32 {
                     let nmlv = lparam as *const NMLISTVIEW;
-                    if !nmlv.is_null() && (*nmlv).uNewState & LVIS_SELECTED != 0 {
-                        match (*hdr).idFrom {
-                            ID_LIST => on_list_selection(hwnd, (*nmlv).iItem),
-                            ID_TREE => on_tree_selection(hwnd, (*nmlv).iItem),
+                    let item = (*nmlv).iItem;
+                    if item >= 0 {
+                        match from {
+                            ID_LIST => {
+                                if (*nmlv).uNewState & LVIS_SELECTED != 0 {
+                                    on_list_selection(hwnd, item);
+                                }
+                            }
+                            ID_TREE => {
+                                let old_idx = ((*nmlv).uOldState >> 12) & 0xF;
+                                let new_idx = ((*nmlv).uNewState >> 12) & 0xF;
+                                let sup = with_state(|s| s.suppress_tree_check).unwrap_or(false);
+                                if (*nmlv).uChanged & LVIF_STATE != 0 && old_idx != new_idx && !sup
+                                {
+                                    on_tree_check(hwnd, item, new_idx == 2);
+                                } else if (*nmlv).uNewState & LVIS_SELECTED != 0 {
+                                    on_tree_selection(hwnd, item);
+                                }
+                            }
                             _ => {}
                         }
                     }
+                    return 0;
                 }
-                0
+                if code == NM_DBLCLK_I32 && from == ID_RECENTS {
+                    let nia = lparam as *const NMITEMACTIVATE;
+                    if (*nia).iItem >= 0 {
+                        on_open_recent(hwnd, (*nia).iItem as usize);
+                    }
+                    return 0;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            m if m == WM_APP_JOB => {
+            WM_APP_JOB => {
                 on_job_message(hwnd);
                 0
             }
-            m if m == WM_APP_PROGRESS => {
+            WM_APP_PROGRESS => {
                 on_progress_message(hwnd);
+                0
+            }
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if !hdc.is_null() {
+                    paint_custom(hwnd, hdc);
+                }
+                EndPaint(hwnd, &ps);
                 0
             }
             WM_SIZE => {
                 layout(hwnd);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
                 0
             }
             WM_GETMINMAXINFO => {
-                let dpi = with_state(|s| s.dpi).unwrap_or(96);
                 let mmi = lparam as *mut MINMAXINFO;
-                if !mmi.is_null() {
-                    (*mmi).ptMinTrackSize.x = scale(900, dpi);
-                    (*mmi).ptMinTrackSize.y = scale(600, dpi);
-                }
+                let scale = with_state(|s| s.dpi as f32 / 96.0).unwrap_or(1.0);
+                (*mmi).ptMinTrackSize.x = (980.0 * scale) as i32;
+                (*mmi).ptMinTrackSize.y = (720.0 * scale) as i32;
                 0
             }
-            m if m == WM_DPICHANGED_MSG => {
-                let new_dpi = (wparam & 0xFFFF) as u32;
-                if new_dpi > 0 {
-                    with_state(|s| s.dpi = new_dpi);
-                    create_fonts(new_dpi);
-                    apply_fonts(hwnd);
-                    let rect = lparam as *const RECT;
-                    if !rect.is_null() {
-                        SetWindowPos(
-                            hwnd,
-                            std::ptr::null_mut(),
-                            (*rect).left,
-                            (*rect).top,
-                            (*rect).right - (*rect).left,
-                            (*rect).bottom - (*rect).top,
-                            SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                    }
-                    layout(hwnd);
+            WM_DPICHANGED => {
+                let new_dpi = ((wparam >> 16) & 0xFFFF) as u32;
+                with_state(|s| s.dpi = new_dpi);
+                create_fonts(new_dpi);
+                apply_fonts(hwnd);
+                let suggested = lparam as *const RECT;
+                if !suggested.is_null() {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        (*suggested).left,
+                        (*suggested).top,
+                        (*suggested).right - (*suggested).left,
+                        (*suggested).bottom - (*suggested).top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
                 }
+                layout(hwnd);
+                InvalidateRect(hwnd, std::ptr::null(), 1);
                 0
             }
             WM_CLOSE => {

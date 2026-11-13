@@ -30,6 +30,17 @@
 //!    offers it shows a "Launch <App>" checkbox (checked per the
 //!    package's default); closing with it checked starts the app.
 //!
+//! One v4.8.0 addition shares the same pages: the **elevation
+//! offer**. When the verdict fails and this process is not elevated,
+//! the Review page also offers **Restart as administrator** (see
+//! [`crate::elevation`]) beside the per-user switch, with the honest
+//! note that shortcuts and settings will then belong to the
+//! administrator account Windows elevates with. The relaunch
+//! preserves the original arguments (and an applied preset's path);
+//! declining the UAC prompt leaves the wizard open with a plain
+//! note. An instance carrying the `--elevated-relaunch` marker
+//! never re-offers.
+//!
 //! Two v7 additions share the same pages. **Modify mode**
 //! (`InstallWizard::modify`, reached from a bare `--modify` or the
 //! ARP entry's Modify button) re-opens the wizard on an existing
@@ -239,6 +250,20 @@ pub fn delete_uninstall_entry(app_name: &str) {
 #[cfg(not(windows))]
 pub fn delete_uninstall_entry(_app_name: &str) {}
 
+/// How the uninstall confirmation window ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninstallConfirmation {
+    /// Cancelled or closed — the caller must remove nothing.
+    Cancelled,
+    /// Confirmed; `purge_data` is the data checkbox's final state.
+    Proceed { purge_data: bool },
+    /// The user picked **Restart as administrator** and the elevated
+    /// instance was handed off successfully — this process removes
+    /// nothing and exits; the elevated copy runs the whole
+    /// confirmation again under the administrator token.
+    RelaunchedElevated,
+}
+
 /// The uninstall confirmation window, in the wizard's visual language:
 /// names what uninstall removes and — when the install recorded data
 /// directories — offers a checkbox to delete the app's data files
@@ -249,11 +274,18 @@ pub fn delete_uninstall_entry(_app_name: &str) {}
 /// `purgeDataOnUninstall`); it is unchecked for every install that
 /// did not opt in, and the user always makes the final call here.
 ///
-/// Returns `Some(purge_data)` when the user confirms (the checkbox
-/// state), or `None` when the window is cancelled or closed — the
-/// caller must then remove nothing. The window is a view over the
-/// shared uninstall operation ([`crate::uninstall::perform_uninstall`]);
-/// it decides nothing else.
+/// When `offer_elevation` is set (v4.8.0: the install folder is not
+/// writable by this account and the elevation decision offers the
+/// restart — see [`crate::elevation`]), the window also shows a
+/// **Restart as administrator** button with the honest note that
+/// the uninstall would then run as the administrator account.
+/// Declining the UAC prompt keeps the window open with a plain
+/// note; a successful hand-off returns
+/// [`UninstallConfirmation::RelaunchedElevated`].
+///
+/// The window is a view over the shared uninstall operation
+/// ([`crate::uninstall::perform_uninstall`]); it decides nothing
+/// else.
 ///
 /// Off Windows there is no native window; the function proceeds with
 /// the safe default (uninstall, keep data).
@@ -262,8 +294,9 @@ pub fn confirm_uninstall(
     app_name: &str,
     data_dirs: &[PathBuf],
     purge_default: bool,
-) -> Option<bool> {
-    imp::confirm_uninstall(app_name, data_dirs, purge_default)
+    offer_elevation: bool,
+) -> UninstallConfirmation {
+    imp::confirm_uninstall(app_name, data_dirs, purge_default, offer_elevation)
 }
 
 /// Off Windows there is no native window; proceeds with the safe
@@ -273,8 +306,9 @@ pub fn confirm_uninstall(
     _app_name: &str,
     _data_dirs: &[PathBuf],
     _purge_default: bool,
-) -> Option<bool> {
-    Some(false)
+    _offer_elevation: bool,
+) -> UninstallConfirmation {
+    UninstallConfirmation::Proceed { purge_data: false }
 }
 
 /// The Rail-layout installer wizard for one overlay package.
@@ -289,6 +323,17 @@ pub struct InstallWizard {
     /// primary button runs the shared modify operation instead of an
     /// install.
     modify_dir: Option<PathBuf>,
+    /// An answer file to apply before the first page shows (v4.8.0):
+    /// set only for an elevated relaunch whose unelevated instance
+    /// had already applied the preset on the user's click — the
+    /// choices are the user's, carried across the hand-off, never a
+    /// silent first-run application.
+    preset_answers_path: Option<PathBuf>,
+    /// The install location the unelevated instance was showing
+    /// when the user clicked Restart as administrator (v4.8.0): the
+    /// elevated instance opens on the folder the user actually
+    /// chose, not the package default. Install mode only.
+    relaunch_location: Option<PathBuf>,
 }
 
 impl InstallWizard {
@@ -306,7 +351,25 @@ impl InstallWizard {
             exe_path,
             power,
             modify_dir: None,
+            preset_answers_path: None,
+            relaunch_location: None,
         }
+    }
+
+    /// Carries an already-applied answer file across an elevation
+    /// relaunch (see the field docs). The wizard applies it before
+    /// the Review page shows, exactly as the user's earlier Apply
+    /// click did in the unelevated instance.
+    pub fn with_preset_answers(mut self, path: PathBuf) -> Self {
+        self.preset_answers_path = Some(path);
+        self
+    }
+
+    /// Carries the chosen install location across an elevation
+    /// relaunch (see the field docs).
+    pub fn with_relaunch_location(mut self, dir: PathBuf) -> Self {
+        self.relaunch_location = Some(dir);
+        self
     }
 
     /// The wizard in Modify mode for the install at `dest` (its
@@ -327,6 +390,8 @@ impl InstallWizard {
             exe_path,
             power,
             modify_dir: Some(dest),
+            preset_answers_path: None,
+            relaunch_location: None,
         }
     }
 }
@@ -342,6 +407,8 @@ impl InstallWizard {
             self.exe_path.clone(),
             std::mem::take(&mut self.power),
             self.modify_dir.clone(),
+            self.preset_answers_path.clone(),
+            self.relaunch_location.clone(),
         )
     }
 }
@@ -359,6 +426,12 @@ impl InstallWizard {
             self.exe_path.display().to_string(),
             self.power.components.len(),
             self.modify_dir.as_ref().map(|d| d.display().to_string()),
+            self.preset_answers_path
+                .as_ref()
+                .map(|d| d.display().to_string()),
+            self.relaunch_location
+                .as_ref()
+                .map(|d| d.display().to_string()),
         );
         Err(1)
     }
@@ -450,6 +523,11 @@ mod imp {
     const ID_LBL_CONFIRM_WARN: usize = 464;
     const ID_BTN_CONFIRM: usize = 465;
     const ID_BTN_CONFIRM_CANCEL: usize = 466;
+    // The uninstall confirmation's elevation offer (v4.8.0): a note
+    // line plus the Restart as administrator button, created only
+    // when the caller says the offer applies.
+    const ID_LBL_CONFIRM_NOTE: usize = 467;
+    const ID_BTN_CONFIRM_ELEVATE: usize = 468;
 
     // The Review page's answer-file offer (v7): a label plus Apply /
     // Ignore, shown only while a valid beside-the-exe answers.json is
@@ -458,6 +536,11 @@ mod imp {
     const ID_LBL_ANSWERS: usize = 480;
     const ID_BTN_ANSWERS_APPLY: usize = 481;
     const ID_BTN_ANSWERS_IGNORE: usize = 482;
+    // The Review page's Restart as administrator button (v4.8.0):
+    // sits in the footer row's free left slot (where the keyboard
+    // hint normally rests) and is shown only while the elevation
+    // offer applies.
+    const ID_BTN_RESTART_ADMIN: usize = 483;
 
     const OPTION_CONTROLS: [usize; 12] = [
         ID_LBL_LOC,
@@ -524,6 +607,11 @@ mod imp {
 
     const READY_INFO_TEXT: &str = "Ready to install. Nothing is downloaded and nothing is sent anywhere — this installer works fully offline and can be undone from Windows Settings → Apps.";
     const UNWRITABLE_INFO_TEXT: &str = "That install folder needs administrator access, and this installer runs per user — it cannot use it. Switch to the per-user folder with the Install location row's Change action (no administrator rights needed), or choose a different location on the Options page.";
+    // The same wall, with the v4.8.0 restart offer in play: both
+    // remedies named, the per-user one recommended, and the honest
+    // consequence of elevating — shortcuts and settings land under
+    // the administrator account Windows elevates with.
+    const UNWRITABLE_OFFER_INFO_TEXT: &str = "That folder needs administrator access; this installer runs per user. Recommended: the Install location row switches to the per-user folder in one click — no administrator rights needed. Or restart as administrator (below): Windows will ask permission, and shortcuts and settings will then belong to the administrator account, not yours.";
 
     struct WizardState {
         manifest: OverlayManifestHeader,
@@ -578,6 +666,19 @@ mod imp {
         /// The uninstall data-purge default an applied preset chose;
         /// recorded in the receipt by the install operation.
         purge_data_default: bool,
+        /// The v4.8.0 elevation offer currently applies (the location
+        /// verdict failed, this process is not elevated, and this
+        /// instance carries no relaunch marker) — the Restart as
+        /// administrator button shows and the offer's info text is
+        /// in force. Recomputed by `refresh_location_state`.
+        elevation_offer: bool,
+        /// This process was itself started by an elevation relaunch
+        /// (its arguments carry the marker): it never re-offers.
+        relaunch_marker: bool,
+        /// The answer file the user applied in this instance (the
+        /// beside-the-exe preset's path), so an elevation relaunch
+        /// can carry the applied preset across the hand-off.
+        answers_applied_path: Option<PathBuf>,
     }
 
     static STATE: Mutex<Option<WizardState>> = Mutex::new(None);
@@ -586,6 +687,7 @@ mod imp {
     static mut TILE_FONT: HFONT = std::ptr::null_mut();
     static mut NAME_FONT: HFONT = std::ptr::null_mut();
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         manifest: OverlayManifestHeader,
         records: Vec<FileRecordHeader>,
@@ -593,6 +695,8 @@ mod imp {
         exe_path: PathBuf,
         power: PowerSpec,
         modify_dir: Option<PathBuf>,
+        preset_answers_path: Option<PathBuf>,
+        relaunch_location: Option<PathBuf>,
     ) -> Result<(), u32> {
         let modify = modify_dir.is_some();
         let mut options = options;
@@ -611,8 +715,30 @@ mod imp {
         // The beside-the-exe answer file (install mode only): parsed
         // now, offered on the Review page, applied only if the user
         // clicks Apply. An invalid file is explained, never used.
+        //
+        // The one exception is a preset carried across an elevation
+        // relaunch (v4.8.0): the user already clicked Apply in the
+        // unelevated instance, so the preset lands before the first
+        // page — its options and location here, its component
+        // selection with the starting selection below, its purge
+        // default in the state.
+        let mut preset_applied: Option<crate::answers::Answers> = None;
+        let mut carried_preset_path: Option<PathBuf> = None;
         let (answers_offer, answers_note) = if modify {
             (None, None)
+        } else if let Some(path) = &preset_answers_path {
+            match crate::answers::load_answers(path) {
+                Ok(parsed) => {
+                    parsed.apply_to_options(&mut options);
+                    if let Some(location) = &parsed.install_location {
+                        install_dir = PathBuf::from(location);
+                    }
+                    carried_preset_path = Some(path.clone());
+                    preset_applied = Some(parsed);
+                    (None, None)
+                }
+                Err(errors) => (None, Some(errors.join("; "))),
+            }
         } else {
             let candidate = exe_path
                 .parent()
@@ -625,6 +751,15 @@ mod imp {
                 _ => (None, None),
             }
         };
+        // The location the user was actually looking at when they
+        // clicked Restart as administrator wins over both the
+        // package default and a carried preset's location (it is
+        // the newest statement of the same choice).
+        if let Some(dir) = &relaunch_location {
+            if !modify {
+                install_dir = dir.clone();
+            }
+        }
         // The starting component selection (v6): the previous
         // install's choices when its receipt is at the destination,
         // else the manifest defaults — the same resolution the shared
@@ -644,6 +779,33 @@ mod imp {
                     power.default_selection(previous, power.has_core_files(&records))
                 })
         };
+        // A carried preset's component selection replaces the
+        // starting selection, resolved exactly as an Apply click
+        // resolves it; an unresolvable one keeps the default.
+        let component_selection = match &preset_applied {
+            Some(parsed)
+                if parsed.components.is_some() || !parsed.without_components.is_empty() =>
+            {
+                let primary_rel = records
+                    .get(manifest.primary_exe_index as usize)
+                    .map(|r| r.relative_path());
+                match power.resolve_selection(
+                    parsed.components.as_deref(),
+                    &parsed.without_components,
+                    None,
+                    &records,
+                    primary_rel.as_deref(),
+                ) {
+                    Ok(selection) => selection,
+                    Err(_) => component_selection,
+                }
+            }
+            _ => component_selection,
+        };
+        let preset_purge_default = preset_applied
+            .as_ref()
+            .map(|p| p.purge_data_on_uninstall)
+            .unwrap_or(false);
         if let Ok(mut guard) = STATE.lock() {
             *guard = Some(WizardState {
                 manifest,
@@ -665,8 +827,13 @@ mod imp {
                 modify_finish: None,
                 answers: answers_offer,
                 answers_note,
-                answers_decided: false,
-                purge_data_default: false,
+                answers_decided: carried_preset_path.is_some(),
+                purge_data_default: preset_purge_default,
+                elevation_offer: false,
+                relaunch_marker: crate::elevation::has_relaunch_marker(
+                    &crate::elevation::current_process_args(),
+                ),
+                answers_applied_path: carried_preset_path,
             });
         }
         unsafe {
@@ -998,19 +1165,19 @@ mod imp {
             174,
             366,
             674,
-            46,
+            58,
             ID_LBL_INFO,
         );
         // The answer-file offer row (v7): sits between the info box
         // and the status line; show_page decides its visibility and
         // text from the state's offer.
-        mk(&static_class, "", 0, 174, 420, 398, 22, ID_LBL_ANSWERS);
+        mk(&static_class, "", 0, 174, 432, 398, 22, ID_LBL_ANSWERS);
         mk(
             &button_class,
             "Apply preset",
             WS_TABSTOP | BS_OWNERDRAW,
             584,
-            418,
+            430,
             120,
             26,
             ID_BTN_ANSWERS_APPLY,
@@ -1020,12 +1187,12 @@ mod imp {
             "Ignore",
             WS_TABSTOP | BS_OWNERDRAW,
             712,
-            418,
+            430,
             120,
             26,
             ID_BTN_ANSWERS_IGNORE,
         );
-        mk(&static_class, "", 0, 174, 458, 674, 22, ID_LBL_STATUS);
+        mk(&static_class, "", 0, 174, 462, 674, 22, ID_LBL_STATUS);
         mk(&static_class, "", SS_ETCHEDHORZ, RAIL_W, 486, 714, 2, 0);
         mk(
             &static_class,
@@ -1037,6 +1204,21 @@ mod imp {
             20,
             ID_LBL_HINT,
         );
+        // The elevation offer's button (v4.8.0): the footer row's
+        // left slot, where the keyboard hint rests — the hint hides
+        // while the button shows (refresh_location_state settles
+        // both). Starts hidden; most installs never need it.
+        let restart_btn = mk(
+            &button_class,
+            "Restart as administrator",
+            WS_TABSTOP | BS_OWNERDRAW,
+            174,
+            496,
+            262,
+            30,
+            ID_BTN_RESTART_ADMIN,
+        );
+        ShowWindow(restart_btn, SW_HIDE);
         mk(
             &button_class,
             "Back",
@@ -1287,6 +1469,10 @@ mod imp {
         // Review group.
         show(ID_LIST, page == 1);
         show(ID_LBL_INFO, page == 1);
+        // The Restart as administrator button defaults to hidden;
+        // refresh_location_state (called below for pages 1–2) shows
+        // it on the Review page while the elevation offer applies.
+        show(ID_BTN_RESTART_ADMIN, false);
         // The answer-file offer (v7): the label shows while an offer
         // is pending or an invalid file needs explaining; the buttons
         // only while a valid preset awaits the user's decision.
@@ -1527,10 +1713,12 @@ mod imp {
                     s.options.install_location(),
                     s.location_ok,
                     s.page,
+                    s.modify,
+                    s.relaunch_marker,
                 )
             })
         });
-        let Some((dir, app_name, recorded, was_ok, page)) = snapshot else {
+        let Some((dir, app_name, recorded, was_ok, page, modify, marker)) = snapshot else {
             return;
         };
         let (ok, fallback) = match crate::install::location_verdict(&dir, &app_name, &recorded) {
@@ -1539,9 +1727,36 @@ mod imp {
                 (false, Some(fallback))
             }
         };
+        // The elevation offer (v4.8.0): the shared decision — offer
+        // the restart only while the location is unwritable, this
+        // process is unelevated, and this instance is not itself a
+        // relaunch. The button lives on the Review page; the
+        // keyboard hint yields its slot while the button shows.
+        let mode = if modify {
+            crate::elevation::ElevationMode::Modify
+        } else {
+            crate::elevation::ElevationMode::Install
+        };
+        let offer = crate::elevation::elevation_offered(
+            ok,
+            crate::elevation::is_process_elevated(),
+            marker,
+            mode,
+        );
         if let Ok(mut g) = STATE.lock() {
             if let Some(s) = g.as_mut() {
                 s.location_ok = ok;
+                s.elevation_offer = offer;
+            }
+        }
+        {
+            let btn = GetDlgItem(hwnd, ID_BTN_RESTART_ADMIN as i32);
+            if !btn.is_null() {
+                ShowWindow(btn, if offer && page == 1 { SW_SHOW } else { SW_HIDE });
+            }
+            let hint = GetDlgItem(hwnd, ID_LBL_HINT as i32);
+            if !hint.is_null() {
+                ShowWindow(hint, if offer && page == 1 { SW_HIDE } else { SW_SHOW });
             }
         }
         if ok != was_ok && page == 1 {
@@ -1554,7 +1769,15 @@ mod imp {
             set_text(hwnd, ID_LBL_INFO, READY_INFO_TEXT);
             set_text(hwnd, ID_LBL_STATUS, "");
         } else if let Some(fallback) = &fallback {
-            set_text(hwnd, ID_LBL_INFO, UNWRITABLE_INFO_TEXT);
+            set_text(
+                hwnd,
+                ID_LBL_INFO,
+                if offer {
+                    UNWRITABLE_OFFER_INFO_TEXT
+                } else {
+                    UNWRITABLE_INFO_TEXT
+                },
+            );
             set_text(
                 hwnd,
                 ID_LBL_STATUS,
@@ -2014,7 +2237,8 @@ mod imp {
                     | ID_BTN_CANCEL
                     | ID_BTN_BROWSE
                     | ID_BTN_ANSWERS_APPLY
-                    | ID_BTN_ANSWERS_IGNORE => theme::draw_push_button(dis, false),
+                    | ID_BTN_ANSWERS_IGNORE
+                    | ID_BTN_RESTART_ADMIN => theme::draw_push_button(dis, false),
                     ID_CHK_DESKTOP | ID_CHK_STARTMENU | ID_CHK_PATH | ID_CHK_LOGIN
                     | ID_CHK_LAUNCH => theme::draw_checkbox(dis),
                     id if (ID_CHK_COMPONENT_BASE..ID_CHK_COMPONENT_BASE + MAX_COMPONENT_BOXES)
@@ -2063,6 +2287,7 @@ mod imp {
                         }
                     }
                     ID_BTN_INSTALL => on_install_click(hwnd),
+                    ID_BTN_RESTART_ADMIN => on_restart_admin_click(hwnd),
                     ID_BTN_ANSWERS_APPLY => on_answers_apply(hwnd),
                     ID_BTN_ANSWERS_IGNORE => {
                         if let Ok(mut g) = STATE.lock() {
@@ -2440,6 +2665,71 @@ mod imp {
         }
     }
 
+    /// The Review page's **Restart as administrator** button
+    /// (v4.8.0): relaunch this same executable elevated with the
+    /// original arguments preserved — bare wizard, `--modify`, and
+    /// an applied preset's `--answers <path>` — plus the relaunch
+    /// marker, plus (install mode) the location currently chosen,
+    /// carried as `--to` so the elevated instance opens on the
+    /// folder the user actually picked. This window closes only
+    /// after a successful hand-off. If Windows declines (the UAC
+    /// prompt was refused) or the launch fails, the wizard stays
+    /// open, says so in plain words on the status line, and the
+    /// per-user offer stays exactly as it was — no error page.
+    unsafe fn on_restart_admin_click(hwnd: HWND) {
+        let snapshot = STATE.lock().ok().and_then(|g| {
+            g.as_ref().map(|s| {
+                (
+                    s.exe_path.clone(),
+                    s.answers_applied_path.clone(),
+                    s.modify,
+                    s.install_dir.clone(),
+                )
+            })
+        });
+        let Some((exe_path, applied_preset, modify, install_dir)) = snapshot else {
+            return;
+        };
+        let mut base_args = crate::elevation::current_process_args();
+        if base_args.is_empty() && modify {
+            base_args.push("--modify".to_string());
+        }
+        if let Some(path) = &applied_preset {
+            if !base_args.iter().any(|a| a == "--answers") {
+                base_args.push("--answers".to_string());
+                base_args.push(path.to_string_lossy().into_owned());
+            }
+        }
+        if !modify && !base_args.iter().any(|a| a == "--to") {
+            base_args.push("--to".to_string());
+            base_args.push(install_dir.to_string_lossy().into_owned());
+        }
+        crate::diag::log(
+            "wizard",
+            &format!(
+                "elevation relaunch requested ({} mode)",
+                if modify { "modify" } else { "install" }
+            ),
+        );
+        match crate::elevation::relaunch_elevated(&exe_path, &base_args) {
+            Ok(()) => {
+                crate::diag::log("wizard", "elevation relaunch handed off; exiting");
+                DestroyWindow(hwnd);
+            }
+            Err(e) => {
+                crate::diag::log("wizard", &format!("elevation relaunch: {}", e.describe()));
+                set_text(
+                    hwnd,
+                    ID_LBL_STATUS,
+                    &format!(
+                        "{} — nothing was changed. The per-user folder above is still available.",
+                        e.describe()
+                    ),
+                );
+            }
+        }
+    }
+
     /// The Review page's Apply-preset button: the beside-the-exe
     /// answer file's choices land on the wizard state exactly as if
     /// the user had made them on the Options page — options, the
@@ -2480,6 +2770,14 @@ mod imp {
                 }
                 s.purge_data_default = answers.purge_data_on_uninstall;
                 s.answers_decided = true;
+                // Remember which file was applied, so an elevation
+                // relaunch can carry the preset across the hand-off
+                // (the elevated instance applies it before page 1 —
+                // the user's click here is its authorization).
+                s.answers_applied_path = s
+                    .exe_path
+                    .parent()
+                    .map(|p| p.join(crate::answers::ANSWERS_FILE_NAME));
             }
         }
         let list = GetDlgItem(hwnd, ID_LIST as i32);
@@ -2689,8 +2987,13 @@ mod imp {
         /// recorded default; unchecked unless an answer file opted
         /// in at install time).
         purge_default: bool,
-        /// None until the user confirms; Cancel/close leaves it None.
-        result: Option<bool>,
+        /// The v4.8.0 elevation offer applies (the install folder is
+        /// unwritable by this account, unelevated, no marker): the
+        /// window shows the Restart as administrator button.
+        offer_elevation: bool,
+        /// None until the window ends with a decision; Cancel/close
+        /// leaves it None (reported as Cancelled).
+        result: Option<super::UninstallConfirmation>,
     }
 
     static CONFIRM_STATE: Mutex<Option<ConfirmState>> = Mutex::new(None);
@@ -2699,7 +3002,8 @@ mod imp {
         app_name: &str,
         data_dirs: &[PathBuf],
         purge_default: bool,
-    ) -> Option<bool> {
+        offer_elevation: bool,
+    ) -> super::UninstallConfirmation {
         if let Ok(mut g) = CONFIRM_STATE.lock() {
             *g = Some(ConfirmState {
                 app_name: app_name.to_string(),
@@ -2708,6 +3012,7 @@ mod imp {
                     .map(|d| d.to_string_lossy().into_owned())
                     .collect(),
                 purge_default,
+                offer_elevation,
                 result: None,
             });
         }
@@ -2760,7 +3065,7 @@ mod imp {
                         "wizard",
                         &format!("uninstall confirm RegisterClassExW failed: error {err}"),
                     );
-                    return None;
+                    return super::UninstallConfirmation::Cancelled;
                 }
             }
             let title: Vec<u16> = format!("Uninstall {app_name}\0").encode_utf16().collect();
@@ -2780,7 +3085,7 @@ mod imp {
             );
             if hwnd.is_null() {
                 crate::diag::log("wizard", "uninstall confirm window creation failed");
-                return None;
+                return super::UninstallConfirmation::Cancelled;
             }
             create_confirm_controls(hwnd, instance);
             SendMessageW(hwnd, DM_SETDEFID_MSG, ID_BTN_CONFIRM, 0);
@@ -2802,19 +3107,26 @@ mod imp {
             .lock()
             .ok()
             .and_then(|g| g.as_ref().and_then(|s| s.result))
+            .unwrap_or(super::UninstallConfirmation::Cancelled)
     }
 
     unsafe fn create_confirm_controls(parent: HWND, instance: HINSTANCE) {
         let static_class: Vec<u16> = "STATIC\0".encode_utf16().collect();
         let button_class: Vec<u16> = "BUTTON\0".encode_utf16().collect();
-        let (app_name, data_dirs, purge_default) = CONFIRM_STATE
+        let (app_name, data_dirs, purge_default, offer_elevation) = CONFIRM_STATE
             .lock()
             .ok()
             .and_then(|g| {
-                g.as_ref()
-                    .map(|s| (s.app_name.clone(), s.data_dirs.clone(), s.purge_default))
+                g.as_ref().map(|s| {
+                    (
+                        s.app_name.clone(),
+                        s.data_dirs.clone(),
+                        s.purge_default,
+                        s.offer_elevation,
+                    )
+                })
             })
-            .unwrap_or_else(|| ("App".to_string(), Vec::new(), false));
+            .unwrap_or_else(|| ("App".to_string(), Vec::new(), false, false));
         let mk =
             |class: &[u16], text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: usize| {
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -2903,6 +3215,32 @@ mod imp {
                 ID_LBL_CONFIRM_WARN,
             );
         }
+        if offer_elevation {
+            // The elevation offer (v4.8.0): the honest note plus the
+            // restart button in the footer's left slot. A declined
+            // prompt rewrites the note in place (confirm_wnd_proc)
+            // and the window stays open.
+            mk(
+                &static_class,
+                "This app's folder needs administrator access, and this uninstaller runs as your account. You can restart as administrator: Windows will ask for permission, and the uninstall will then run as the administrator account.",
+                0,
+                16,
+                262,
+                590,
+                40,
+                ID_LBL_CONFIRM_NOTE,
+            );
+            mk(
+                &button_class,
+                "Restart as administrator",
+                WS_TABSTOP | BS_OWNERDRAW,
+                16,
+                310,
+                300,
+                30,
+                ID_BTN_CONFIRM_ELEVATE,
+            );
+        }
         mk(
             &button_class,
             "Cancel",
@@ -2956,7 +3294,9 @@ mod imp {
                 let dis = &*dis;
                 match dis.CtlID as usize {
                     ID_BTN_CONFIRM => theme::draw_push_button(dis, true),
-                    ID_BTN_CONFIRM_CANCEL => theme::draw_push_button(dis, false),
+                    ID_BTN_CONFIRM_CANCEL | ID_BTN_CONFIRM_ELEVATE => {
+                        theme::draw_push_button(dis, false)
+                    }
                     ID_CHK_PURGE => theme::draw_checkbox(dis),
                     _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
@@ -2974,10 +3314,47 @@ mod imp {
                         let purge = get_check(hwnd, ID_CHK_PURGE);
                         if let Ok(mut g) = CONFIRM_STATE.lock() {
                             if let Some(s) = g.as_mut() {
-                                s.result = Some(purge);
+                                s.result = Some(super::UninstallConfirmation::Proceed {
+                                    purge_data: purge,
+                                });
                             }
                         }
                         DestroyWindow(hwnd);
+                    }
+                    ID_BTN_CONFIRM_ELEVATE => {
+                        // Restart as administrator (v4.8.0): relaunch
+                        // this same executable elevated with the
+                        // original arguments preserved (the ARP
+                        // string's --uninstall --to <dir> included)
+                        // plus the marker. The window closes only
+                        // after a successful hand-off; a declined
+                        // prompt rewrites the note and stays open.
+                        let args = crate::elevation::current_process_args();
+                        let outcome = match crate::elevation::own_exe() {
+                            Ok(e) => crate::elevation::relaunch_elevated(&e, &args),
+                            Err(err) => Err(err),
+                        };
+                        match outcome {
+                            Ok(()) => {
+                                if let Ok(mut g) = CONFIRM_STATE.lock() {
+                                    if let Some(s) = g.as_mut() {
+                                        s.result =
+                                            Some(super::UninstallConfirmation::RelaunchedElevated);
+                                    }
+                                }
+                                DestroyWindow(hwnd);
+                            }
+                            Err(why) => {
+                                set_text(
+                                    hwnd,
+                                    ID_LBL_CONFIRM_NOTE,
+                                    &format!(
+                                        "{} — nothing was removed. You can cancel, or go ahead with Uninstall as your own account.",
+                                        why.describe()
+                                    ),
+                                );
+                            }
+                        }
                     }
                     ID_BTN_CONFIRM_CANCEL => {
                         DestroyWindow(hwnd);
