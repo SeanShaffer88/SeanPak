@@ -9,7 +9,7 @@ Unverified until SEAN's field pass (see QUALITY.md).
 |---|---|---|
 | PE overlay packager (sector-aligned, per-file compression) | Shipped; compression in 4.1.0 | `src/overlay.rs`; magic `SEANPAK_OVL`, legacy `CRUCIBLEKIT_OVL` + `RUSTPAK_OVERLAY` readable; manifest v4 adds a per-file codec flag, v3/v2 packages still read + install |
 | CLI modes (`--batch`, `--list`, `--extract`, `--install`, `--help`, `--version`) | Shipped (pre-4.0) | Full CLI parity for packaging/inspection |
-| Builder GUI (folder pick, build, UAC self-elevate) | Shipped (pre-4.0) | Design D studio layout is the target for a later slice; current window is the 3.0.0 layout with the rev2 palette |
+| Builder studio GUI (Design D: files table + manifest panel + output strip) | Shipped in 4.2.0, Windows behavior Unverified | `src/studio.rs`; replaces the 3.0.0-era builder window. Every action runs a shared CLI operation (see the parity table below); the document/settings model is host-tested |
 | Installer wizard (Design C ledger review) | Shipped in 4.0.0, Windows behavior Unverified | `src/wizard.rs`; bare run of a built installer opens it |
 | Install = extract to chosen location + rollback journal | Shipped in 4.0.0, Unverified on Windows | Existing targets snapshotted before overwrite; failure rolls back |
 | Uninstaller + ARP entry | Shipped in 4.0.0, Unverified on Windows | Copies itself as `Uninstall.exe`; ARP uninstall string runs it with `--uninstall` |
@@ -42,13 +42,13 @@ build/install operations append JSON-lines records to `seanpak.log`.
 
 | Capability | Shared operation | GUI surface | CLI surface |
 |---|---|---|---|
-| Pack a release set (Setup.exe + Portable.zip + SHA256SUMS.txt) from a JSON manifest | `pack::pack` | Not in the Builder window (planned) | `pack <manifest.json> <files-dir> [--out-dir] [--force] [--json]` |
-| Prove a built installer (overlay, manifest sanity, payloads) | `pack::verify_package` | — | `verify <Setup.exe> [--json]` |
-| Sandbox-proof a built installer (install → compare → uninstall → residue) | `pack::sandbox_verify` | — | `verify <Setup.exe> --sandbox [--json]` |
-| Print the manifest JSON Schema | `manifest::MANIFEST_SCHEMA_JSON` | — | `schema` |
-| Validate a manifest | `manifest::AppManifest::from_json` | — | `validate <manifest.json> [--json]` |
-| Build a native overlay installer from a folder | `overlay::OverlayWriter` | Builder window | `--batch <folder> --out <exe> [--json]` |
-| Generate Inno/NSIS scripts | `backends` | Builder window | `--batch ... --engine inno\|nsis [--script-only]` |
+| Pack a release set (Setup.exe + Portable.zip + SHA256SUMS.txt) from a JSON manifest | `pack::pack` | Studio **Build Setup** button (worker thread; a refused overwrite becomes an explicit confirm + forced retry) | `pack <manifest.json> <files-dir> [--out-dir] [--force] [--json]` |
+| Prove a built installer (overlay, manifest sanity, payloads) | `pack::verify_package` | Studio **Verify** button | `verify <Setup.exe> [--json]` |
+| Sandbox-proof a built installer (install → compare → uninstall → residue) | `pack::sandbox_verify` | Studio **Test install** button, or Verify with the Sandbox toggle on | `verify <Setup.exe> --sandbox [--json]` |
+| Print the manifest JSON Schema | `manifest::MANIFEST_SCHEMA_JSON` | Studio Tools → Show Manifest Schema (prints into the output strip) | `schema` |
+| Validate a manifest | `manifest::AppManifest::from_json` | Studio **Validate** button + the manifest panel (same fields, same rules) | `validate <manifest.json> [--json]` |
+| Build a native overlay installer from a folder | `overlay::OverlayWriter` | — (the studio packs via `pack::pack`) | `--batch <folder> --out <exe> [--json]` |
+| Generate Inno/NSIS scripts | `backends` | — | `--batch ... --engine inno\|nsis [--script-only]` |
 | Install (extract + Uninstall.exe + uninstall entry + shortcuts/associations/PATH, rollback on failure) | `install::perform_install_with` | Wizard Install button (Options page edits the same options first) | `--install [--to] [--dry-run] [--repair] [--force] [--json] [--silent\|--headless]` |
 | Preview an install without changing anything | `install::plan_install` | Wizard review table (Design C) | `--install --dry-run [--json]` |
 | Review / edit install options before installing | overlay `InstallOptions` (manifest v3+) | Wizard review table + Options page | `validate` / `--list [--json]` expose the same fields |
@@ -56,7 +56,12 @@ build/install operations append JSON-lines records to `seanpak.log`.
 | Extract overlay contents | `overlay::OverlayReader` | — | `--extract <packed.exe> --to <dir> [--json]` |
 | Uninstall | receipt artifact replay + overlay record replay + ARP cleanup | ARP / `Uninstall.exe` | `--uninstall [--to] [--json]` |
 
-GUI-only capability: picking a folder with the native dialog and editing
-fields interactively in the Builder window — input conveniences over the
-same folder scan and options the CLI takes as arguments. No build,
-install, verification, or uninstall capability exists only in the GUI.
+GUI-only capability: none. The studio adds input conveniences over the
+same operations — picking files/folders with the native dialogs, copying
+picked files into the package folder (a plain file copy the CLI user does
+by hand), editing the manifest fields interactively, and curating the
+package file list, which is exactly the manifest's `files` field (an
+empty list when the package is the whole folder, as with the CLI). Its
+window geometry/path persistence (`seanpak-studio.json` beside the exe)
+is a UI preference store, not a capability. No build, install,
+verification, or uninstall capability exists only in the GUI.
