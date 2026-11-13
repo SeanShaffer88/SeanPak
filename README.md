@@ -35,7 +35,9 @@ SeanPak is built to be driven by a local AI: packaging is the primary workflow, 
 - Per-user installs by default: no administrator rights are ever *required*, and nothing elevates on its own. A pre-flight writability check refuses an unwritable destination *before* anything changes and suggests the per-user folder instead — the wizard offers that folder in one click. The one user-invoked exception (4.8.0): when a chosen folder cannot be written by this account, the wizard also offers **Restart as administrator** beside the per-user remedy, saying plainly that the install would then run as the administrator account; declining the Windows prompt leaves the wizard open with the per-user offer intact
 - A TesselGUI Rail wizard (Review → Options → Installing → Done) over the same install operation the CLI runs; cancelling mid-install rolls everything back
 - Desktop and Start Menu shortcuts, file associations (the previous default handler is captured and restored by uninstall), and a PATH entry — all journaled
-- Launch after install, offered and checked per the manifest; headless installs launch only with an explicit `--launch`
+- Per-user install locations: `installLocation` accepts `%LOCALAPPDATA%` / `%APPDATA%` / `%USERPROFILE%` token paths resolved on the installing account, and the default location is the per-user Programs folder — never Program Files
+- Silent auto-update: re-running a Setup for an already-installed app (same or older version) updates it in place behind a minimal window instead of opening the wizard; a running program is asked to close, and relaunched after a successful update
+- Launch after install, offered and checked per the manifest (offered + checked by default for installers created now); headless installs launch only with an explicit `--launch`
 - Start at login via a per-user Run entry, journaled and removed by uninstall
 - Optional components with packed sizes on the wizard's Options page (`--components` / `--without` on the CLI); upgrades default to the previous install's selection
 - Pre/post install hooks with per-hook abort/continue failure policies; every run is recorded in the receipt
@@ -156,7 +158,11 @@ cargo build --release --target x86_64-pc-windows-msvc
 .\seanpak.exe --extract "dist\AppSetup.exe" --to "C:\Unpacked"
 
 # A built installer run with no arguments opens the installer wizard;
-# this is the explicit form, with an optional destination:
+# this is the explicit form, with an optional destination. Run again
+# for an app that is already installed at the same version or older
+# and it updates in place instead — no pages, just a small "Updating"
+# window (see "Silent auto-update" below). --to also accepts a
+# per-user token path such as "%LOCALAPPDATA%\Programs\MyApp".
 .\AppSetup.exe --install [--to "D:\Apps\MyApp"]
 ```
 
@@ -214,6 +220,8 @@ back and confirmed.
 # "elevationOffered" when the folder could be reached by restarting
 # as administrator; adding --elevate performs that restart (Windows
 # shows its prompt), waits, and returns the elevated run's exit code.
+# A successful install's report carries "action": "install", or
+# "action": "update" when an existing install was updated in place.
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --json
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --repair --json
 # --launch starts the app afterwards (an explicit opt-in; headless
@@ -243,7 +251,14 @@ back and confirmed.
 .\AppSetup.exe --uninstall --to "D:\Apps\MyApp" --purge-data --json
 ```
 
-**Install options in the manifest.** Beyond shortcuts, associations,
+**Install options in the manifest.** `installLocation` says where
+the app installs: an absolute path, or a per-user token path in the
+same grammar as `dataDirs` — `%LOCALAPPDATA%\Programs\MyApp`
+resolves on the installing account at install time. When a manifest
+omits it, the package records `%LOCALAPPDATA%\Programs\<App>`:
+installs are per-user by default, and Program Files is never the
+default (a manifest may still name it explicitly). The wizard always
+shows the resolved folder. Beyond shortcuts, associations,
 and PATH, a manifest can declare: `launchAfterInstall` — whether the
 wizard's Finish page offers a "Launch <App>" checkbox and whether it
 starts checked (default: offered, checked); `startAtLogin` — whether
@@ -255,6 +270,25 @@ install-relative paths), recorded in the install receipt so the
 uninstall's opt-in checkbox can offer to delete them. The two option
 fields accept a boolean or `{"offered": bool, "defaultChecked": bool}`;
 `seanpak schema` documents every field.
+
+**Creation defaults (5.1.0).** Installers created now — by
+`seanpak init`, by the Builder's New Project, or by packing a
+manifest that omits the fields — default to creating a desktop
+shortcut and to offering launch-after-setup already ticked.
+A manifest that sets `desktopShortcut` or `launchAfterInstall`
+explicitly (including `false`) is never overridden.
+
+**Silent auto-update (5.1.0).** When a Setup wizard starts and the
+same app is already installed at the package's target location (the
+install receipt there says so) at an older or the same version, the
+wizard never opens: a minimal window runs the upgrade in place,
+shows "Updated to <version>.", and closes itself after a few
+seconds. If the program is running, it is asked to close first; a
+program that refuses earns one dialog — **Close it and update** or
+**Cancel** — and a successfully updated program that had been
+running is relaunched. A failed update rolls back and shows the
+error. An installed version newer than the package still gets the
+normal wizard and its downgrade refusal.
 
 **Power features (4.6.0 engine, 4.7.0 surface — the Power bundle is
 complete).** A manifest can also declare
