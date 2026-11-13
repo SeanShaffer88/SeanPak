@@ -23,7 +23,7 @@ Prebuilt binaries are on the **[latest GitHub Release](https://github.com/SeanSh
 - **Windows Restart Manager API (`rstrtmgr.dll`):** The library wraps Restart Manager sessions (loaded dynamically, graceful fallback when unavailable) so hosts can detect processes locking files, query how many are affected, and shut them down / restart them around a file mutation. The packager itself never force-closes your apps.
 - **Transactional rollback journaling:** Native builds snapshot an existing output file before overwriting; on failure the snapshot is restored (LIFO transaction log covering created/modified files and created directories, plus registry-key deletion on Windows).
 - **Privilege separation (UAC):** Embedded manifest execution level is `asInvoker`. Installs are per-user (shortcuts, associations, and PATH all land under HKCU / the user profile), so neither the packager nor a built installer asks for administrator rights.
-- **Broad Windows compatibility:** Targets Windows 7 SP1 / Server 2008 R2 through Windows 11 / Server 2025 across `x86_64`, `i686`, and `aarch64` (all three are built in CI). The pure-logic modules (overlay, scanner, rollback file journal, script backends) are platform-independent and unit-tested on any host OS.
+- **Windows 11 x64:** Release builds target `x86_64-pc-windows-msvc` only. Pure-logic modules (overlay, scanner, rollback file journal, and script backends) are platform-independent and unit-tested on any host OS.
 
 ## Installer engines
 | Engine | Flag | Output | Needs |

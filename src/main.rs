@@ -1189,6 +1189,23 @@ fn run_verify_sandbox(args: &[String], path: &Path) -> i32 {
         vec![
             ("path", jpath(path)),
             ("ok", JsonValue::Bool(report.ok)),
+            ("installDir", jpath(&report.install_dir)),
+            (
+                "checks",
+                JsonValue::Array(
+                    report
+                        .checks
+                        .iter()
+                        .map(|(name, passed, detail)| {
+                            jobj(vec![
+                                ("name", jstr(name.clone())),
+                                ("passed", JsonValue::Bool(*passed)),
+                                ("detail", jstr(detail.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
             (
                 "leftovers",
                 JsonValue::Array(report.leftovers.iter().map(|l| jstr(l.clone())).collect()),

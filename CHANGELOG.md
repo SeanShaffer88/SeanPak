@@ -2,6 +2,11 @@
 
 All notable changes to the SeanPak utility are documented in this file. (3.0.0 was published under the product's former name, CrucibleKit; releases before 3.0.0 under its original name, RustPak.)
 
+## [4.2.1] - 2026-11-13
+### Fixed
+- `verify --sandbox` now records each install, file-comparison, uninstall, and residue check in `seanpak.log`, so failed proofs remain diagnosable when console output is unavailable.
+- SeanPak release builds now target Windows 11 x64 only.
+
 ## [4.2.0] - 2026-11-13
 ### Added
 - **Builder studio (Design D).** Running `seanpak` with no arguments now opens the Builder studio instead of the 3.0.0-era builder window: a dominant files table (File / Destination / Size / Packed estimate — the estimate is computed with the packer's own compression, not a guess) with Add files… / Add folder… / Remove, an App Manifest panel bound to a real `manifest.json` document (Open / Save / Save As, unsaved-changes marker in the title), and an output strip along the bottom. **Build Setup** packs the release set, **Validate** checks the manifest, **Verify** proves the built Setup.exe (with a Sandbox toggle; the footer's **Test install** runs the full sandbox proof) — every action calls the exact shared operation the CLI exposes (`pack`, `validate`, `verify`, `verify --sandbox`), on worker threads, with results (asset sizes + SHA-256) streamed into the output strip. Menus (File / Project / Build / Tools / Help), Ctrl+O / Ctrl+S / Ctrl+K, tooltips, Per-Monitor DPI v2 scaling, a resize-surviving layout, and persisted window geometry + last-used paths (`seanpak-studio.json` beside the executable) round it out. A pack that would overwrite a differing output asks first, then retries with the equivalent of `--force`.

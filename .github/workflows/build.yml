@@ -21,10 +21,6 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             name: seanpak-x86_64-windows
-          - target: i686-pc-windows-msvc
-            name: seanpak-i686-windows
-          - target: aarch64-pc-windows-msvc
-            name: seanpak-arm64-windows
 
     steps:
       - name: Check out repository
@@ -127,8 +123,6 @@ jobs:
         run: |
           mkdir -p release-assets
           cp artifacts/seanpak-x86_64-windows/seanpak-x86_64-windows.zip release-assets/
-          cp artifacts/seanpak-i686-windows/seanpak-i686-windows.zip release-assets/
-          cp artifacts/seanpak-arm64-windows/seanpak-arm64-windows.zip release-assets/
           cd release-assets
           sha256sum seanpak-*.zip > SHA256SUMS.txt
           ls -la
@@ -137,6 +131,4 @@ jobs:
         with:
           files: |
             release-assets/seanpak-x86_64-windows.zip
-            release-assets/seanpak-i686-windows.zip
-            release-assets/seanpak-arm64-windows.zip
             release-assets/SHA256SUMS.txt
