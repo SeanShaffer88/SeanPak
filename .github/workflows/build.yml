@@ -112,23 +112,35 @@ jobs:
     name: Publish Release Assets
     needs: build-windows
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Collect release assets
+      # SeanPak packages itself: the just-built x64 executable packs the
+      # standard release set from packaging/seanpak-manifest.json (the
+      # version is stamped from the tag), proves it with the sandbox
+      # verify, and only then do the three assets attach to the release.
+      - name: Pack SeanPak with itself
         shell: bash
         run: |
-          mkdir -p release-assets
-          cp artifacts/seanpak-x86_64-windows/seanpak-x86_64-windows.zip release-assets/
-          cd release-assets
-          sha256sum seanpak-*.zip > SHA256SUMS.txt
-          ls -la
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p selfpack/files release-assets
+          cp artifacts/seanpak-x86_64-windows/seanpak-x86_64-windows.exe selfpack/files/seanpak.exe
+          cp README.md LICENSE selfpack/files/
+          sed -i "s/\"version\": *\"[^\"]*\"/\"version\": \"$ver\"/" packaging/seanpak-manifest.json
+          SP=selfpack/files/seanpak.exe
+          "$SP" pack packaging/seanpak-manifest.json selfpack/files --out-dir release-assets --json
+          "$SP" verify "release-assets/SeanPak-v$ver-x64-Setup.exe" --sandbox --json
+          ls -la release-assets
       - name: Attach assets to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/seanpak-x86_64-windows.zip
+            release-assets/SeanPak-*-x64-Setup.exe
+            release-assets/SeanPak-*-x64-Portable.zip
             release-assets/SHA256SUMS.txt
