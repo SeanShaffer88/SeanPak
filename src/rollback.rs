@@ -20,25 +20,45 @@ pub enum RollbackAction {
 
 pub struct TransactionRollbackLog {
     actions: Vec<RollbackAction>,
+    /// Arbitrary cleanup closures (for example "remove the shortcuts and
+    /// registry artifacts the install just applied"), run LIFO together
+    /// with `actions` when the transaction rolls back.
+    hooks: Vec<Box<dyn FnOnce() + Send>>,
     backup_temp_dir: PathBuf,
     committed: bool,
 }
 
 impl TransactionRollbackLog {
     pub fn new() -> std::io::Result<Self> {
+        // The sequence number matters: the tick count alone collides
+        // when two transactions start within the same millisecond in
+        // one process (parallel tests proved it — the second snapshot
+        // overwrote the first transaction's `bak_0`).
+        static TX_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = TX_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut temp_path = std::env::temp_dir();
         temp_path.push(format!(
-            "seanpak_tx_{}_{}",
+            "seanpak_tx_{}_{}_{}",
             std::process::id(),
-            get_tick_count()
+            get_tick_count(),
+            sequence
         ));
         fs::create_dir_all(&temp_path)?;
 
         Ok(Self {
             actions: Vec::with_capacity(64),
+            hooks: Vec::new(),
             backup_temp_dir: temp_path,
             committed: false,
         })
+    }
+
+    /// Records a cleanup closure to run if this transaction rolls back.
+    /// Hooks run in reverse recording order, after the file/registry
+    /// actions recorded so far have been undone in the same LIFO pass —
+    /// concretely, hooks recorded last run first.
+    pub fn record_rollback_hook(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.hooks.push(Box::new(hook));
     }
 
     /// Prepares to mutate an existing file by staging a backup snapshot.
@@ -76,6 +96,13 @@ impl TransactionRollbackLog {
     pub fn rollback(&mut self) {
         if self.committed {
             return;
+        }
+
+        // Hooks first (LIFO): they undo the most recent, outermost
+        // effects (shortcuts, registry artifacts) before file state is
+        // restored underneath them.
+        while let Some(hook) = self.hooks.pop() {
+            hook();
         }
 
         // Reverse iteration: LIFO rollback order
@@ -175,6 +202,30 @@ mod tests {
         assert!(!created.exists(), "created file must be removed");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_hooks_run_lifo_on_rollback_and_never_on_commit() {
+        use std::sync::{Arc, Mutex};
+        let order = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut tx = TransactionRollbackLog::new().unwrap();
+            for name in ["first", "second"] {
+                let order = order.clone();
+                tx.record_rollback_hook(move || order.lock().unwrap().push(name));
+            }
+            tx.rollback();
+        }
+        assert_eq!(*order.lock().unwrap(), vec!["second", "first"]);
+
+        order.lock().unwrap().clear();
+        {
+            let mut tx = TransactionRollbackLog::new().unwrap();
+            let order2 = order.clone();
+            tx.record_rollback_hook(move || order2.lock().unwrap().push("never"));
+            tx.commit().unwrap();
+        }
+        assert!(order.lock().unwrap().is_empty());
     }
 
     #[test]

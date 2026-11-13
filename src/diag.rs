@@ -36,7 +36,7 @@ pub fn log_path() -> PathBuf {
 
 /// Formats seconds since the Unix epoch as `YYYY-MM-DD HH:MM:SSZ` (UTC).
 /// Pure arithmetic (civil-from-days), unit-tested; avoids a date crate.
-fn format_utc(epoch_secs: u64) -> String {
+pub(crate) fn format_utc(epoch_secs: u64) -> String {
     let days = (epoch_secs / 86_400) as i64;
     let secs = epoch_secs % 86_400;
     let (hour, minute, second) = (secs / 3600, (secs % 3600) / 60, secs % 60);

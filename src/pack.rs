@@ -14,7 +14,7 @@
 //! The ZIP writer is hand-rolled (stored, no compression) for the same
 //! dependency reason as everything else in this crate.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::hash::{crc32, sha256_file_hex};
@@ -418,7 +418,7 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
         sane = false;
         sane_notes.push("primary exe index is out of range".to_string());
     }
-    if !(2..=3).contains(&manifest.version) {
+    if !(2..=4).contains(&manifest.version) {
         sane = false;
         sane_notes.push(format!("unsupported manifest version {}", manifest.version));
     }
@@ -432,19 +432,22 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
         },
     ));
 
-    // File list matches payloads: paths safe, ranges in bounds and
-    // non-overlapping, and every payload fully readable.
+    // File list matches payloads: paths safe, stored ranges in bounds
+    // and non-overlapping, and every payload fully readable AND
+    // decompressing to exactly the recorded original bytes (v4 payloads
+    // may be stored compressed; `stored_len` gives the on-disk length).
     let mut list_ok = true;
     let mut list_notes: Vec<String> = Vec::new();
     let mut ranges: Vec<(u64, u64, String)> = Vec::new();
-    for record in &records {
+    for (idx, record) in records.iter().enumerate() {
         let rel = record.relative_path();
         if !is_safe_relative_path(&rel) {
             list_ok = false;
             list_notes.push(format!("unsafe stored path \"{rel}\""));
             continue;
         }
-        let end = record.payload_offset.saturating_add(record.file_size);
+        let stored = OverlayReader::stored_len(&records, idx, file_len);
+        let end = record.payload_offset.saturating_add(stored);
         if end > file_len {
             list_ok = false;
             list_notes.push(format!(
@@ -465,27 +468,28 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
         }
     }
     if list_ok {
-        // Read every payload end to end to prove the bytes are there.
+        // Decode every payload end to end to prove the bytes are there
+        // and the compression (if any) is sound.
         let mut file = std::fs::File::open(path)?;
-        let mut buffer = [0u8; 65536];
-        for record in &records {
-            file.seek(SeekFrom::Start(record.payload_offset))?;
-            let mut remaining = record.file_size;
-            while remaining > 0 {
-                let want = remaining.min(buffer.len() as u64) as usize;
-                let n = file.read(&mut buffer[..want])?;
-                if n == 0 {
+        for idx in 0..records.len() {
+            match OverlayReader::read_payload(&mut file, &records, idx, file_len) {
+                Ok(bytes) if bytes.len() as u64 == records[idx].file_size => {}
+                Ok(_) => {
                     list_ok = false;
                     list_notes.push(format!(
-                        "payload of \"{}\" is truncated",
-                        record.relative_path()
+                        "payload of \"{}\" decodes to the wrong length",
+                        records[idx].relative_path()
                     ));
                     break;
                 }
-                remaining -= n as u64;
-            }
-            if !list_ok {
-                break;
+                Err(e) => {
+                    list_ok = false;
+                    list_notes.push(format!(
+                        "payload of \"{}\" cannot be decoded: {e}",
+                        records[idx].relative_path()
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -501,6 +505,198 @@ pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
 
     report.ok = report.checks.iter().all(|(_, passed, _)| *passed);
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox verify.
+
+#[derive(Debug)]
+pub struct SandboxReport {
+    pub ok: bool,
+    pub install_dir: PathBuf,
+    /// (check name, passed, detail) in the order the checks ran.
+    pub checks: Vec<(String, bool, String)>,
+    /// Files left in the install dir after uninstall (expected: just
+    /// the running uninstaller copy and its log).
+    pub leftovers: Vec<String>,
+}
+
+/// The full end-to-end proof of a built installer: silently install it
+/// into a fresh temp dir, compare every installed file byte-for-byte
+/// against the package payload, silently uninstall, and assert nothing
+/// the install owned is left behind. The installer under test is run as
+/// a subprocess, so this works on any platform that can execute it
+/// (on Windows CI it exercises the real Windows build; a foreign PE on
+/// the wrong OS fails the first check honestly instead of pretending).
+pub fn sandbox_verify(setup_path: &Path) -> std::io::Result<SandboxReport> {
+    use crate::hash::sha256_file_hex;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root =
+        std::env::temp_dir().join(format!("seanpak_sandbox_{}_{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&root)?;
+    let install_dir = root.join("app");
+    let mut report = SandboxReport {
+        ok: false,
+        install_dir: install_dir.clone(),
+        checks: Vec::new(),
+        leftovers: Vec::new(),
+    };
+    let finish = |report: SandboxReport| -> std::io::Result<SandboxReport> {
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(report)
+    };
+
+    let staged = root.join("SetupUnderTest.exe");
+    std::fs::copy(setup_path, &staged)?;
+    let dir_arg = install_dir.to_string_lossy().into_owned();
+    let run = |exe: &Path, args: &[&str]| -> std::io::Result<(bool, String)> {
+        let out = std::process::Command::new(exe).args(args).output()?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        Ok((out.status.success(), text))
+    };
+
+    // 1. Silent install of the staged installer.
+    let (installed_ok, install_output) = match run(
+        &staged,
+        &["--install", "--to", &dir_arg, "--silent", "--json"],
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            report.checks.push((
+                "sandbox install runs".to_string(),
+                false,
+                format!("cannot execute the installer on this platform: {e}"),
+            ));
+            return finish(report);
+        }
+    };
+    report.checks.push((
+        "sandbox install runs".to_string(),
+        installed_ok,
+        if installed_ok {
+            "installer exited 0".to_string()
+        } else {
+            format!("installer failed: {}", install_output.trim())
+        },
+    ));
+    if !installed_ok {
+        return finish(report);
+    }
+
+    // 2. Receipt written, and installed files match the payload bytes.
+    let receipt = crate::receipt::read_receipt(&install_dir);
+    report.checks.push((
+        "install receipt written".to_string(),
+        receipt.is_some(),
+        match &receipt {
+            Some(r) => format!("{} {} ({})", r.app, r.version, r.mode),
+            None => "seanpak-receipt.json missing or unreadable".to_string(),
+        },
+    ));
+    let payload_dir = root.join("payload");
+    let mut files_ok = true;
+    let mut files_detail = String::new();
+    match OverlayReader::extract_file(setup_path, &payload_dir) {
+        Ok(written) => {
+            for payload_file in &written {
+                let rel = payload_file
+                    .strip_prefix(&payload_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let installed_file = install_dir.join(&rel);
+                match (
+                    sha256_file_hex(payload_file),
+                    sha256_file_hex(&installed_file),
+                ) {
+                    (Ok(a), Ok(b)) if a == b => {}
+                    _ => {
+                        files_ok = false;
+                        files_detail = format!("\"{rel}\" differs from its payload");
+                        break;
+                    }
+                }
+            }
+            if files_ok {
+                files_detail = format!("{} files byte-identical", written.len());
+            }
+        }
+        Err(e) => {
+            files_ok = false;
+            files_detail = format!("cannot extract payload for comparison: {e}");
+        }
+    }
+    report.checks.push((
+        "installed files match payload".to_string(),
+        files_ok,
+        files_detail,
+    ));
+
+    // 3. Silent uninstall via the installed Uninstall.exe.
+    let uninstaller = install_dir.join("Uninstall.exe");
+    let (uninstalled_ok, uninstall_output) =
+        match run(&uninstaller, &["--uninstall", "--to", &dir_arg, "--json"]) {
+            Ok(result) => result,
+            Err(e) => (false, format!("cannot run Uninstall.exe: {e}")),
+        };
+    report.checks.push((
+        "sandbox uninstall runs".to_string(),
+        uninstalled_ok,
+        if uninstalled_ok {
+            "uninstaller exited 0".to_string()
+        } else {
+            format!("uninstaller failed: {}", uninstall_output.trim())
+        },
+    ));
+
+    // 4. Residue: payload files and the receipt must be gone. The
+    // running uninstaller copy and its log are the known, reported
+    // leftovers (a process cannot delete its own running image).
+    let mut remaining: Vec<String> = Vec::new();
+    collect_relative_files(&install_dir, &install_dir, &mut remaining);
+    remaining.sort();
+    report.leftovers = remaining.clone();
+    let known = ["Uninstall.exe", "seanpak.log"];
+    let unexpected: Vec<&String> = remaining
+        .iter()
+        .filter(|f| !known.contains(&f.replace('\\', "/").as_str()))
+        .collect();
+    report.checks.push((
+        "no install residue".to_string(),
+        unexpected.is_empty(),
+        if unexpected.is_empty() {
+            format!("only known leftovers remain: {}", remaining.join(", "))
+        } else {
+            format!(
+                "unexpected files left behind: {}",
+                unexpected
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    ));
+
+    report.ok = report.checks.iter().all(|(_, passed, _)| *passed);
+    finish(report)
+}
+
+fn collect_relative_files(base: &Path, dir: &Path, out: &mut Vec<String>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_relative_files(base, &path, out);
+            } else if let Ok(rel) = path.strip_prefix(base) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
 }
 
 fn is_safe_relative_path(rel: &str) -> bool {

@@ -1,4 +1,4 @@
-//! Uncompressed Direct PE Overlay Engine
+//! Direct PE Overlay Engine (per-file compressed payloads since v4)
 //! Appends raw sector-aligned file payloads directly to the host PE executable overlay.
 //! Provides maximum sustained NVMe throughput with 0 heap allocation in write loops.
 
@@ -84,6 +84,18 @@ impl OverlayManifestHeader {
 impl FileRecordHeader {
     pub fn relative_path(&self) -> String {
         fixed_str(&self.relative_path_utf8)
+    }
+
+    /// Compression codec of the stored payload (manifest v4+; the first
+    /// reserved byte). Packages written before v4 always carry 0
+    /// ([`crate::codec::CODEC_STORED`]), so the same accessor is correct
+    /// for every readable package.
+    pub fn compression(&self) -> u8 {
+        self.reserved[0]
+    }
+
+    pub fn set_compression(&mut self, codec: u8) {
+        self.reserved[0] = codec;
     }
 }
 
@@ -178,7 +190,7 @@ impl OverlayWriter {
     }
 
     /// Like [`OverlayWriter::build_from_folder`], but records explicit
-    /// install-time `options` in the package (manifest version 3) instead of
+    /// install-time `options` in the package (options block, since manifest version 3) instead of
     /// the per-app defaults.
     #[allow(clippy::too_many_arguments)]
     pub fn build_from_folder_with_options(
@@ -250,7 +262,7 @@ impl OverlayWriter {
 
         let mut manifest = OverlayManifestHeader {
             magic: *OVERLAY_MAGIC,
-            version: 3,
+            version: 4,
             file_count: files.len() as u32,
             primary_exe_index: 0,
             total_uncompressed_bytes: 0,
@@ -272,11 +284,18 @@ impl OverlayWriter {
 
         let mut record_headers = Vec::with_capacity(files.len());
         let mut total_bytes: u64 = 0;
+        // Stored payloads, in record order. Payloads are compressed per
+        // file (manifest v4), so each file is buffered once at pack time;
+        // `file_size` in the record stays the ORIGINAL size and the stored
+        // length is recoverable from the next record's offset (payloads
+        // are laid out contiguously, as they always have been).
+        let mut stored_payloads: Vec<Vec<u8>> = Vec::with_capacity(files.len());
 
         for (idx, (abs_path, rel_path, is_primary)) in files.iter().enumerate() {
-            let metadata = std::fs::metadata(abs_path)?;
-            let file_size = metadata.len();
+            let raw = std::fs::read(abs_path)?;
+            let file_size = raw.len() as u64;
             total_bytes += file_size;
+            let (codec, stored) = crate::codec::compress_best(&raw);
 
             let mut header = FileRecordHeader {
                 file_size,
@@ -285,6 +304,7 @@ impl OverlayWriter {
                 is_executable: if *is_primary { 1 } else { 0 },
                 ..Default::default()
             };
+            header.set_compression(codec);
 
             copy_str_to_fixed(&mut header.relative_path_utf8, rel_path);
             if *is_primary {
@@ -292,7 +312,8 @@ impl OverlayWriter {
             }
 
             record_headers.push(header);
-            current_payload_offset += file_size;
+            current_payload_offset += stored.len() as u64;
+            stored_payloads.push(stored);
         }
 
         manifest.total_uncompressed_bytes = total_bytes;
@@ -326,17 +347,9 @@ impl OverlayWriter {
         };
         out_file.write_all(options_bytes)?;
 
-        // Stream raw files directly to disk (Fixed 64KB stack buffer, zero-allocation)
-        let mut buffer = [0u8; BUFFER_SIZE];
-        for (abs_path, _, _) in files {
-            let mut src = File::open(abs_path)?;
-            loop {
-                let n = src.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                out_file.write_all(&buffer[..n])?;
-            }
+        // Write the stored (possibly compressed) payloads in record order.
+        for stored in &stored_payloads {
+            out_file.write_all(stored)?;
         }
 
         out_file.flush()?;
@@ -442,12 +455,58 @@ impl OverlayReader {
         Ok(Some((manifest, records, options)))
     }
 
+    /// The stored (on-disk) length of `records[index]`'s payload.
+    /// Payloads are laid out contiguously in record order in every format
+    /// version, so a payload runs to the next payload's offset — or to
+    /// the end of the stream for the last one. For uncompressed records
+    /// this equals `file_size`; for v4 compressed records it is the
+    /// compressed size.
+    pub fn stored_len(records: &[FileRecordHeader], index: usize, stream_len: u64) -> u64 {
+        let start = records[index].payload_offset;
+        let mut end = stream_len;
+        for record in records {
+            if record.payload_offset > start {
+                end = end.min(record.payload_offset);
+            }
+        }
+        end.saturating_sub(start)
+    }
+
+    /// Reads and decompresses one record's payload, returning the
+    /// original file bytes (exactly `record.file_size` of them).
+    pub fn read_payload<R: Read + Seek>(
+        reader: &mut R,
+        records: &[FileRecordHeader],
+        index: usize,
+        stream_len: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        let record = &records[index];
+        let stored_len = Self::stored_len(records, index, stream_len);
+        reader.seek(SeekFrom::Start(record.payload_offset))?;
+        let mut stored = vec![0u8; stored_len as usize];
+        reader.read_exact(&mut stored)?;
+        crate::codec::decompress(record.compression(), &stored, record.file_size as usize)
+    }
+
     /// Extracts every file recorded in the overlay into `dest_dir`, creating
     /// subdirectories as needed and returning the paths written, in record
     /// order. Record paths are validated before anything is written for that
     /// record: absolute paths and `..` traversal are rejected, so a crafted
     /// overlay cannot write outside `dest_dir`.
     pub fn extract<R: Read + Seek>(reader: R, dest_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        Self::extract_with_control(reader, dest_dir, &mut ExtractControl::default())
+    }
+
+    /// Like [`OverlayReader::extract`], with per-file progress and
+    /// cancellation: `control.on_file` runs before each file is written,
+    /// and a set `control.cancel` flag aborts the extraction between
+    /// files with an `Interrupted` error (files already written stay
+    /// written — callers roll back).
+    pub fn extract_with_control<R: Read + Seek>(
+        reader: R,
+        dest_dir: &Path,
+        control: &mut ExtractControl<'_>,
+    ) -> std::io::Result<Vec<PathBuf>> {
         let mut reader = reader;
         let (_manifest, records) = Self::read_manifest(&mut reader)?.ok_or_else(|| {
             std::io::Error::new(
@@ -455,32 +514,29 @@ impl OverlayReader {
                 "no SeanPak overlay found in this file",
             )
         })?;
+        let stream_len = reader.seek(SeekFrom::End(0))?;
 
         std::fs::create_dir_all(dest_dir)?;
         let mut written = Vec::with_capacity(records.len());
-        for record in &records {
+        for (idx, record) in records.iter().enumerate() {
+            if let Some(cancel) = control.cancel {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "extraction cancelled",
+                    ));
+                }
+            }
             let rel = record.relative_path();
+            if let Some(on_file) = control.on_file.as_deref_mut() {
+                on_file(idx, records.len(), &rel);
+            }
             let target = safe_join(dest_dir, &rel)?;
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            reader.seek(SeekFrom::Start(record.payload_offset))?;
-            let mut out = File::create(&target)?;
-            let mut remaining = record.file_size;
-            let mut buffer = [0u8; BUFFER_SIZE];
-            while remaining > 0 {
-                let want = remaining.min(BUFFER_SIZE as u64) as usize;
-                let n = reader.read(&mut buffer[..want])?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!("overlay payload truncated for {rel}"),
-                    ));
-                }
-                out.write_all(&buffer[..n])?;
-                remaining -= n as u64;
-            }
-            out.flush()?;
+            let bytes = Self::read_payload(&mut reader, &records, idx, stream_len)?;
+            std::fs::write(&target, &bytes)?;
             written.push(target);
         }
         Ok(written)
@@ -491,6 +547,18 @@ impl OverlayReader {
         let file = File::open(packed_path)?;
         Self::extract(file, dest_dir)
     }
+}
+
+/// Per-file progress callback for extraction: `(index, total, path)`.
+pub type OnExtractFile<'a> = dyn FnMut(usize, usize, &str) + 'a;
+
+/// Progress + cancellation hooks for [`OverlayReader::extract_with_control`].
+#[derive(Default)]
+pub struct ExtractControl<'a> {
+    /// Called as `(index, total, relative_path)` before each file lands.
+    pub on_file: Option<&'a mut OnExtractFile<'a>>,
+    /// When this flag is set, extraction aborts between files.
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// Joins a stored relative path onto `dest_dir`, rejecting anything that
@@ -728,7 +796,7 @@ mod tests {
         let (manifest, records, read_back) = OverlayReader::read_package(file)
             .unwrap()
             .expect("new overlay must be discoverable");
-        assert_eq!(manifest.version, 3);
+        assert_eq!(manifest.version, 4);
         assert_eq!(manifest.app_name(), "Opt App");
         assert_eq!(records.len(), 1);
         assert_eq!(read_back.install_location(), "C:\\Apps\\Opt App");
@@ -792,6 +860,48 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(!root.join("evil.txt").exists());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v4_packages_compress_and_round_trip() {
+        let root = unique_temp("v4compress");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut payload = Vec::new();
+        for i in 0..50_000u32 {
+            payload.extend_from_slice(format!("line {i} of a very repetitive file\n").as_bytes());
+            if payload.len() > 200_000 {
+                break;
+            }
+        }
+        std::fs::write(src.join("big.txt"), &payload).unwrap();
+        std::fs::write(src.join("tiny.bin"), b"\x01\x02\x03").unwrap();
+        let stub = root.join("stub.exe");
+        std::fs::write(&stub, vec![0xAAu8; 5000]).unwrap();
+        let out = root.join("Setup.exe");
+
+        OverlayWriter::build_from_folder(&stub, &out, &src, "Zip App", "1.0.0", "Tester").unwrap();
+        let file = File::open(&out).unwrap();
+        let (manifest, records) = OverlayReader::read_manifest(file).unwrap().unwrap();
+        assert_eq!(manifest.version, 4);
+        let big = records
+            .iter()
+            .find(|r| r.relative_path() == "big.txt")
+            .unwrap();
+        assert_ne!(big.compression(), crate::codec::CODEC_STORED);
+        assert_eq!(big.file_size, payload.len() as u64);
+        // The whole package is smaller than stub + raw payloads would be.
+        let package_len = std::fs::metadata(&out).unwrap().len();
+        assert!(package_len < 8192 + payload.len() as u64);
+
+        let dest = root.join("extracted");
+        OverlayReader::extract_file(&out, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("big.txt")).unwrap(), payload);
+        assert_eq!(
+            std::fs::read(dest.join("tiny.bin")).unwrap(),
+            b"\x01\x02\x03"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

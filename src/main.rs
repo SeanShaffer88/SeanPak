@@ -78,9 +78,13 @@ fn print_usage() {
          \x20                                      Build the release set from a JSON manifest:\n\
          \x20                                      <App>-v<ver>-x64-Setup.exe + -Portable.zip\n\
          \x20                                      + SHA256SUMS.txt, named from the manifest\n\
-         \x20 seanpak.exe verify <Setup.exe> [--json]\n\
+         \x20 seanpak.exe verify <Setup.exe> [--sandbox] [--json]\n\
          \x20                                      Prove a built installer: overlay readable,\n\
-         \x20                                      embedded manifest sane, payloads present\n\
+         \x20                                      embedded manifest sane, payloads present.\n\
+         \x20                                      --sandbox goes further: silent-install into\n\
+         \x20                                      a fresh temp dir, compare every file\n\
+         \x20                                      byte-for-byte, silent-uninstall, assert no\n\
+         \x20                                      install residue remains\n\
          \x20 seanpak.exe schema                   Print the JSON Schema for the app manifest\n\
          \x20 seanpak.exe validate <manifest.json> [--json]\n\
          \x20                                      Check a manifest before packing with it\n\
@@ -95,15 +99,23 @@ fn print_usage() {
          \x20 seanpak.exe --extract <packed.exe> --to <dir> [--json]\n\
          \x20                                      Extract a SeanPak overlay to a directory\n\
          \x20 seanpak.exe --install [--to <dir>] [--dry-run] [--json] [--silent|--headless]\n\
+         \x20                                      [--repair] [--force]\n\
          \x20                                      Install this executable's own overlay: the\n\
          \x20                                      same operation the wizard's Install button\n\
          \x20                                      runs (extract + Uninstall.exe + uninstall\n\
-         \x20                                      entry, rolled back on failure). Default\n\
-         \x20                                      destination: a folder named after the app,\n\
-         \x20                                      next to the executable\n\
+         \x20                                      entry + the manifest's shortcuts, file\n\
+         \x20                                      associations and PATH entry, all journaled\n\
+         \x20                                      for uninstall, rolled back on failure). An\n\
+         \x20                                      existing install is detected: same version\n\
+         \x20                                      repairs with --repair, a newer version makes\n\
+         \x20                                      downgrade refused unless --force, an older\n\
+         \x20                                      one upgrades in place. Default destination:\n\
+         \x20                                      a folder named after the app, next to the exe\n\
          \x20 seanpak.exe --uninstall [--to <dir>] [--json]\n\
          \x20                                      Remove an installed app: deletes its payload\n\
-         \x20                                      files and its uninstall entry\n\
+         \x20                                      files, its uninstall entry, the journaled\n\
+         \x20                                      shortcuts/associations/PATH segment recorded\n\
+         \x20                                      in seanpak-receipt.json, and the receipt\n\
          \x20 seanpak.exe --help                   This help\n\
          \x20 seanpak.exe --version                Print version\n\
          \n\
@@ -222,7 +234,7 @@ fn run_install(args: &[String]) -> i32 {
             )
         }
     };
-    let (manifest, records, _options) = match install::read_own_package(&exe) {
+    let (manifest, records, options) = match install::read_own_package(&exe) {
         Ok(pkg) => pkg,
         Err(e) => return fail(args, "install", EXIT_BAD_MANIFEST, &e),
     };
@@ -235,7 +247,7 @@ fn run_install(args: &[String]) -> i32 {
                 .unwrap_or_else(|| PathBuf::from(sanitize_folder_name(&app)))
         }
     };
-    let plan = install::plan_install(&manifest, &records, &dest);
+    let plan = install::plan_install(&manifest, &records, &options, &dest);
 
     if has_flag(args, &["--dry-run"]) {
         diag::record(
@@ -253,6 +265,14 @@ fn run_install(args: &[String]) -> i32 {
                 ("status", jstr("dry-run")),
                 ("app", jstr(plan.app_name.clone())),
                 ("version", jstr(plan.app_version.clone())),
+                ("mode", jstr(plan.mode.clone())),
+                (
+                    "previousVersion",
+                    plan.previous_version
+                        .clone()
+                        .map(jstr)
+                        .unwrap_or(JsonValue::Null),
+                ),
                 ("dest", jpath(&plan.dest)),
                 (
                     "files",
@@ -268,25 +288,52 @@ fn run_install(args: &[String]) -> i32 {
                 ("totalBytes", jnum(plan.total_bytes)),
                 ("uninstaller", jpath(&plan.uninstaller_path)),
                 ("arpKey", jstr(plan.arp_key.clone())),
+                (
+                    "shortcuts",
+                    JsonValue::Array(plan.shortcuts.iter().map(|s| jstr(s.clone())).collect()),
+                ),
+                (
+                    "associations",
+                    JsonValue::Array(plan.associations.iter().map(|s| jstr(s.clone())).collect()),
+                ),
+                ("pathEntry", JsonValue::Bool(plan.path_entry)),
                 ("changes", JsonValue::Bool(false)),
             ]));
         } else {
             println!(
-                "Dry run: would install {} {} to {}",
+                "Dry run: would {} {} {} to {}",
+                plan.mode,
                 plan.app_name,
                 plan.app_version,
                 plan.dest.display()
             );
+            if let Some(prev) = &plan.previous_version {
+                println!("  (version {prev} is installed there now)");
+            }
             for (rel, size) in &plan.files {
                 println!("  {rel} ({size} bytes)");
             }
             println!("  + Uninstall.exe and uninstall entry {}", plan.arp_key);
+            for link in &plan.shortcuts {
+                println!("  + shortcut {link}");
+            }
+            for ext in &plan.associations {
+                println!("  + file association .{ext}");
+            }
+            if plan.path_entry {
+                println!("  + PATH entry for the install folder");
+            }
             println!("Nothing was changed.");
         }
         return EXIT_OK;
     }
 
-    match install::perform_install(&exe, &dest) {
+    let request = install::InstallRequest {
+        options_override: None,
+        force: has_flag(args, &["--force"]),
+        repair: has_flag(args, &["--repair"]),
+    };
+    match install::perform_install_with(&exe, &dest, &request, None, None) {
         Ok(outcome) => {
             diag::record(
                 "install",
@@ -296,6 +343,7 @@ fn run_install(args: &[String]) -> i32 {
                     ("dest", jpath(&outcome.dest)),
                     ("files", jnum(outcome.files_written as u64)),
                     ("arpWritten", JsonValue::Bool(outcome.arp_written)),
+                    ("installMode", jstr(outcome.mode.clone())),
                 ],
             );
             if json_mode(args) {
@@ -304,9 +352,26 @@ fn run_install(args: &[String]) -> i32 {
                     ("status", jstr("ok")),
                     ("app", jstr(plan.app_name.clone())),
                     ("version", jstr(plan.app_version.clone())),
+                    ("installMode", jstr(outcome.mode.clone())),
+                    (
+                        "previousVersion",
+                        outcome
+                            .previous_version
+                            .clone()
+                            .map(jstr)
+                            .unwrap_or(JsonValue::Null),
+                    ),
                     ("dest", jpath(&outcome.dest)),
                     ("installed", jnum(outcome.files_written as u64)),
+                    ("restoredFiles", jnum(outcome.restored_files as u64)),
                     ("arpWritten", JsonValue::Bool(outcome.arp_written)),
+                    ("receipt", jpath(&outcome.receipt_path)),
+                    ("shortcutsCreated", jnum(outcome.shortcuts_created as u64)),
+                    (
+                        "associationsApplied",
+                        jnum(outcome.associations_applied as u64),
+                    ),
+                    ("pathEntryAdded", JsonValue::Bool(outcome.path_entry_added)),
                 ]));
             } else if !quiet_mode(args) {
                 println!(
@@ -319,6 +384,7 @@ fn run_install(args: &[String]) -> i32 {
                         "not applicable on this platform"
                     }
                 );
+                println!("Receipt: {}", outcome.receipt_path.display());
             }
             EXIT_OK
         }
@@ -365,6 +431,11 @@ fn run_uninstall(args: &[String]) -> i32 {
         None => seanpak::wizard::default_install_dir(&options, &manifest.app_name()),
     };
 
+    // The install receipt is the journal of system artifacts (shortcuts,
+    // associations, PATH segment) this install applied; read it before
+    // anything is deleted so uninstall can remove exactly those.
+    let receipt = seanpak::receipt::read_receipt(&dest);
+
     let mut removed: Vec<String> = Vec::new();
     let mut subdirs: Vec<PathBuf> = Vec::new();
     for record in &records {
@@ -393,6 +464,15 @@ fn run_uninstall(args: &[String]) -> i32 {
     for dir in &subdirs {
         let _ = std::fs::remove_dir(dir); // only succeeds when empty
     }
+    // Remove the journaled system artifacts and the receipt itself.
+    let mut artifacts_removed = 0usize;
+    if let Some(receipt) = &receipt {
+        artifacts_removed = receipt.artifacts.shortcuts.len()
+            + receipt.artifacts.associations.len()
+            + receipt.artifacts.path_segment_added.is_some() as usize;
+        seanpak::sysinstall::remove_artifacts(&receipt.artifacts);
+    }
+    let receipt_removed = std::fs::remove_file(seanpak::receipt::receipt_path(&dest)).is_ok();
     seanpak::wizard::delete_uninstall_entry(&manifest.app_name());
     diag::record(
         "uninstall",
@@ -400,6 +480,7 @@ fn run_uninstall(args: &[String]) -> i32 {
             ("app", jstr(manifest.app_name())),
             ("from", jpath(&dest)),
             ("removed", jnum(removed.len() as u64)),
+            ("artifactsRemoved", jnum(artifacts_removed as u64)),
         ],
     );
     let self_copy_note = exe.starts_with(&dest);
@@ -412,6 +493,8 @@ fn run_uninstall(args: &[String]) -> i32 {
                 "removed",
                 JsonValue::Array(removed.iter().map(|r| jstr(r.clone())).collect()),
             ),
+            ("artifactsRemoved", jnum(artifacts_removed as u64)),
+            ("receiptRemoved", JsonValue::Bool(receipt_removed)),
             ("from", jpath(&dest)),
             ("selfCopyLeftBehind", JsonValue::Bool(self_copy_note)),
         ]));
@@ -994,10 +1077,13 @@ fn run_verify(args: &[String]) -> i32 {
                 args,
                 "verify",
                 EXIT_USAGE,
-                "usage: seanpak verify <Setup.exe> [--json]",
+                "usage: seanpak verify <Setup.exe> [--sandbox] [--json]",
             )
         }
     };
+    if has_flag(args, &["--sandbox"]) {
+        return run_verify_sandbox(args, &path);
+    }
     let report = match seanpak::pack::verify_package(&path) {
         Ok(r) => r,
         Err(e) => {
@@ -1080,6 +1166,86 @@ fn run_verify(args: &[String]) -> i32 {
         EXIT_OK
     } else {
         EXIT_BAD_MANIFEST
+    }
+}
+
+/// `verify --sandbox`: the end-to-end proof — silent install into a
+/// temp dir, byte-for-byte file comparison, silent uninstall, residue
+/// check (see `pack::sandbox_verify`).
+fn run_verify_sandbox(args: &[String], path: &Path) -> i32 {
+    let report = match seanpak::pack::sandbox_verify(path) {
+        Ok(r) => r,
+        Err(e) => {
+            return fail(
+                args,
+                "verify",
+                EXIT_IO,
+                &format!("Cannot sandbox-verify {}: {e}", path.display()),
+            )
+        }
+    };
+    diag::record(
+        "verify-sandbox",
+        vec![
+            ("path", jpath(path)),
+            ("ok", JsonValue::Bool(report.ok)),
+            (
+                "leftovers",
+                JsonValue::Array(report.leftovers.iter().map(|l| jstr(l.clone())).collect()),
+            ),
+        ],
+    );
+    if json_mode(args) {
+        print_json(&jobj(vec![
+            ("command", jstr("verify")),
+            ("sandbox", JsonValue::Bool(true)),
+            ("status", jstr(if report.ok { "ok" } else { "failed" })),
+            ("path", jpath(path)),
+            ("installDir", jpath(&report.install_dir)),
+            (
+                "checks",
+                JsonValue::Array(
+                    report
+                        .checks
+                        .iter()
+                        .map(|(name, passed, detail)| {
+                            jobj(vec![
+                                ("name", jstr(name.clone())),
+                                ("passed", JsonValue::Bool(*passed)),
+                                ("detail", jstr(detail.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "leftovers",
+                JsonValue::Array(report.leftovers.iter().map(|l| jstr(l.clone())).collect()),
+            ),
+        ]));
+    } else {
+        println!(
+            "Sandbox verify {}: {}",
+            path.display(),
+            if report.ok { "PASS" } else { "FAIL" }
+        );
+        for (name, passed, detail) in &report.checks {
+            println!(
+                "  [{}] {name}: {detail}",
+                if *passed { "ok" } else { "FAIL" }
+            );
+        }
+        if !report.leftovers.is_empty() {
+            println!(
+                "  Leftovers after uninstall: {}",
+                report.leftovers.join(", ")
+            );
+        }
+    }
+    if report.ok {
+        EXIT_OK
+    } else {
+        EXIT_INSTALL
     }
 }
 

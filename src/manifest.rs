@@ -54,7 +54,7 @@ pub const MANIFEST_SCHEMA_JSON: &str = r##"{
     "desktopShortcut": {
       "type": "boolean",
       "default": true,
-      "description": "Recorded install option: create a desktop shortcut (applied by a later SeanPak slice; shown in the wizard today)."
+      "description": "Install option: create a desktop shortcut at install time (journaled; removed by uninstall)."
     },
     "startMenuShortcut": {
       "type": "boolean",
@@ -65,12 +65,12 @@ pub const MANIFEST_SCHEMA_JSON: &str = r##"{
       "type": "array",
       "items": { "type": "string" },
       "default": [],
-      "description": "File extensions to associate (with or without a leading dot, for example \".txt\" or \"md\"). Recorded and shown in the wizard; registration is applied by a later slice."
+      "description": "File extensions to associate with the app (with or without a leading dot, for example \".txt\" or \"md\"). Registered per-user (HKCU) at install time and removed by uninstall only while the association still points at this app."
     },
     "pathEntry": {
       "type": "boolean",
       "default": false,
-      "description": "Recorded install option: add the install folder to PATH (applied by a later slice)."
+      "description": "Install option: add the install folder to the per-user PATH at install time (appended only if absent; uninstall removes exactly that segment)."
     },
     "files": {
       "type": "array",

@@ -1,4 +1,5 @@
 pub mod backends;
+pub mod codec;
 pub mod diag;
 pub mod hash;
 pub mod install;
@@ -6,9 +7,11 @@ pub mod manifest;
 pub mod native_dialog;
 pub mod overlay;
 pub mod pack;
+pub mod receipt;
 pub mod restart_manager;
 pub mod rollback;
 pub mod scanner;
+pub mod sysinstall;
 pub mod win32_ui;
 pub mod wizard;
 
