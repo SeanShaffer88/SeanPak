@@ -30,7 +30,7 @@ Five optional manifest blocks for installers that need more than the
 basics. All five live in the shared install operation, so the wizard,
 the CLI, and the sandbox proof all see the same behavior; `schema` and
 `validate` cover them, and the Builder studio's manifest pane edits
-them through its Power blocks JSON editor (the same encoding).
+them through its Advanced options (JSON) editor (the same encoding).
 
 - **`components`** — optional parts of the package:
   `[{id, name, description?, files, required?, defaultSelected?}]`.
