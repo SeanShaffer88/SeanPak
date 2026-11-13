@@ -6179,7 +6179,7 @@ mod imp {
                     std::ptr::null_mut(),
                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
                 );
-                0
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CTLCOLORSTATIC => {
                 let hdc = wparam as HDC;
