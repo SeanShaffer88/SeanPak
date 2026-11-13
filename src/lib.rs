@@ -18,6 +18,7 @@ pub mod rollback;
 pub mod scanner;
 pub mod studio;
 pub mod sysinstall;
+pub mod theme;
 pub mod uninstall;
 pub mod wizard;
 pub mod writes;

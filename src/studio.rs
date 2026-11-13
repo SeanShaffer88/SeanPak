@@ -824,7 +824,9 @@ mod imp {
     use windows_sys::Win32::Foundation::*;
     use windows_sys::Win32::Graphics::Gdi::*;
     use windows_sys::Win32::UI::Controls::*;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetKeyState, SetFocus};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        EnableWindow, GetKeyState, IsWindowEnabled, SetFocus,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     use super::{
@@ -836,14 +838,9 @@ mod imp {
     use crate::pack::{PackError, PackOutcome};
     use crate::scanner::format_bytes;
 
-    // TesselGUI rev2 GitHub Dark palette (COLORREF is 0x00BBGGRR).
-    const COLOR_BG: u32 = 0x0017_110D; // #0D1117
-    const COLOR_SURFACE: u32 = 0x001D_1612; // #12161D
-    const COLOR_FG: u32 = 0x00FC_F6F0; // #F0F6FC
-    const COLOR_MUTED: u32 = 0x00A1_9891; // #9198A1
-    const COLOR_GREEN: u32 = 0x0037_7F1A; // #1A7F37
-    const COLOR_GREEN_DARK: u32 = 0x002D_5314; // #14532D (pressed state)
-    const COLOR_DANGER: u32 = 0x0049_51F8; // #F85149
+    // Colors come from the shared TesselGUI 1.4.0 theme module —
+    // this window keeps no private palette.
+    use crate::theme;
 
     // Controls.
     const ID_LIST: usize = 100;
@@ -876,6 +873,7 @@ mod imp {
     const ID_LBL_OUTPUT_HDR: usize = 162;
     const ID_LBL_FACTS: usize = 163;
     const ID_LBL_PACKAGE_HDR: usize = 165;
+    const ID_FOOTER_SEP: usize = 166;
     // IDE layout (Design H): toolbar strip, left files pane, center
     // totals line, and the install-options fields in the manifest pane.
     const ID_BTN_TB_OPEN: usize = 180;
@@ -899,6 +897,18 @@ mod imp {
     const ID_LBL_POWER: usize = 200;
     // Field labels inside the manifest panel (colored as one group).
     const PANEL_LABELS: [usize; 9] = [170, 171, 172, 173, 174, 175, 176, 177, 178];
+    // Every checkbox in the window (all owner-drawn; a click toggles
+    // the stored check state — see WM_COMMAND).
+    const CHECKBOX_IDS: [usize; 8] = [
+        ID_CHK_DESKTOP,
+        ID_CHK_STARTMENU,
+        ID_CHK_PATH,
+        ID_CHK_LAUNCH_OFFER,
+        ID_CHK_LAUNCH_DEFAULT,
+        ID_CHK_LOGIN_OFFER,
+        ID_CHK_LOGIN_DEFAULT,
+        ID_CHK_SANDBOX,
+    ];
 
     // Menus.
     const IDM_FILE_OPEN: usize = 9001;
@@ -927,8 +937,11 @@ mod imp {
     const TTS_ALWAYSTIP_STYLE: u32 = 0x01;
     const TTF_IDISHWND_FLAG: u32 = 0x0001;
     const TTF_SUBCLASS_FLAG: u32 = 0x0010;
-    const BS_AUTOCHECKBOX: u32 = 0x0003;
     const BS_OWNERDRAW: u32 = 0x000B;
+    // BN_CLICKED (the notification owner-drawn checkboxes toggle on)
+    // and ODT_HEADER (the DRAWITEMSTRUCT CtlType of header cells).
+    const BN_CLICKED_CODE: usize = 0;
+    const ODT_HEADER_CTL: u32 = 100;
     const ES_AUTOHSCROLL: u32 = 0x0080;
     const ES_MULTILINE: u32 = 0x0004;
     const ES_READONLY: u32 = 0x0800;
@@ -1011,10 +1024,6 @@ mod imp {
     }
 
     static STATE: Mutex<Option<StudioState>> = Mutex::new(None);
-    static mut BG_BRUSH: HBRUSH = std::ptr::null_mut();
-    static mut SURFACE_BRUSH: HBRUSH = std::ptr::null_mut();
-    static mut GREEN_BRUSH: HBRUSH = std::ptr::null_mut();
-    static mut GREEN_DARK_BRUSH: HBRUSH = std::ptr::null_mut();
     static mut BODY_FONT: HFONT = std::ptr::null_mut();
     static mut HEADER_FONT: HFONT = std::ptr::null_mut();
 
@@ -1097,11 +1106,6 @@ mod imp {
                 windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
             let class_name: Vec<u16> = "SeanPakStudioWindowClass\0".encode_utf16().collect();
 
-            BG_BRUSH = CreateSolidBrush(COLOR_BG);
-            SURFACE_BRUSH = CreateSolidBrush(COLOR_SURFACE);
-            GREEN_BRUSH = CreateSolidBrush(COLOR_GREEN);
-            GREEN_DARK_BRUSH = CreateSolidBrush(COLOR_GREEN_DARK);
-
             let icon = LoadIconW(instance, 1 as _);
             let icon = if icon.is_null() {
                 LoadIconW(std::ptr::null_mut(), IDI_APPLICATION)
@@ -1117,7 +1121,7 @@ mod imp {
                 hInstance: instance,
                 hIcon: icon,
                 hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-                hbrBackground: BG_BRUSH,
+                hbrBackground: theme::brush(theme::BACKGROUND),
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: class_name.as_ptr(),
                 hIconSm: icon,
@@ -1402,31 +1406,31 @@ mod imp {
         mk(
             &button_class,
             "Open…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TB_OPEN,
         );
         mk(
             &button_class,
             "Save",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TB_SAVE,
         );
         mk(
             &button_class,
             "Save As…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TB_SAVEAS,
         );
         mk(
             &button_class,
             "Add files…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TB_ADDFILES,
         );
         mk(
             &button_class,
             "Validate",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TB_VALIDATE,
         );
         mk(&static_class, "", SS_RIGHT, ID_LBL_APPVER);
@@ -1452,9 +1456,9 @@ mod imp {
             (LVS_EX_FULLROWSELECT) as WPARAM,
             (LVS_EX_FULLROWSELECT) as LPARAM,
         );
-        SendMessageW(tree, LVM_SETBKCOLOR, 0, COLOR_SURFACE as LPARAM);
-        SendMessageW(tree, LVM_SETTEXTBKCOLOR, 0, COLOR_SURFACE as LPARAM);
-        SendMessageW(tree, LVM_SETTEXTCOLOR, 0, COLOR_FG as LPARAM);
+        SendMessageW(tree, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
+        SendMessageW(tree, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
+        SendMessageW(tree, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
         {
             let mut wide: Vec<u16> = "Name".encode_utf16().chain(std::iter::once(0)).collect();
             let col = LVCOLUMNW {
@@ -1480,15 +1484,18 @@ mod imp {
             WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS,
             ID_LIST,
         );
+        // No LVS_EX_GRIDLINES: the native gridline color is a fixed
+        // light system color. The theme's custom draw (WM_NOTIFY)
+        // paints selection and gridlines in token colors instead.
         SendMessageW(
             list,
             LVM_SETEXTENDEDLISTVIEWSTYLE,
-            (LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT) as WPARAM,
-            (LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT) as LPARAM,
+            (LVS_EX_FULLROWSELECT) as WPARAM,
+            (LVS_EX_FULLROWSELECT) as LPARAM,
         );
-        SendMessageW(list, LVM_SETBKCOLOR, 0, COLOR_SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, COLOR_SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTCOLOR, 0, COLOR_FG as LPARAM);
+        SendMessageW(list, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
+        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
+        SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
         for (idx, (title, _width)) in [
             ("File", 380),
             ("Destination", 180),
@@ -1514,22 +1521,25 @@ mod imp {
             };
             SendMessageW(list, LVM_INSERTCOLUMNW, idx, &col as *const _ as LPARAM);
         }
+        // The header renders owner-drawn in theme colors (the native
+        // header cannot be recolored and stayed white).
+        theme::make_header_owner_draw(list);
         mk(
             &button_class,
             "Add files…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_ADD_FILES,
         );
         mk(
             &button_class,
             "Add folder…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_ADD_FOLDER,
         );
         mk(
             &button_class,
             "Remove",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_REMOVE,
         );
         // Totals / selection line under the center table.
@@ -1558,19 +1568,19 @@ mod imp {
         mk(
             &button_class,
             "Desktop shortcut",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_DESKTOP,
         );
         mk(
             &button_class,
             "Start Menu",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_STARTMENU,
         );
         mk(
             &button_class,
             "Add install folder to PATH",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_PATH,
         );
         // The 4.4.0 install options: each offer is a pair — offer the
@@ -1579,26 +1589,26 @@ mod imp {
         mk(
             &button_class,
             "Offer",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_LAUNCH_OFFER,
         );
         mk(
             &button_class,
             "On by default",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_LAUNCH_DEFAULT,
         );
         mk(&static_class, "Start at login", 0, ID_LBL_LOGIN);
         mk(
             &button_class,
             "Offer",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_LOGIN_OFFER,
         );
         mk(
             &button_class,
             "On by default",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_LOGIN_DEFAULT,
         );
         mk(&static_class, "Data folders", 0, ID_LBL_DATADIRS);
@@ -1628,7 +1638,7 @@ mod imp {
         mk(
             &button_class,
             "…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_FILES_DIR,
         );
         mk(&static_class, "Output folder", 0, PANEL_LABELS[8]);
@@ -1641,7 +1651,7 @@ mod imp {
         mk(
             &button_class,
             "…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_OUT_DIR,
         );
 
@@ -1650,19 +1660,19 @@ mod imp {
         mk(
             &button_class,
             "Validate",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_VALIDATE,
         );
         mk(
             &button_class,
             "Verify",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_VERIFY,
         );
         mk(
             &button_class,
             "Sandbox",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_CHK_SANDBOX,
         );
         mk(
@@ -1673,12 +1683,13 @@ mod imp {
         );
         mk(&static_class, "", 0, ID_LBL_FACTS);
 
-        // Footer.
+        // Footer: a 1px edge separator above the status line.
+        mk(&static_class, "", 0, ID_FOOTER_SEP);
         mk(&static_class, "Ready", 0, ID_LBL_STATUS);
         mk(
             &button_class,
             "Test install",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             ID_BTN_TEST,
         );
         mk(
@@ -2003,80 +2014,101 @@ mod imp {
         mv(hwnd, ID_LBL_DATADIRS, px, row_y + s(2), label_w, s(20));
         mv(hwnd, ID_EDT_DATA_DIRS, edit_x, row_y, edit_w, s(25));
         row_y += s(31);
+        // The manifest pane runs down to the footer — the output
+        // strip occupies only the left/center columns — so the
+        // PACKAGE cluster anchors to the pane's bottom and the Power
+        // blocks editor flexes in the space between. Before this the
+        // pane flowed top-down into the strip's rows at ordinary
+        // window sizes, and the cluster collided with the strip's
+        // buttons and the facts text.
+        let pane_bottom = footer_top - s(8);
+        let cluster_h = s(23) + s(29) + s(29);
+        let cluster_top = pane_bottom - cluster_h;
+        let power_h = (cluster_top - s(6) - row_y).clamp(s(36), s(120));
         mv(hwnd, ID_LBL_POWER, px, row_y + s(2), label_w, s(20));
-        mv(hwnd, ID_EDT_POWER, edit_x, row_y, edit_w, s(84));
-        row_y += s(90);
-        mv(hwnd, ID_LBL_PACKAGE_HDR, px, row_y, panel_w, s(20));
-        row_y += s(23);
+        mv(hwnd, ID_EDT_POWER, edit_x, row_y, edit_w, power_h);
+        mv(hwnd, ID_LBL_PACKAGE_HDR, px, cluster_top, panel_w, s(20));
         // Files folder row (+ browse button).
-        mv(hwnd, PANEL_LABELS[7], px, row_y + s(2), label_w, s(20));
-        mv(hwnd, ID_EDT_FILES_DIR, edit_x, row_y, edit_w - s(36), s(25));
+        let files_y = cluster_top + s(23);
+        mv(hwnd, PANEL_LABELS[7], px, files_y + s(2), label_w, s(20));
+        mv(
+            hwnd,
+            ID_EDT_FILES_DIR,
+            edit_x,
+            files_y,
+            edit_w - s(36),
+            s(25),
+        );
         mv(
             hwnd,
             ID_BTN_FILES_DIR,
             edit_x + edit_w - s(30),
-            row_y,
+            files_y,
             s(30),
             s(25),
         );
-        row_y += s(29);
-        mv(hwnd, PANEL_LABELS[8], px, row_y + s(2), label_w, s(20));
-        mv(hwnd, ID_EDT_OUT_DIR, edit_x, row_y, edit_w - s(36), s(25));
+        // Output folder row (+ browse button).
+        let out_y = files_y + s(29);
+        mv(hwnd, PANEL_LABELS[8], px, out_y + s(2), label_w, s(20));
+        mv(hwnd, ID_EDT_OUT_DIR, edit_x, out_y, edit_w - s(36), s(25));
         mv(
             hwnd,
             ID_BTN_OUT_DIR,
             edit_x + edit_w - s(30),
-            row_y,
+            out_y,
             s(30),
             s(25),
         );
 
-        // Output strip.
-        mv(hwnd, ID_LBL_OUTPUT_HDR, m, strip_y, s(200), s(20));
-        let strip_btn_y = strip_y;
+        // Output strip: the left/center columns only — its right
+        // edge stops at the manifest pane, so nothing here can meet
+        // the PACKAGE cluster. The facts line runs under the output
+        // edit instead of in a right-hand column of its own.
+        let strip_right = px - s(12);
+        mv(hwnd, ID_LBL_OUTPUT_HDR, m, strip_y, s(120), s(20));
         mv(
             hwnd,
             ID_CHK_SANDBOX,
-            w - m - s(330),
-            strip_btn_y,
-            s(110),
+            strip_right - s(292),
+            strip_y,
+            s(92),
             s(24),
         );
         mv(
             hwnd,
             ID_BTN_VERIFY,
-            w - m - s(212),
-            strip_btn_y,
-            s(96),
+            strip_right - s(192),
+            strip_y,
+            s(92),
             s(26),
         );
         mv(
             hwnd,
             ID_BTN_VALIDATE,
-            w - m - s(104),
-            strip_btn_y,
-            s(104),
+            strip_right - s(96),
+            strip_y,
+            s(96),
             s(26),
         );
-        let facts_w = s(300);
         mv(
             hwnd,
             ID_OUTPUT,
             m,
             strip_y + s(30),
-            w - m * 2 - facts_w - s(12),
-            strip_h - s(38),
+            strip_right - m,
+            strip_h - s(74),
         );
         mv(
             hwnd,
             ID_LBL_FACTS,
-            w - m - facts_w,
-            strip_y + s(34),
-            facts_w,
-            strip_h - s(42),
+            m,
+            strip_y + strip_h - s(40),
+            strip_right - m,
+            s(38),
         );
 
         // Footer.
+        mv(hwnd, ID_FOOTER_SEP, 0, footer_top - s(2), w, s(1));
         mv(
             hwnd,
             ID_LBL_STATUS,
@@ -3515,43 +3547,6 @@ mod imp {
         true
     }
 
-    unsafe fn draw_build_button(lparam: LPARAM) {
-        let dis = lparam as *const DRAWITEMSTRUCT;
-        if dis.is_null() {
-            return;
-        }
-        let dis = &*dis;
-        let disabled = dis.itemState & ODS_DISABLED != 0;
-        let pressed = dis.itemState & ODS_SELECTED != 0;
-        let brush = if disabled {
-            SURFACE_BRUSH
-        } else if pressed {
-            GREEN_DARK_BRUSH
-        } else {
-            GREEN_BRUSH
-        };
-        FillRect(dis.hDC, &dis.rcItem, brush);
-        let mut rc = dis.rcItem;
-        let text: Vec<u16> = "Build Setup".encode_utf16().collect();
-        SetBkMode(dis.hDC, TRANSPARENT as i32);
-        SetTextColor(dis.hDC, if disabled { COLOR_MUTED } else { COLOR_FG });
-        DrawTextW(
-            dis.hDC,
-            text.as_ptr(),
-            text.len() as i32,
-            &mut rc,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        if dis.itemState & ODS_FOCUS != 0 {
-            let mut focus_rc = dis.rcItem;
-            focus_rc.left += 3;
-            focus_rc.top += 3;
-            focus_rc.right -= 3;
-            focus_rc.bottom -= 3;
-            DrawFocusRect(dis.hDC, &focus_rc);
-        }
-    }
-
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
         msg: u32,
@@ -3559,19 +3554,37 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
-            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            WM_CTLCOLORSTATIC => {
                 let hdc = wparam as HDC;
                 let ctrl = lparam as HWND;
                 let id = GetWindowLongW(ctrl, GWL_ID) as usize;
+                if id == ID_FOOTER_SEP {
+                    // The footer's 1px edge separator: an empty
+                    // static filled edge-to-edge with the edge brush.
+                    SetBkMode(hdc, OPAQUE as i32);
+                    SetBkColor(hdc, theme::EDGE);
+                    return theme::brush(theme::EDGE) as LRESULT;
+                }
+                if id == ID_OUTPUT {
+                    // A read-only edit reports as a static, not via
+                    // WM_CTLCOLOREDIT. It takes the read-only fill —
+                    // letting it fall through to the window brush was
+                    // what made the output panel a different dark
+                    // than every edit field above it.
+                    SetBkMode(hdc, OPAQUE as i32);
+                    SetBkColor(hdc, theme::READ_ONLY_FILL);
+                    SetTextColor(hdc, theme::FOREGROUND);
+                    return theme::brush(theme::READ_ONLY_FILL) as LRESULT;
+                }
                 SetBkMode(hdc, TRANSPARENT as i32);
                 if id == ID_LBL_STATUS {
                     let kind = with_state(|s| s.status_kind).unwrap_or(StatusKind::Neutral);
                     SetTextColor(
                         hdc,
                         match kind {
-                            StatusKind::Ok => COLOR_GREEN,
-                            StatusKind::Error => COLOR_DANGER,
-                            StatusKind::Neutral => COLOR_FG,
+                            StatusKind::Ok => theme::SUCCESS,
+                            StatusKind::Error => theme::DANGER,
+                            StatusKind::Neutral => theme::MUTED,
                         },
                     );
                 } else if id == ID_LBL_FILES_HDR
@@ -3582,34 +3595,62 @@ mod imp {
                     || id == ID_LBL_FACTS
                     || id == ID_LBL_TOTALS
                     || id == ID_LBL_APPVER
-                    || id == ID_LBL_LAUNCH
-                    || id == ID_LBL_LOGIN
-                    || id == ID_LBL_DATADIRS
-                    || PANEL_LABELS.contains(&id)
                 {
-                    SetTextColor(hdc, COLOR_MUTED);
+                    // Section captions and genuinely secondary text.
+                    SetTextColor(hdc, theme::MUTED);
                 } else {
-                    SetTextColor(hdc, COLOR_FG);
+                    // Everything else is an enabled control's label
+                    // (the manifest field labels, the option rows).
+                    SetTextColor(hdc, theme::FOREGROUND);
                 }
-                BG_BRUSH as LRESULT
+                theme::brush(theme::BACKGROUND) as LRESULT
             }
             WM_CTLCOLOREDIT => {
                 let hdc = wparam as HDC;
+                let ctrl = lparam as HWND;
                 SetBkMode(hdc, OPAQUE as i32);
-                SetBkColor(hdc, COLOR_SURFACE);
-                SetTextColor(hdc, COLOR_FG);
-                SURFACE_BRUSH as LRESULT
+                if IsWindowEnabled(ctrl) == 0 {
+                    SetBkColor(hdc, theme::DISABLED_FILL);
+                    SetTextColor(hdc, theme::DISABLED_FOREGROUND);
+                    theme::brush(theme::DISABLED_FILL) as LRESULT
+                } else {
+                    SetBkColor(hdc, theme::SURFACE);
+                    SetTextColor(hdc, theme::FOREGROUND);
+                    theme::brush(theme::SURFACE) as LRESULT
+                }
             }
             WM_DRAWITEM => {
-                if wparam == ID_BTN_BUILD {
-                    draw_build_button(lparam);
+                let dis = lparam as *const DRAWITEMSTRUCT;
+                if dis.is_null() {
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                let dis = &*dis;
+                if dis.CtlType == ODT_HEADER_CTL {
+                    theme::draw_list_header(dis);
                     return 1;
                 }
-                DefWindowProcW(hwnd, msg, wparam, lparam)
+                match dis.CtlID as usize {
+                    ID_BTN_BUILD => theme::draw_push_button(dis, true),
+                    ID_BTN_TB_OPEN | ID_BTN_TB_SAVE | ID_BTN_TB_SAVEAS | ID_BTN_TB_ADDFILES
+                    | ID_BTN_TB_VALIDATE | ID_BTN_ADD_FILES | ID_BTN_ADD_FOLDER | ID_BTN_REMOVE
+                    | ID_BTN_FILES_DIR | ID_BTN_OUT_DIR | ID_BTN_VALIDATE | ID_BTN_VERIFY
+                    | ID_BTN_TEST => theme::draw_push_button(dis, false),
+                    id if CHECKBOX_IDS.contains(&id) => theme::draw_checkbox(dis),
+                    _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+                1
             }
             WM_COMMAND => {
                 let control_id = wparam & 0xFFFF;
                 let notify = (wparam >> 16) & 0xFFFF;
+                // Owner-drawn checkboxes do not toggle themselves —
+                // a click flips the stored check state here, and the
+                // arms below react exactly as they did for native
+                // auto-checkboxes (dirty tracking).
+                if notify == BN_CLICKED_CODE && CHECKBOX_IDS.contains(&control_id) {
+                    let now = get_check(hwnd, control_id);
+                    set_check(hwnd, control_id, !now);
+                }
                 match control_id {
                     IDM_FILE_OPEN => on_open_manifest(hwnd),
                     IDM_FILE_SAVE => on_save(hwnd, false),
@@ -3670,6 +3711,18 @@ mod imp {
             }
             WM_NOTIFY => {
                 let hdr = lparam as *const NMHDR;
+                if !hdr.is_null() {
+                    // Theme custom draw (selection fill, gridlines)
+                    // for the two list views.
+                    let custom = match (*hdr).idFrom {
+                        ID_LIST => theme::listview_custom_draw(lparam, true),
+                        ID_TREE => theme::listview_custom_draw(lparam, false),
+                        _ => None,
+                    };
+                    if let Some(result) = custom {
+                        return result;
+                    }
+                }
                 if !hdr.is_null() && (*hdr).code as i32 == LVN_ITEMCHANGED_I32 {
                     let nmlv = lparam as *const NMLISTVIEW;
                     if !nmlv.is_null() && (*nmlv).uNewState & LVIS_SELECTED != 0 {

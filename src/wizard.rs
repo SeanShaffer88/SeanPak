@@ -374,7 +374,9 @@ mod imp {
     use windows_sys::Win32::Graphics::Gdi::*;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     use windows_sys::Win32::UI::Controls::*;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        EnableWindow, IsWindowEnabled, SetFocus,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     use super::{default_install_dir, review_rows, InstallOptions};
@@ -382,16 +384,10 @@ mod imp {
     use crate::overlay::{FileRecordHeader, OverlayManifestHeader, PowerSpec};
     use crate::scanner::format_bytes;
 
-    // TesselGUI rev2 GitHub Dark palette (COLORREF is 0x00BBGGRR).
-    const COLOR_BG: u32 = 0x0017_110D; // #0D1117
-    const COLOR_SURFACE: u32 = 0x001D_1612; // #12161D
-    const COLOR_RAIL: u32 = 0x0009_0401; // #010409 (the rail, darkest panel)
-    const COLOR_DEEP: u32 = 0x003C_2615; // #15263C (info box fill)
-    const COLOR_FG: u32 = 0x00FC_F6F0; // #F0F6FC
-    const COLOR_MUTED: u32 = 0x00A1_9891; // #9198A1
-    const COLOR_BLUE: u32 = 0x00F7_812F; // #2F81F7
-    const COLOR_GREEN: u32 = 0x0037_7F1A; // #1A7F37
-    const COLOR_OK: u32 = 0x0050_B93F; // #3FB950 (completed-step check)
+    // Colors come from the shared TesselGUI 1.4.0 theme module —
+    // this window keeps no private palette. (The rail takes the
+    // theme's background token; the info box its accent token.)
+    use crate::theme;
 
     // The rail: fixed left panel, its step list, and its disk block.
     const RAIL_W: i32 = 150;
@@ -500,6 +496,17 @@ mod imp {
     const BST_CHECKED_STATE: usize = 1;
     const PBM_SETRANGE32_MSG: u32 = 0x0400 + 6; // WM_USER + 6
     const PBM_SETPOS_MSG: u32 = 0x0400 + 2;
+    const PBM_SETBARCOLOR_MSG: u32 = 0x0400 + 9; // WM_USER + 9
+    const PBM_SETBKCOLOR_MSG: u32 = 0x2001;
+    // Owner-draw button style (all buttons and checkboxes draw via
+    // the theme painters), the click notification the owner-drawn
+    // checkboxes toggle on, the header draw-item type, and the
+    // dialog message that keeps Enter activating the primary button
+    // now that it no longer carries the default-pushbutton style.
+    const BS_OWNERDRAW: u32 = 0x000B;
+    const BN_CLICKED_CODE: usize = 0;
+    const ODT_HEADER_CTL: u32 = 100;
+    const DM_SETDEFID_MSG: u32 = 0x0400 + 1; // WM_USER + 1
 
     // Static-control styles (windows-sys keeps these behind the
     // SystemServices feature, which this crate does not enable).
@@ -507,9 +514,8 @@ mod imp {
     const SS_RIGHT: u32 = 0x0002;
     const SS_ETCHEDHORZ: u32 = 0x0010;
     const SS_ETCHEDVERT: u32 = 0x0011;
-    // Edit / checkbox styles, likewise defined locally.
+    // Edit styles, likewise defined locally.
     const ES_AUTOHSCROLL: u32 = 0x0080;
-    const BS_AUTOCHECKBOX: u32 = 0x0003;
 
     // NM_DBLCLK is (-3); NMHDR.code is unsigned, so compare as i32.
     const NM_DBLCLK_I32: i32 = -3;
@@ -577,11 +583,6 @@ mod imp {
 
     static STATE: Mutex<Option<WizardState>> = Mutex::new(None);
     static MAIN_HWND: Mutex<usize> = Mutex::new(0);
-    static mut BG_BRUSH: HBRUSH = std::ptr::null_mut();
-    static mut SURFACE_BRUSH: HBRUSH = std::ptr::null_mut();
-    static mut GREEN_BRUSH: HBRUSH = std::ptr::null_mut();
-    static mut RAIL_BRUSH: HBRUSH = std::ptr::null_mut();
-    static mut DEEP_BRUSH: HBRUSH = std::ptr::null_mut();
     static mut HEADER_FONT: HFONT = std::ptr::null_mut();
     static mut TILE_FONT: HFONT = std::ptr::null_mut();
     static mut NAME_FONT: HFONT = std::ptr::null_mut();
@@ -692,11 +693,6 @@ mod imp {
             .encode_utf16()
             .collect();
 
-            BG_BRUSH = CreateSolidBrush(COLOR_BG);
-            SURFACE_BRUSH = CreateSolidBrush(COLOR_SURFACE);
-            GREEN_BRUSH = CreateSolidBrush(COLOR_GREEN);
-            RAIL_BRUSH = CreateSolidBrush(COLOR_RAIL);
-            DEEP_BRUSH = CreateSolidBrush(COLOR_DEEP);
             NAME_FONT = CreateFontW(
                 -15,
                 0,
@@ -755,7 +751,7 @@ mod imp {
                 hInstance: instance,
                 hIcon: LoadIconW(std::ptr::null_mut(), IDI_APPLICATION),
                 hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-                hbrBackground: BG_BRUSH,
+                hbrBackground: theme::brush(theme::BACKGROUND),
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: class_name.as_ptr(),
                 hIconSm: std::ptr::null_mut(),
@@ -795,6 +791,10 @@ mod imp {
             }
 
             create_controls(hwnd, instance);
+            // The primary button is owner-drawn now (it painted via
+            // the theme), so name it the dialog default explicitly —
+            // Enter keeps activating it from anywhere on the page.
+            SendMessageW(hwnd, DM_SETDEFID_MSG, ID_BTN_INSTALL, 0);
             ShowWindow(hwnd, SW_SHOWDEFAULT);
             UpdateWindow(hwnd);
 
@@ -978,15 +978,18 @@ mod imp {
             272,
             ID_LIST,
         );
+        // No LVS_EX_GRIDLINES: the native gridline color is a fixed
+        // light system color. The theme's custom draw (WM_NOTIFY)
+        // paints selection and gridlines in token colors instead.
         SendMessageW(
             list,
             LVM_SETEXTENDEDLISTVIEWSTYLE,
-            (LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT) as WPARAM,
-            (LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT) as LPARAM,
+            (LVS_EX_FULLROWSELECT) as WPARAM,
+            (LVS_EX_FULLROWSELECT) as LPARAM,
         );
-        SendMessageW(list, LVM_SETBKCOLOR, 0, COLOR_SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, COLOR_SURFACE as LPARAM);
-        SendMessageW(list, LVM_SETTEXTCOLOR, 0, COLOR_FG as LPARAM);
+        SendMessageW(list, LVM_SETBKCOLOR, 0, theme::SURFACE as LPARAM);
+        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme::SURFACE as LPARAM);
+        SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme::FOREGROUND as LPARAM);
         fill_list(list);
 
         mk(
@@ -1006,7 +1009,7 @@ mod imp {
         mk(
             &button_class,
             "Apply preset",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             584,
             418,
             120,
@@ -1016,7 +1019,7 @@ mod imp {
         mk(
             &button_class,
             "Ignore",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             712,
             418,
             120,
@@ -1038,7 +1041,7 @@ mod imp {
         mk(
             &button_class,
             "Back",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             448,
             496,
             120,
@@ -1048,7 +1051,7 @@ mod imp {
         mk(
             &button_class,
             "Cancel",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             580,
             496,
             120,
@@ -1058,7 +1061,7 @@ mod imp {
         mk(
             &button_class,
             "Install",
-            WS_TABSTOP | (BS_DEFPUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             712,
             496,
             136,
@@ -1090,7 +1093,7 @@ mod imp {
         mk(
             &button_class,
             "Browse…",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             730,
             112,
             118,
@@ -1100,7 +1103,7 @@ mod imp {
         mk(
             &button_class,
             "Desktop shortcut",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             174,
             154,
             500,
@@ -1110,7 +1113,7 @@ mod imp {
         mk(
             &button_class,
             "Start Menu shortcuts",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             174,
             184,
             500,
@@ -1120,7 +1123,7 @@ mod imp {
         mk(
             &button_class,
             "Add the install folder to PATH",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             174,
             214,
             500,
@@ -1132,7 +1135,7 @@ mod imp {
         mk(
             &button_class,
             "Start at login",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             174,
             244,
             500,
@@ -1213,7 +1216,7 @@ mod imp {
                 mk(
                     &button_class,
                     "Component",
-                    WS_TABSTOP | BS_AUTOCHECKBOX,
+                    WS_TABSTOP | BS_OWNERDRAW,
                     x,
                     y,
                     330,
@@ -1234,7 +1237,7 @@ mod imp {
             22,
             ID_LBL_PROGFILE,
         );
-        mk(
+        let bar = mk(
             &progress_class,
             "",
             WS_TABSTOP,
@@ -1244,6 +1247,10 @@ mod imp {
             28,
             ID_PROGRESS,
         );
+        // The progress role color on the surface token (honored
+        // wherever the control paints with message colors).
+        SendMessageW(bar, PBM_SETBARCOLOR_MSG, 0, theme::PROGRESS as LPARAM);
+        SendMessageW(bar, PBM_SETBKCOLOR_MSG, 0, theme::SURFACE as LPARAM);
 
         // ---- Page 4: Finish ----
         mk(&static_class, "", 0, 174, 82, 674, 330, ID_LBL_FINISH);
@@ -1253,7 +1260,7 @@ mod imp {
         mk(
             &button_class,
             "Launch",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
+            WS_TABSTOP | BS_OWNERDRAW,
             174,
             424,
             674,
@@ -1763,6 +1770,9 @@ mod imp {
                 };
                 SendMessageW(list, LVM_INSERTCOLUMNW, idx, &col as *const _ as LPARAM);
             }
+            // The header renders owner-drawn in theme colors (the
+            // native header cannot be recolored and stayed white).
+            theme::make_header_owner_draw(list);
             if let Ok(mut g) = COLUMNS_DONE.lock() {
                 *g = true;
             }
@@ -1880,26 +1890,26 @@ mod imp {
                 if id == ID_TILE {
                     // The monogram tile: app-green block, light initial.
                     SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, COLOR_GREEN);
-                    SetTextColor(hdc, COLOR_FG);
-                    return GREEN_BRUSH as LRESULT;
+                    SetBkColor(hdc, theme::ACTION);
+                    SetTextColor(hdc, theme::ACCENT_FOREGROUND);
+                    return theme::brush(theme::ACTION) as LRESULT;
                 }
                 if id == ID_RAIL_BG {
                     // The rail's own background: solid darkest panel.
                     SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, COLOR_RAIL);
-                    return RAIL_BRUSH as LRESULT;
+                    SetBkColor(hdc, theme::BACKGROUND);
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if let Some(i) = ID_STEP_ACCENTS.iter().position(|a| *a == id) {
                     // Accent bar: green for the current step, rail
                     // color (invisible) for the rest.
                     SetBkMode(hdc, OPAQUE as i32);
                     if page == (i + 1) as u8 {
-                        SetBkColor(hdc, COLOR_GREEN);
-                        return GREEN_BRUSH as LRESULT;
+                        SetBkColor(hdc, theme::ACTION);
+                        return theme::brush(theme::ACTION) as LRESULT;
                     }
-                    SetBkColor(hdc, COLOR_RAIL);
-                    return RAIL_BRUSH as LRESULT;
+                    SetBkColor(hdc, theme::BACKGROUND);
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if let Some(i) = ID_STEP_NUMS.iter().position(|a| *a == id) {
                     // Step number: green-filled while current, a green
@@ -1907,13 +1917,20 @@ mod imp {
                     let step = (i + 1) as u8;
                     if page == step {
                         SetBkMode(hdc, OPAQUE as i32);
-                        SetBkColor(hdc, COLOR_GREEN);
-                        SetTextColor(hdc, COLOR_FG);
-                        return GREEN_BRUSH as LRESULT;
+                        SetBkColor(hdc, theme::ACTION);
+                        SetTextColor(hdc, theme::ACTION_FOREGROUND);
+                        return theme::brush(theme::ACTION) as LRESULT;
                     }
                     SetBkMode(hdc, TRANSPARENT as i32);
-                    SetTextColor(hdc, if page > step { COLOR_OK } else { COLOR_MUTED });
-                    return RAIL_BRUSH as LRESULT;
+                    SetTextColor(
+                        hdc,
+                        if page > step {
+                            theme::SUCCESS
+                        } else {
+                            theme::MUTED
+                        },
+                    );
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if let Some(i) = ID_STEP_NAMES.iter().position(|a| *a == id) {
                     // Step name: bright for the current and completed
@@ -1922,17 +1939,17 @@ mod imp {
                     SetTextColor(
                         hdc,
                         if page >= (i + 1) as u8 {
-                            COLOR_FG
+                            theme::FOREGROUND
                         } else {
-                            COLOR_MUTED
+                            theme::MUTED
                         },
                     );
-                    return RAIL_BRUSH as LRESULT;
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_APPNAME || id == ID_LBL_DISKNEED {
                     SetBkMode(hdc, TRANSPARENT as i32);
-                    SetTextColor(hdc, COLOR_FG);
-                    return RAIL_BRUSH as LRESULT;
+                    SetTextColor(hdc, theme::FOREGROUND);
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_APPVER
                     || id == ID_LBL_APPPUB
@@ -1940,36 +1957,97 @@ mod imp {
                     || id == ID_LBL_DISKFREE
                 {
                     SetBkMode(hdc, TRANSPARENT as i32);
-                    SetTextColor(hdc, COLOR_MUTED);
-                    return RAIL_BRUSH as LRESULT;
+                    SetTextColor(hdc, theme::MUTED);
+                    return theme::brush(theme::BACKGROUND) as LRESULT;
                 }
                 if id == ID_LBL_INFO {
                     // The info box: light text on the deep-blue fill.
                     SetBkMode(hdc, OPAQUE as i32);
-                    SetBkColor(hdc, COLOR_DEEP);
-                    SetTextColor(hdc, COLOR_FG);
-                    return DEEP_BRUSH as LRESULT;
+                    SetBkColor(hdc, theme::ACCENT);
+                    SetTextColor(hdc, theme::FOREGROUND);
+                    return theme::brush(theme::ACCENT) as LRESULT;
                 }
                 SetBkMode(hdc, TRANSPARENT as i32);
                 if (id == ID_LBL_STATUS || id == ID_LBL_FINISH) && installed {
                     // Success green, always paired with the status text.
-                    SetTextColor(hdc, COLOR_GREEN);
+                    SetTextColor(hdc, theme::SUCCESS);
                 } else if id == ID_LBL_STEP
                     || id == ID_LBL_HINT
                     || id == ID_LBL_STATUS
                     || id == ID_LBL_SUBTITLE
                 {
-                    SetTextColor(hdc, COLOR_MUTED);
+                    SetTextColor(hdc, theme::MUTED);
                 } else if id == ID_LBL_OPTNOTE {
-                    SetTextColor(hdc, COLOR_BLUE);
+                    SetTextColor(hdc, theme::INFO);
                 } else {
-                    SetTextColor(hdc, COLOR_FG);
+                    SetTextColor(hdc, theme::FOREGROUND);
                 }
-                BG_BRUSH as LRESULT
+                theme::brush(theme::BACKGROUND) as LRESULT
+            }
+            WM_CTLCOLOREDIT => {
+                let hdc = wparam as HDC;
+                let ctrl = lparam as HWND;
+                SetBkMode(hdc, OPAQUE as i32);
+                if IsWindowEnabled(ctrl) == 0 {
+                    // The location edit in Modify mode: fixed, and
+                    // drawn as disabled rather than merely inert.
+                    SetBkColor(hdc, theme::DISABLED_FILL);
+                    SetTextColor(hdc, theme::DISABLED_FOREGROUND);
+                    theme::brush(theme::DISABLED_FILL) as LRESULT
+                } else {
+                    SetBkColor(hdc, theme::SURFACE);
+                    SetTextColor(hdc, theme::FOREGROUND);
+                    theme::brush(theme::SURFACE) as LRESULT
+                }
+            }
+            WM_DRAWITEM => {
+                let dis = lparam as *const DRAWITEMSTRUCT;
+                if dis.is_null() {
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                let dis = &*dis;
+                if dis.CtlType == ODT_HEADER_CTL {
+                    theme::draw_list_header(dis);
+                    return 1;
+                }
+                match dis.CtlID as usize {
+                    ID_BTN_INSTALL => theme::draw_push_button(dis, true),
+                    ID_BTN_BACK
+                    | ID_BTN_CANCEL
+                    | ID_BTN_BROWSE
+                    | ID_BTN_ANSWERS_APPLY
+                    | ID_BTN_ANSWERS_IGNORE => theme::draw_push_button(dis, false),
+                    ID_CHK_DESKTOP | ID_CHK_STARTMENU | ID_CHK_PATH | ID_CHK_LOGIN
+                    | ID_CHK_LAUNCH => theme::draw_checkbox(dis),
+                    id if (ID_CHK_COMPONENT_BASE..ID_CHK_COMPONENT_BASE + MAX_COMPONENT_BOXES)
+                        .contains(&id) =>
+                    {
+                        theme::draw_checkbox(dis)
+                    }
+                    _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+                1
             }
             WM_COMMAND => {
                 let control_id = wparam & 0xFFFF;
                 let notify_code = (wparam >> 16) & 0xFFFF;
+                // Owner-drawn checkboxes do not toggle themselves —
+                // a click flips the stored check state here; the
+                // pages harvest the states exactly as before.
+                if notify_code == BN_CLICKED_CODE
+                    && (matches!(
+                        control_id,
+                        ID_CHK_DESKTOP
+                            | ID_CHK_STARTMENU
+                            | ID_CHK_PATH
+                            | ID_CHK_LOGIN
+                            | ID_CHK_LAUNCH
+                    ) || (ID_CHK_COMPONENT_BASE..ID_CHK_COMPONENT_BASE + MAX_COMPONENT_BOXES)
+                        .contains(&control_id))
+                {
+                    let now = get_check(hwnd, control_id);
+                    set_check(hwnd, control_id, !now);
+                }
                 if control_id == ID_EDT_LOCATION && notify_code == EN_CHANGE_CODE {
                     on_location_edited(hwnd);
                 }
@@ -2007,9 +2085,14 @@ mod imp {
             }
             WM_NOTIFY => {
                 let hdr = lparam as *const NMHDR;
-                if !hdr.is_null() && (*hdr).idFrom == ID_LIST && (*hdr).code as i32 == NM_DBLCLK_I32
-                {
-                    on_row_activate(hwnd);
+                if !hdr.is_null() && (*hdr).idFrom == ID_LIST {
+                    // Theme custom draw (selection fill, gridlines).
+                    if let Some(result) = theme::listview_custom_draw(lparam, true) {
+                        return result;
+                    }
+                    if (*hdr).code as i32 == NM_DBLCLK_I32 {
+                        on_row_activate(hwnd);
+                    }
                 }
                 0
             }
@@ -2631,12 +2714,11 @@ mod imp {
             });
         }
         unsafe {
-            // The palette statics are normally created by the wizard's
+            // The header font is normally created by the wizard's
             // run(); an uninstall confirmation runs in a process where
-            // the wizard never opened, so create them on demand.
-            if BG_BRUSH.is_null() {
-                BG_BRUSH = CreateSolidBrush(COLOR_BG);
-            }
+            // the wizard never opened, so create it on demand. (The
+            // palette needs no such care — theme brushes are created
+            // lazily by the theme module itself.)
             if HEADER_FONT.is_null() {
                 HEADER_FONT = CreateFontW(
                     -20,
@@ -2667,7 +2749,7 @@ mod imp {
                 hInstance: instance,
                 hIcon: LoadIconW(std::ptr::null_mut(), IDI_APPLICATION),
                 hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-                hbrBackground: BG_BRUSH,
+                hbrBackground: theme::brush(theme::BACKGROUND),
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: class_name.as_ptr(),
                 hIconSm: std::ptr::null_mut(),
@@ -2703,6 +2785,7 @@ mod imp {
                 return None;
             }
             create_confirm_controls(hwnd, instance);
+            SendMessageW(hwnd, DM_SETDEFID_MSG, ID_BTN_CONFIRM, 0);
             ShowWindow(hwnd, SW_SHOWDEFAULT);
             UpdateWindow(hwnd);
             let mut msg: MSG = std::mem::zeroed();
@@ -2789,7 +2872,7 @@ mod imp {
             let purge_box = mk(
                 &button_class,
                 &format!("Also delete {app_name}'s data files"),
-                WS_TABSTOP | BS_AUTOCHECKBOX,
+                WS_TABSTOP | BS_OWNERDRAW,
                 16,
                 116,
                 590,
@@ -2825,7 +2908,7 @@ mod imp {
         mk(
             &button_class,
             "Cancel",
-            WS_TABSTOP | (BS_PUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             470,
             310,
             120,
@@ -2835,7 +2918,7 @@ mod imp {
         mk(
             &button_class,
             "Uninstall",
-            WS_TABSTOP | (BS_DEFPUSHBUTTON as u32),
+            WS_TABSTOP | BS_OWNERDRAW,
             338,
             310,
             120,
@@ -2856,16 +2939,38 @@ mod imp {
                 let ctrl = lparam as HWND;
                 let id = GetWindowLongW(ctrl, GWL_ID) as usize;
                 SetBkMode(hdc, TRANSPARENT as i32);
-                if id == ID_LBL_CONFIRM_WARN || id == ID_LBL_CONFIRM_BODY {
-                    SetTextColor(hdc, COLOR_BLUE);
+                if id == ID_LBL_CONFIRM_WARN {
+                    SetTextColor(hdc, theme::WARNING);
+                } else if id == ID_LBL_CONFIRM_BODY {
+                    SetTextColor(hdc, theme::INFO);
                 } else if id == ID_LBL_CONFIRM_DIRS {
-                    SetTextColor(hdc, COLOR_MUTED);
+                    SetTextColor(hdc, theme::MUTED);
                 } else {
-                    SetTextColor(hdc, COLOR_FG);
+                    SetTextColor(hdc, theme::FOREGROUND);
                 }
-                BG_BRUSH as LRESULT
+                theme::brush(theme::BACKGROUND) as LRESULT
+            }
+            WM_DRAWITEM => {
+                let dis = lparam as *const DRAWITEMSTRUCT;
+                if dis.is_null() {
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                let dis = &*dis;
+                match dis.CtlID as usize {
+                    ID_BTN_CONFIRM => theme::draw_push_button(dis, true),
+                    ID_BTN_CONFIRM_CANCEL => theme::draw_push_button(dis, false),
+                    ID_CHK_PURGE => theme::draw_checkbox(dis),
+                    _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+                1
             }
             WM_COMMAND => {
+                // The owner-drawn purge checkbox toggles here (see
+                // the wizard's WM_COMMAND for the same pattern).
+                if (wparam >> 16) & 0xFFFF == BN_CLICKED_CODE && wparam & 0xFFFF == ID_CHK_PURGE {
+                    let now = get_check(hwnd, ID_CHK_PURGE);
+                    set_check(hwnd, ID_CHK_PURGE, !now);
+                }
                 match wparam & 0xFFFF {
                     ID_BTN_CONFIRM => {
                         let purge = get_check(hwnd, ID_CHK_PURGE);
