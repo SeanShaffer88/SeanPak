@@ -5,7 +5,7 @@
 - **Project:** SeanPak — the single custom TesselGUI installer for all of SEAN's projects (formerly RustPak, then CrucibleKit).
 - **Tier:** t2 (CLI/library-class tool; the installer stub it emits is t1b-class).
 - **Stack:** Rust, `windows-sys` 0.59 only (no other runtime dependencies), static CRT (`+crt-static`), native Win32 UI — no web runtimes, no telemetry, fully offline.
-- **Design standard:** TesselGUI revision 2 (GitHub Dark / GitHub Light accents); installer wizard follows the approved Design C ledger layout.
+- **Design standard:** TesselGUI revision 2 (GitHub Dark / GitHub Light accents); installer wizard follows the approved Design E (Rail) layout and the Builder studio the approved Design H (IDE) layout (both picked 2026-11-13, shipped in 4.5.0; Designs C/D superseded).
 - **Release shape:** exactly `SeanPak-v{VERSION}-x64-Setup.exe` + `SeanPak-v{VERSION}-x64-Portable.zip` + `SHA256SUMS.txt`.
 - **Repository:** https://github.com/SeanShaffer88/SeanPak
 

@@ -1,6 +1,6 @@
 [package]
 name = "seanpak"
-version = "4.2.1"
+version = "4.5.0"
 edition = "2021"
 authors = ["SeanPak Systems Engineering Team"]
 description = "SeanPak: Zero-dependency, high-throughput standalone Windows installer packager and PE overlay engine"

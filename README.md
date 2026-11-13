@@ -60,8 +60,8 @@ seanpak/
     ├── restart_manager.rs # Dynamic rstrtmgr.dll binding with RAII session lifecycle
     ├── rollback.rs        # Transactional filesystem/registry rollback log
     ├── scanner.rs         # Recursive directory scanner + COFF PE architecture inspector
-    ├── studio.rs          # Builder studio GUI (Design D) over the same pack/verify operations
-    └── wizard.rs          # Installer wizard (Design C ledger review) over install.rs
+    ├── studio.rs          # Builder studio GUI (Design H IDE layout) over the same pack/verify operations
+    └── wizard.rs          # Installer wizard (Design E Rail layout) over install.rs
 ```
 
 ## Building
@@ -126,11 +126,39 @@ back and confirmed.
 # (all journaled for uninstall), writes seanpak-receipt.json into the
 # install dir, and detects an existing install: same version repairs
 # with --repair, a newer version makes downgrade refused unless
-# --force, an older one upgrades in place.
+# --force, an older one upgrades in place. Installs are per-user and
+# never elevate: a destination your account cannot write (for example
+# C:\Program Files) is refused before anything changes — the JSON
+# report carries reason "location_not_writable" and a suggested
+# per-user location (%LOCALAPPDATA%\Programs\<App>), and --dry-run
+# plans include the same verdict as locationWritable /
+# suggestedLocation.
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --json
 .\AppSetup.exe --install --to "D:\Apps\MyApp" --repair --json
+# --launch starts the app afterwards (an explicit opt-in; headless
+# installs never launch by default, and the JSON report records
+# launchRequested / launchPerformed). --start-at-login /
+# --no-start-at-login override the manifest's start-at-login default.
+.\AppSetup.exe --install --to "D:\Apps\MyApp" --launch --json
+# Interactive uninstall asks first (a native confirmation window);
+# silent / --json uninstalls never ask and never delete the app's
+# data folders unless --purge-data is passed explicitly.
 .\AppSetup.exe --uninstall --to "D:\Apps\MyApp" --json
+.\AppSetup.exe --uninstall --to "D:\Apps\MyApp" --purge-data --json
 ```
+
+**Install options in the manifest.** Beyond shortcuts, associations,
+and PATH, a manifest can declare: `launchAfterInstall` — whether the
+wizard's Finish page offers a "Launch <App>" checkbox and whether it
+starts checked (default: offered, checked); `startAtLogin` — whether
+the installer offers "Start <App> at login", a per-user Run entry
+journaled like the other artifacts and removed by uninstall (default:
+not offered); and `dataDirs` — the app's data folders (`%APPDATA%`,
+`%LOCALAPPDATA%`, `%USERPROFILE%`, `%INSTALLDIR%` tokens or
+install-relative paths), recorded in the install receipt so the
+uninstall's opt-in checkbox can offer to delete them. The two option
+fields accept a boolean or `{"offered": bool, "defaultChecked": bool}`;
+`seanpak schema` documents every field.
 
 **Packaging other projects in CI.** SeanPak is the standing packaging
 route for all of SEAN's Windows programs: a project's release workflow
@@ -142,10 +170,10 @@ the caller-workflow example.
 **Exit codes** (deterministic; also printed by `--help`): `0` success ·
 `1` generic/GUI failure · `2` usage error · `3` bad or missing
 manifest/overlay · `4` I/O failure (including a refused overwrite) ·
-`5` install failed (destination rolled back).
+`5` install failed (destination rolled back; an unwritable destination is refused before anything changes, with JSON reason `location_not_writable`).
 
 ## Known limitations (honest list)
-- The Builder studio (Design D) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. Its Windows runtime behavior is **Unverified** until an on-machine field pass (the document/settings model and the full open → validate → pack → verify chain are covered by host tests).
+- The Builder studio (Design H, IDE layout) is the secondary surface: it edits a `manifest.json`, curates the package file list, and runs the same `pack` / `validate` / `verify` operations as the CLI — nothing is GUI-only. Its Windows runtime behavior is **Unverified** until an on-machine field pass (the document/settings model and the full open → validate → pack → verify chain are covered by host tests). Screenshots of the 4.5.0 layouts are owed from that field pass.
 - Payloads are compressed per file (Windows Compression API on Windows; a built-in LZ codec elsewhere) and stored uncompressed when compression would not shrink them. Packages written by older SeanPak/CrucibleKit/RustPak versions remain readable and installable.
 - Windows GUI behavior is compile-verified in CI on all three targets; interactive on-machine testing is still recommended before shipping an installer to users. `docs/PARITY.md` tracks exactly what is shipped and what remains.
 
