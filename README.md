@@ -61,7 +61,7 @@ SeanPak is built to be driven by a local AI: packaging is the primary workflow, 
 **Engineering**
 - Rust + `windows-sys` only: zero third-party runtime dependencies, static CRT, and the shipped executables import Windows system libraries only
 - Zero telemetry, fully offline, no account, no network code paths in the installer
-- TesselGUI 1.4.0 dark theme (GitHub Dark High Contrast values) from one shared theme module, test-pinned to the published tokens
+- TesselGUI 2.0.0 (design revision 3, Carmine) across every window — Builder, wizard, uninstall confirmation, silent update — from one shared theme module, test-pinned to the published tokens, with the revision's fine grid texture on the page backgrounds and ten-segment progress
 
 ## Download
 Prebuilt binaries are on the **[latest GitHub Release](https://github.com/SeanShaffer88/SeanPak/releases/latest)**:
@@ -124,7 +124,7 @@ seanpak/
     ├── scanner.rs         # Recursive directory scanner + COFF PE architecture inspector
     ├── studio.rs          # Builder studio GUI (guided page flow since 5.0.0) over the same pack/verify operations
     ├── sysinstall.rs      # Shortcuts, associations, PATH, Run entry (COM + HKCU, journaled)
-    ├── theme.rs           # TesselGUI 1.4.0 dark palette + shared control painters (4.7.1)
+    ├── theme.rs           # TesselGUI 2.0.0 rev-3 (Carmine) palette + shared control painters
     ├── uninstall.rs       # Shared uninstall operation (receipt-driven, data-purge opt-in)
     ├── wizard.rs          # Installer wizard (Design E Rail layout) over install.rs
     └── writes.rs          # Journaled HKCU registry + environment writes (4.6.0)
