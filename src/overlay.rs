@@ -989,8 +989,8 @@ impl OverlayWriter {
     }
 
     /// Like [`OverlayWriter::build_from_folder`], but records explicit
-    /// install-time `options` in the package (options blocks, manifest
-    /// version 6) instead of the per-app defaults.
+    /// install-time `options` in the package's v7 layout instead of the
+    /// per-app defaults.
     #[allow(clippy::too_many_arguments)]
     pub fn build_from_folder_with_options(
         stub_binary_path: &Path,
@@ -1126,7 +1126,7 @@ impl OverlayWriter {
 
         let mut manifest = OverlayManifestHeader {
             magic: *OVERLAY_MAGIC,
-            version: 6,
+            version: 7,
             file_count: files.len() as u32,
             primary_exe_index: 0,
             total_uncompressed_bytes: 0,
@@ -1151,6 +1151,7 @@ impl OverlayWriter {
         // length depends on the per-component packed sizes, which only
         // exist once every file is compressed.
         let mut stored_payloads: Vec<Vec<u8>> = Vec::with_capacity(files.len());
+        let mut payload_digests: Vec<[u8; 32]> = Vec::with_capacity(files.len());
 
         for (idx, (abs_path, rel_path, is_primary)) in files.iter().enumerate() {
             if let Some(cancel) = control.cancel {
@@ -1165,6 +1166,7 @@ impl OverlayWriter {
                 on_file(idx, files.len(), rel_path);
             }
             let raw = std::fs::read(abs_path)?;
+            payload_digests.push(crate::hash::sha256_digest(&raw));
             let file_size = raw.len() as u64;
             total_bytes += file_size;
             let (codec, stored) = crate::codec::compress_best(&raw);
@@ -1209,11 +1211,13 @@ impl OverlayWriter {
         // v5 options: the v3/v4 base block plus the v5 extension block,
         // then the v6 power block.
         let options_size = (OPTIONS_BASE_DISK_SIZE + OPTIONS_EXT_DISK_SIZE) as u64;
+        let integrity_table_size = payload_digests.len() as u64 * 32;
         let mut current_payload_offset = aligned_overlay_start
             + manifest_size
             + records_total_size
             + options_size
-            + power_block_size;
+            + power_block_size
+            + integrity_table_size;
         for (header, stored) in record_headers.iter_mut().zip(&stored_payloads) {
             header.payload_offset = current_payload_offset;
             current_payload_offset += stored.len() as u64;
@@ -1263,6 +1267,11 @@ impl OverlayWriter {
         out_file.write_all(&(power_json.len() as u32).to_le_bytes())?;
         out_file.write_all(power_json.as_bytes())?;
 
+        // v7 stores one raw SHA-256 digest for each original payload.
+        for digest in &payload_digests {
+            out_file.write_all(digest)?;
+        }
+
         // Write the stored (possibly compressed) payloads in record order.
         for stored in &stored_payloads {
             out_file.write_all(stored)?;
@@ -1284,6 +1293,15 @@ pub type PackageFull = (
     Vec<FileRecordHeader>,
     InstallOptions,
     PowerSpec,
+);
+
+/// Package metadata plus the optional v7 SHA-256 table, in record order.
+pub type PackageWithIntegrity = (
+    OverlayManifestHeader,
+    Vec<FileRecordHeader>,
+    InstallOptions,
+    PowerSpec,
+    Option<Vec<[u8; 32]>>,
 );
 
 impl OverlayReader {
@@ -1407,8 +1425,18 @@ impl OverlayReader {
     /// package's v6 [`PowerSpec`] (components, hooks, writes, rich
     /// shortcuts). Pre-v6 packages read as an empty spec.
     pub fn read_package_full<R: Read + Seek>(
-        mut reader: R,
+        reader: R,
     ) -> std::io::Result<Option<PackageFull>> {
+        Ok(Self::read_package_with_integrity(reader)?.map(
+            |(manifest, records, options, power, _digests)| (manifest, records, options, power),
+        ))
+    }
+
+    /// Reads package metadata and, for v7+, its ordered SHA-256 table.
+    /// Older packages return None for the integrity table.
+    pub fn read_package_with_integrity<R: Read + Seek>(
+        mut reader: R,
+    ) -> std::io::Result<Option<PackageWithIntegrity>> {
         let stream_len = reader.seek(SeekFrom::End(0))?;
         let manifest_size = std::mem::size_of::<OverlayManifestHeader>() as u64;
 
@@ -1510,7 +1538,7 @@ impl OverlayReader {
 
         // The v6 power block follows the options blocks: a u32 length
         // prefix + a JSON document. Anything malformed is an honest
-        // read error — a v6 package whose power block cannot be read
+        // read error — a v6-or-newer package whose power block cannot be read
         // must not silently install as if it had none.
         let power = if manifest.version >= 6 {
             let mut len_buf = [0u8; 4];
@@ -1542,7 +1570,47 @@ impl OverlayReader {
             PowerSpec::default()
         };
 
-        Ok(Some((manifest, records, options, power)))
+        let payload_digests = if manifest.version >= 7 {
+            let table_start = reader.stream_position()?;
+            let table_len = (manifest.file_count as u64)
+                .checked_mul(32)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "payload digest table length overflow",
+                    )
+                })?;
+            let table_end = table_start.checked_add(table_len).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "payload digest table range overflow",
+                )
+            })?;
+            let payload_end = Self::payload_stream_len(&mut reader)?;
+            let first_payload = records
+                .iter()
+                .map(|record| record.payload_offset)
+                .min()
+                .unwrap_or(table_end);
+            if table_end > payload_end || table_end > first_payload {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "payload digest table overlaps or exceeds payload data",
+                ));
+            }
+            reader.seek(SeekFrom::Start(table_start))?;
+            let mut digests = Vec::with_capacity(records.len());
+            for _ in &records {
+                let mut digest = [0u8; 32];
+                reader.read_exact(&mut digest)?;
+                digests.push(digest);
+            }
+            Some(digests)
+        } else {
+            None
+        };
+
+        Ok(Some((manifest, records, options, power, payload_digests)))
     }
 
     /// The stored (on-disk) length of `records[index]`'s payload.
@@ -1613,12 +1681,13 @@ impl OverlayReader {
         control: &mut ExtractControl<'_>,
     ) -> std::io::Result<Vec<PathBuf>> {
         let mut reader = reader;
-        let (_manifest, records) = Self::read_manifest(&mut reader)?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "no SeanPak overlay found in this file",
-            )
-        })?;
+        let (_manifest, records, _options, _power, payload_digests) =
+            Self::read_package_with_integrity(&mut reader)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "no SeanPak overlay found in this file",
+                )
+            })?;
         let stream_len = Self::payload_stream_len(&mut reader)?;
         let selected: Vec<usize> = records
             .iter()
@@ -1649,6 +1718,20 @@ impl OverlayReader {
                 std::fs::create_dir_all(parent)?;
             }
             let bytes = Self::read_payload(&mut reader, &records, idx, stream_len)?;
+            if let Some(digests) = &payload_digests {
+                let expected = digests.get(idx).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "payload digest table is incomplete",
+                    )
+                })?;
+                if crate::hash::sha256_digest(&bytes) != *expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("payload integrity check failed for {rel}"),
+                    ));
+                }
+            }
             std::fs::write(&target, &bytes)?;
             written.push(target);
         }
@@ -2075,7 +2158,7 @@ mod tests {
         let (manifest, records, read_back) = OverlayReader::read_package(file)
             .unwrap()
             .expect("new overlay must be discoverable");
-        assert_eq!(manifest.version, 6);
+        assert_eq!(manifest.version, 7);
         assert_eq!(manifest.app_name(), "Opt App");
         assert_eq!(records.len(), 1);
         assert_eq!(read_back.install_location(), "C:\\Apps\\Opt App");
@@ -2104,6 +2187,42 @@ mod tests {
             b"fake-pe-bytes"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_rejects_payload_digest_mismatch_before_writing() {
+        let root = unique_temp("payload-integrity");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.bin"), b"x").unwrap();
+        let stub = root.join("stub.exe");
+        std::fs::write(&stub, vec![0xAAu8; 5000]).unwrap();
+        let package = root.join("setup.exe");
+        OverlayWriter::build_from_folder(&stub, &package, &src, "Integrity", "1.0.0", "Tester")
+            .unwrap();
+
+        let (manifest, records, _, _, digests) =
+            OverlayReader::read_package_with_integrity(File::open(&package).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(manifest.version, 7);
+        assert_eq!(digests.as_ref().map(Vec::len), Some(records.len()));
+        assert_eq!(
+            digests.as_ref().unwrap()[0],
+            crate::hash::sha256_digest(b"x")
+        );
+        assert_eq!(records[0].compression(), crate::codec::CODEC_STORED);
+
+        let mut image = std::fs::read(&package).unwrap();
+        image[records[0].payload_offset as usize] ^= 1;
+        std::fs::write(&package, image).unwrap();
+
+        let dest = root.join("extracted");
+        let error = OverlayReader::extract_file(&package, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("payload integrity check failed"));
+        assert!(!dest.join("app.bin").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2174,7 +2293,7 @@ mod tests {
         OverlayWriter::build_from_folder(&stub, &out, &src, "Zip App", "1.0.0", "Tester").unwrap();
         let file = File::open(&out).unwrap();
         let (manifest, records) = OverlayReader::read_manifest(file).unwrap().unwrap();
-        assert_eq!(manifest.version, 6);
+        assert_eq!(manifest.version, 7);
         let big = records
             .iter()
             .find(|r| r.relative_path() == "big.txt")
@@ -2306,7 +2425,7 @@ mod tests {
         let (manifest, records, _options, power) = OverlayReader::read_package_full(file)
             .unwrap()
             .expect("v6 overlay must be discoverable");
-        assert_eq!(manifest.version, 6);
+        assert_eq!(manifest.version, 7);
         assert_eq!(records.len(), 3);
         assert_eq!(power, stored_power);
         assert_eq!(power.component_id_for_file("app.exe"), "core");
@@ -2404,11 +2523,12 @@ mod tests {
         bytes.extend_from_slice(ext_bytes);
         bytes.extend_from_slice(payload);
 
-        let (read_back, records, _opts, power) =
-            OverlayReader::read_package_full(Cursor::new(bytes.clone()))
+        let (read_back, records, _opts, power, digests) =
+            OverlayReader::read_package_with_integrity(Cursor::new(bytes.clone()))
                 .unwrap()
                 .expect("v5 overlay must be discoverable");
         assert_eq!(read_back.version, 5);
+        assert!(digests.is_none());
         assert_eq!(records.len(), 1);
         assert!(power.is_empty());
 
