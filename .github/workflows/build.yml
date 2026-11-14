@@ -80,11 +80,14 @@ jobs:
           [IO.File]::WriteAllText((Join-Path $files "smoke.exe"), "fixture payload")
           $cli = Join-Path $tools "SeanPak CLI.exe"
           Copy-Item "target/x86_64-pc-windows-msvc/release/seanpak.exe" $cli
-          & $cli init $smokeRoot --name "MSBuild Smoke"
-          if ($LASTEXITCODE -ne 0) { throw "SeanPak init failed with exit code $LASTEXITCODE" }
 
           $targetFile = Join-Path $env:GITHUB_WORKSPACE "msbuild/SeanPak.targets"
           $manifest = Join-Path $smokeRoot "manifest.json"
+          $manifestText = [IO.File]::ReadAllText("packaging/seanpak-manifest.json")
+          $manifestText = $manifestText.Replace('"appName":"SeanPak"', '"appName":"MSBuild Smoke"')
+          $manifestText = $manifestText.Replace('"primaryExe":"seanpak.exe"', '"primaryExe":"smoke.exe"')
+          $manifestText = $manifestText.Replace('"version":"4.6.0"', '"version":"1.0.0"')
+          [IO.File]::WriteAllText($manifest, $manifestText)
           $publishDir = $files + [IO.Path]::DirectorySeparatorChar
           $project = Join-Path $smokeRoot "MSBuildSmoke.proj"
           $xml = @'
