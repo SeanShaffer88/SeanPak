@@ -33,14 +33,14 @@ pub struct InitOutcome {
 /// layout, the verify line, and worked examples of the power blocks
 /// (kept here, not in the generated manifest, so the manifest stays
 /// clean).
-fn packaging_md(app_name: &str, files_dir_arg: &str, manifest_dir_arg: &str) -> String {
+fn packaging_md(app_name: &str, files_dir_arg: &str) -> String {
     format!(
         "# Packaging {app_name} with SeanPak\n\
          \n\
          ## Build the installer\n\
          \n\
          ```\n\
-         seanpak pack{manifest_dir_arg} --files {files_dir_arg}\n\
+         seanpak pack manifest.json {files_dir_arg}\n\
          ```\n\
          \n\
          This writes `{app_name}-v<version>-x64-Setup.exe`, the matching portable\n\
@@ -178,22 +178,13 @@ pub fn init_project(
     let packaging_written = if packaging_path.exists() && !force {
         None
     } else {
-        let manifest_dir_arg = if files_dir_arg == "." {
-            String::new()
-        } else {
-            " .".to_string()
-        };
-        let body = packaging_md(&app_name, &files_dir_arg, &manifest_dir_arg);
+        let body = packaging_md(&app_name, &files_dir_arg);
         std::fs::write(&packaging_path, body)
             .map_err(|e| format!("cannot write {}: {e}", packaging_path.display()))?;
         Some(packaging_path)
     };
 
-    let pack_command = if files_dir_arg == "." {
-        "seanpak pack --files .".to_string()
-    } else {
-        "seanpak pack . --files files".to_string()
-    };
+    let pack_command = format!("seanpak pack manifest.json {files_dir_arg}");
     Ok(InitOutcome {
         manifest_path,
         packaging_path: packaging_written,
@@ -288,7 +279,9 @@ mod tests {
         std::fs::write(root.join("widget.exe"), b"fake").unwrap();
         let outcome = init_project(&root, None, false).unwrap();
         assert_eq!(outcome.primary_exe.as_deref(), Some("widget.exe"));
-        assert!(outcome.packaging_path.is_some());
+        assert_eq!(outcome.pack_command, "seanpak pack manifest.json .");
+        let packaging = std::fs::read_to_string(outcome.packaging_path.as_ref().unwrap()).unwrap();
+        assert!(packaging.contains("seanpak pack manifest.json ."));
         let text = std::fs::read_to_string(&outcome.manifest_path).unwrap();
         let manifest = AppManifest::from_json(&text).unwrap();
         assert_eq!(manifest.version, "1.0.0");
@@ -320,7 +313,9 @@ mod tests {
         assert_eq!(outcome.files_dir, "files");
         assert_eq!(outcome.app_name, "Named App");
         assert_eq!(outcome.primary_exe.as_deref(), Some("nested.exe"));
-        assert!(outcome.pack_command.contains("--files files"));
+        assert_eq!(outcome.pack_command, "seanpak pack manifest.json files");
+        let packaging = std::fs::read_to_string(outcome.packaging_path.as_ref().unwrap()).unwrap();
+        assert!(packaging.contains("seanpak pack manifest.json files"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

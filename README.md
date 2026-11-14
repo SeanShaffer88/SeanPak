@@ -18,6 +18,7 @@ SeanPak is built to be driven by a local AI: packaging is the primary workflow, 
 - `verify` proves a built package (overlay readable, manifest sane, file list matches payloads); `verify --sandbox` goes further — silent install into a fresh temp folder, byte-for-byte comparison, silent uninstall, residue check
 - Alternative engines: generate or compile Inno Setup / NSIS installers (`--engine inno|nsis`, `--script-only`), plus the legacy `--batch` packaging mode
 - A reusable GitHub Actions workflow (`pack-reusable.yml`) so other projects package with SeanPak in CI
+- Optional Visual Studio/MSBuild publish integration delegates to the same CLI; see `docs/MSBUILD.md`
 - Windows Restart Manager awareness: hosts can detect processes locking files; the packager never force-closes your apps
 
 **Built for AI and scripts — the primary workflow**

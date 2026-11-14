@@ -1,0 +1,25 @@
+<Project>
+  <PropertyGroup>
+    <SeanPakEnabled Condition="'$(SeanPakEnabled)' == ''">false</SeanPakEnabled>
+    <SeanPakExecutable Condition="'$(SeanPakExecutable)' == ''">$(MSBuildProjectDirectory)\tools\seanpak.exe</SeanPakExecutable>
+    <SeanPakManifest Condition="'$(SeanPakManifest)' == ''">$(MSBuildProjectDirectory)\manifest.json</SeanPakManifest>
+    <SeanPakOutputDirectory Condition="'$(SeanPakOutputDirectory)' == ''">$(MSBuildProjectDirectory)\dist</SeanPakOutputDirectory>
+    <SeanPakPackForceArgument Condition="'$(SeanPakForce)' == 'true'">--force</SeanPakPackForceArgument>
+  </PropertyGroup>
+
+  <Target Name="SeanPakPackage" AfterTargets="Publish" Condition="'$(SeanPakEnabled)' == 'true'">
+    <PropertyGroup>
+      <_SeanPakFilesDirectory Condition="'$(SeanPakFilesDirectory)' == ''">$([System.String]::Copy('$(PublishDir)').Replace('\','/'))</_SeanPakFilesDirectory>
+      <_SeanPakFilesDirectory Condition="'$(SeanPakFilesDirectory)' != ''">$([System.String]::Copy('$(SeanPakFilesDirectory)').Replace('\','/'))</_SeanPakFilesDirectory>
+      <_SeanPakOutputArgument>$([System.String]::Copy('$(SeanPakOutputDirectory)').Replace('\','/'))</_SeanPakOutputArgument>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(SeanPakExecutable)')"
+           Text="SeanPak packaging is enabled, but SeanPakExecutable does not exist: $(SeanPakExecutable)" />
+    <Error Condition="!Exists('$(SeanPakManifest)')"
+           Text="SeanPak packaging is enabled, but SeanPakManifest does not exist: $(SeanPakManifest)" />
+    <Error Condition="!Exists('$(_SeanPakFilesDirectory)')"
+           Text="SeanPak packaging is enabled, but SeanPakFilesDirectory does not exist: $(_SeanPakFilesDirectory)" />
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)"
+          Command="&quot;$(SeanPakExecutable)&quot; pack &quot;$(SeanPakManifest)&quot; &quot;$(_SeanPakFilesDirectory)&quot; --out-dir &quot;$(_SeanPakOutputArgument)&quot; $(SeanPakPackForceArgument)" />
+  </Target>
+</Project>

@@ -44,6 +44,10 @@ jobs:
         shell: bash
         run: cargo test --lib high_contrast_fill_roles --target ${{ matrix.target }}
 
+      - name: Test init-generated packaging commands
+        shell: bash
+        run: cargo test --lib init_ --target ${{ matrix.target }}
+
       - name: Validate release signing script without credentials
         shell: pwsh
         env:
@@ -64,6 +68,55 @@ jobs:
         shell: bash
         run: |
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target ${{ matrix.target }}
+
+      - name: Test MSBuild package integration
+        shell: pwsh
+        run: |
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "SeanPak MSBuild smoke"
+          $files = Join-Path $smokeRoot "files"
+          $tools = Join-Path $smokeRoot "tools"
+          $output = Join-Path $smokeRoot "dist"
+          New-Item -ItemType Directory -Force -Path $files, $tools, $output | Out-Null
+          [IO.File]::WriteAllText((Join-Path $files "smoke.exe"), "fixture payload")
+          $cli = Join-Path $tools "SeanPak CLI.exe"
+          Copy-Item "target/x86_64-pc-windows-msvc/release/seanpak.exe" $cli
+          & $cli init $smokeRoot --name "MSBuild Smoke"
+          if ($LASTEXITCODE -ne 0) { throw "SeanPak init failed with exit code $LASTEXITCODE" }
+
+          $targetFile = Join-Path $env:GITHUB_WORKSPACE "msbuild/SeanPak.targets"
+          $manifest = Join-Path $smokeRoot "manifest.json"
+          $publishDir = $files + [IO.Path]::DirectorySeparatorChar
+          $project = Join-Path $smokeRoot "MSBuildSmoke.proj"
+          $xml = @'
+          <Project DefaultTargets="Publish">
+            <PropertyGroup>
+              <PublishDir>__PUBLISH__</PublishDir>
+              <SeanPakEnabled>true</SeanPakEnabled>
+              <SeanPakExecutable>__CLI__</SeanPakExecutable>
+              <SeanPakManifest>__MANIFEST__</SeanPakManifest>
+              <SeanPakOutputDirectory>__OUTPUT__</SeanPakOutputDirectory>
+            </PropertyGroup>
+            <Target Name="Publish">
+              <Message Importance="high" Text="MSBuild publish fixture is ready." />
+            </Target>
+            <Import Project="__TARGETS__" />
+          </Project>
+          '@
+          foreach ($pair in @(
+            @('__PUBLISH__', $publishDir),
+            @('__CLI__', $cli),
+            @('__MANIFEST__', $manifest),
+            @('__OUTPUT__', $output),
+            @('__TARGETS__', $targetFile)
+          )) {
+            $xml = $xml.Replace($pair[0], [System.Security.SecurityElement]::Escape($pair[1]))
+          }
+          [IO.File]::WriteAllText($project, $xml, [Text.UTF8Encoding]::new($false))
+          dotnet msbuild $project -target:Publish -nologo -verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild target failed with exit code $LASTEXITCODE" }
+          if (-not (Get-ChildItem -LiteralPath $output -Filter "*-Setup.exe" -File)) { throw "MSBuild did not produce a Setup.exe" }
+          if (-not (Get-ChildItem -LiteralPath $output -Filter "*-Portable.zip" -File)) { throw "MSBuild did not produce a Portable ZIP" }
+          if (-not (Test-Path (Join-Path $output "SHA256SUMS.txt"))) { throw "MSBuild did not produce SHA256SUMS.txt" }
 
       # Stub-size budget: the installer stub is the binary every packaged
       # app ships, so it stays lean. Measured Slice 2 stubs: 635,904
