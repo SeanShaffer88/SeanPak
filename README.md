@@ -13,6 +13,7 @@ SeanPak is built to be driven by a local AI: packaging is the primary workflow, 
 **Packaging**
 - One `pack` command produces exactly the release set: `<App>-v<version>-x64-Setup.exe`, `<App>-v<version>-x64-Portable.zip`, and `SHA256SUMS.txt`
 - Per-file compression — the Windows Compression API (XPRESS Huffman) on Windows, a built-in LZ codec elsewhere — with files stored uncompressed when compression would not shrink them
+- Overlay format v7 stores a SHA-256 digest per payload; `verify`, `diff`, extraction, install, and Modify check them, while legacy packages remain readable — see `docs/FORMAT.md`
 - Sector-aligned PE-overlay format; the reader also accepts packages written by the CrucibleKit and RustPak eras (`CRUCIBLEKIT_OVL`, `RUSTPAK_OVERLAY`)
 - Safe extraction: every stored path is validated before writing — absolute paths and `..` traversal are rejected, so a crafted installer cannot write outside the destination
 - `verify` proves a built package (overlay readable, manifest sane, file list matches payloads); `verify --sandbox` goes further — silent install into a fresh temp folder, byte-for-byte comparison, silent uninstall, residue check

@@ -7,9 +7,14 @@
 //! implementations verified against published test vectors in the tests
 //! below.
 
-/// Computes the SHA-256 digest of `data` and returns it as lowercase hex.
+/// Computes the SHA-256 digest of data as 32 raw bytes.
+pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data)
+}
+
+/// Computes the SHA-256 digest of data and returns it as lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
+    let digest = sha256_digest(data);
     let mut out = String::with_capacity(64);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));

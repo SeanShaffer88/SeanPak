@@ -640,10 +640,32 @@ fn payload_hashes(exe_path: &Path, records: &[FileRecordHeader]) -> Result<Vec<S
         File::open(exe_path).map_err(|e| format!("cannot open {}: {e}", exe_path.display()))?;
     let stream_len = std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))
         .map_err(|e| format!("cannot read package: {e}"))?;
+    let (_, parsed_records, _, _, payload_digests) =
+        OverlayReader::read_package_with_integrity(&mut file)
+            .map_err(|e| format!("cannot read package: {e}"))?
+            .ok_or_else(|| "this executable carries no SeanPak overlay".to_string())?;
+    if parsed_records.len() != records.len()
+        || parsed_records.iter().zip(records).any(|(fresh, planned)| {
+            fresh.relative_path() != planned.relative_path()
+                || fresh.file_size != planned.file_size
+                || fresh.payload_offset != planned.payload_offset
+                || fresh.compression() != planned.compression()
+        })
+    {
+        return Err("package record table changed during modify planning".to_string());
+    }
     let mut hashes = Vec::with_capacity(records.len());
     for idx in 0..records.len() {
         let bytes = OverlayReader::read_payload(&mut file, records, idx, stream_len)
             .map_err(|e| format!("cannot read payload {}: {e}", records[idx].relative_path()))?;
+        if let Some(expected) = payload_digests.as_ref().and_then(|digests| digests.get(idx)) {
+            if crate::hash::sha256_digest(&bytes) != *expected {
+                return Err(format!(
+                    "payload integrity check failed for {}",
+                    records[idx].relative_path()
+                ));
+            }
+        }
         hashes.push(sha256_hex(&bytes));
     }
     Ok(hashes)
@@ -693,6 +715,34 @@ mod tests {
         outcome.setup.path
     }
 
+    #[test]
+    fn modify_rejects_corrupted_v7_payload_hashes() {
+        let root = unique_temp("integrity");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("files");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.bin"), b"x").unwrap();
+        let stub = root.join("stub.exe");
+        std::fs::write(&stub, vec![0xBBu8; 5000]).unwrap();
+        let setup = root.join("setup.exe");
+        crate::overlay::OverlayWriter::build_from_folder(
+            &stub, &setup, &src, "Integrity", "1.0.0", "Tester",
+        )
+        .unwrap();
+        let (_, records, _, _, digests) =
+            OverlayReader::read_package_with_integrity(std::fs::File::open(&setup).unwrap())
+                .unwrap()
+                .unwrap();
+        assert!(digests.is_some());
+        assert_eq!(records[0].compression(), crate::codec::CODEC_STORED);
+        let mut image = std::fs::read(&setup).unwrap();
+        image[records[0].payload_offset as usize] ^= 1;
+        std::fs::write(&setup, image).unwrap();
+
+        let error = payload_hashes(&setup, &records).unwrap_err();
+        assert!(error.contains("payload integrity check failed for app.bin"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn modify_adds_and_removes_components_and_rewrites_the_receipt() {
         let root = unique_temp("cycle");

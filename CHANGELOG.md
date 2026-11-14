@@ -2,6 +2,13 @@
 
 All notable changes to the SeanPak utility are documented in this file. (3.0.0 was published under the product's former name, CrucibleKit; releases before 3.0.0 under its original name, RustPak.)
 
+## [Unreleased]
+### Added
+- New packages use overlay format v7, with a 32-byte SHA-256 digest per original payload. `verify`, `diff`, install, and Modify validate the payloads they trust; extraction checks each selected file before writing it. Legacy packages remain readable. Digests detect corruption, not malicious modification; Authenticode remains the authenticity check.
+
+### Known limitations
+- Windows 11 desktop runtime behavior remains **Unverified**; the Windows Actions job builds and tests the x64 MSVC target on its hosted Windows runner.
+
 ## [5.2.0] - 2026-11-13
 ### Changed — TesselGUI 2.0.0 (design revision 3, Carmine) adopted across the whole program
 - **Every window SeanPak paints now follows the revised TesselGUI.** The standard was revised (TesselGUI 2.0.0, design revision 3) and SEAN directed adopting it project-wide, so the Builder, the installer wizard in every mode (install and Modify), the uninstall confirmation, and the silent-update window all draw from the new token set in the one shared theme module — values taken from the published standard's own token files (`docs/tokens.json`, cross-checked against its generated Rust export), and pinned by the theme module's tests as before. The v5.0.0-era framing — the Builder themed directly on VS Code GitHub Dark High Contrast as an exemption — is retired; the wizard's Design E (Rail) layout and the Builder's page flow are unchanged, only the theme standard moved.

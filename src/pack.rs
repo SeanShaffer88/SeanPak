@@ -9,7 +9,7 @@
 //!
 //! [`verify_package`] proves a built Setup.exe before publishing: the
 //! overlay must be readable, the embedded manifest sane, and every
-//! recorded payload present, in bounds, and readable.
+//! recorded payload present, in bounds, readable, and digest-matched in v7.
 //!
 //! The ZIP writer is hand-rolled (stored, no compression) for the same
 //! dependency reason as everything else in this crate.
@@ -577,7 +577,7 @@ pub struct VerifyReport {
 }
 
 /// Verifies a built Setup.exe: overlay readable, embedded manifest sane,
-/// and the recorded file list matching the payloads actually present.
+/// and the recorded file list matching payloads that are present and readable.
 pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
     verify_package_with(path, None, None)
 }
@@ -605,24 +605,25 @@ pub fn verify_package_with(
     };
     let mut file = std::fs::File::open(path)?;
     let file_len = OverlayReader::payload_stream_len(&mut file)?;
-    let (manifest, records, _options) = match OverlayReader::read_package(&mut file)? {
-        Some(pkg) => {
-            report.checks.push((
-                "overlay readable".to_string(),
-                true,
-                "SeanPak overlay found".to_string(),
-            ));
-            pkg
-        }
-        None => {
-            report.checks.push((
-                "overlay readable".to_string(),
-                false,
-                "no SeanPak overlay found in this file".to_string(),
-            ));
-            return Ok(report);
-        }
-    };
+    let (manifest, records, _options, _power, payload_digests) =
+        match OverlayReader::read_package_with_integrity(&mut file)? {
+            Some(pkg) => {
+                report.checks.push((
+                    "overlay readable".to_string(),
+                    true,
+                    "SeanPak overlay found".to_string(),
+                ));
+                pkg
+            }
+            None => {
+                report.checks.push((
+                    "overlay readable".to_string(),
+                    false,
+                    "no SeanPak overlay found in this file".to_string(),
+                ));
+                return Ok(report);
+            }
+        };
 
     report.app_name = manifest.app_name();
     report.app_version = manifest.app_version();
@@ -666,7 +667,7 @@ pub fn verify_package_with(
         sane = false;
         sane_notes.push("primary exe index is out of range".to_string());
     }
-    if !(2..=6).contains(&manifest.version) {
+    if !(2..=7).contains(&manifest.version) {
         sane = false;
         sane_notes.push(format!("unsupported manifest version {}", manifest.version));
     }
@@ -731,7 +732,20 @@ pub fn verify_package_with(
                 });
             }
             match OverlayReader::read_payload(&mut file, &records, idx, file_len) {
-                Ok(bytes) if bytes.len() as u64 == records[idx].file_size => {}
+                Ok(bytes) if bytes.len() as u64 == records[idx].file_size => {
+                    if let Some(expected) =
+                        payload_digests.as_ref().and_then(|digests| digests.get(idx))
+                    {
+                        if crate::hash::sha256_digest(&bytes) != *expected {
+                            list_ok = false;
+                            list_notes.push(format!(
+                                "payload of \"{}\" failed SHA-256 integrity check",
+                                records[idx].relative_path()
+                            ));
+                            break;
+                        }
+                    }
+                }
                 Ok(_) => {
                     list_ok = false;
                     list_notes.push(format!(
@@ -1286,6 +1300,38 @@ mod tests {
         assert!(!report.ok);
         // The sandbox folder is gone.
         assert!(!report.install_dir.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_rejects_payload_digest_mismatch() {
+        let root = unique_temp("payload_integrity");
+        let src = root.join("files");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.bin"), b"x").unwrap();
+        let stub = root.join("stub.exe");
+        std::fs::write(&stub, vec![0xAAu8; 5000]).unwrap();
+        let package = root.join("Setup.exe");
+        crate::overlay::OverlayWriter::build_from_folder(
+            &stub, &package, &src, "Integrity", "1.0.0", "Tester",
+        )
+        .unwrap();
+
+        let (_, records, _, _, digests) =
+            OverlayReader::read_package_with_integrity(std::fs::File::open(&package).unwrap())
+                .unwrap()
+                .unwrap();
+        assert!(digests.is_some());
+        assert_eq!(records[0].compression(), crate::codec::CODEC_STORED);
+        let mut image = std::fs::read(&package).unwrap();
+        image[records[0].payload_offset as usize] ^= 1;
+        std::fs::write(&package, image).unwrap();
+
+        let report = verify_package(&package).unwrap();
+        assert!(!report.ok);
+        assert!(report.checks.iter().any(|(name, passed, detail)| {
+            name == "file list matches payloads" && !passed && detail.contains("SHA-256")
+        }));
         let _ = std::fs::remove_dir_all(&root);
     }
 

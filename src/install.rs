@@ -1039,10 +1039,32 @@ fn payload_hashes(exe_path: &Path, records: &[FileRecordHeader]) -> Result<Vec<S
         File::open(exe_path).map_err(|e| format!("cannot open {}: {e}", exe_path.display()))?;
     let stream_len = std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))
         .map_err(|e| format!("cannot read package: {e}"))?;
+    let (_, parsed_records, _, _, payload_digests) =
+        OverlayReader::read_package_with_integrity(&mut file)
+            .map_err(|e| format!("cannot read package: {e}"))?
+            .ok_or_else(|| "this executable carries no SeanPak overlay".to_string())?;
+    if parsed_records.len() != records.len()
+        || parsed_records.iter().zip(records).any(|(fresh, planned)| {
+            fresh.relative_path() != planned.relative_path()
+                || fresh.file_size != planned.file_size
+                || fresh.payload_offset != planned.payload_offset
+                || fresh.compression() != planned.compression()
+        })
+    {
+        return Err("package record table changed during install planning".to_string());
+    }
     let mut hashes = Vec::with_capacity(records.len());
     for idx in 0..records.len() {
         let bytes = OverlayReader::read_payload(&mut file, records, idx, stream_len)
             .map_err(|e| format!("cannot read payload {}: {e}", records[idx].relative_path()))?;
+        if let Some(expected) = payload_digests.as_ref().and_then(|digests| digests.get(idx)) {
+            if crate::hash::sha256_digest(&bytes) != *expected {
+                return Err(format!(
+                    "payload integrity check failed for {}",
+                    records[idx].relative_path()
+                ));
+            }
+        }
         hashes.push(sha256_hex(&bytes));
     }
     Ok(hashes)
@@ -1229,6 +1251,26 @@ mod tests {
         )
         .unwrap();
         setup
+    }
+
+    #[test]
+    fn v7_payload_corruption_fails_during_preflight() {
+        let root = unique_temp("payload_preflight");
+        std::fs::create_dir_all(&root).unwrap();
+        let setup = pack_version(&root, "1.0.0", b"x");
+        let (_, records, _) = read_own_package(&setup).unwrap();
+        let app = records
+            .iter()
+            .find(|record| record.relative_path() == "app.exe")
+            .unwrap();
+        assert_eq!(app.compression(), crate::codec::CODEC_STORED);
+        let mut image = std::fs::read(&setup).unwrap();
+        image[app.payload_offset as usize] ^= 1;
+        std::fs::write(&setup, image).unwrap();
+
+        let error = payload_hashes(&setup, &records).unwrap_err();
+        assert!(error.contains("payload integrity check failed for app.exe"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
