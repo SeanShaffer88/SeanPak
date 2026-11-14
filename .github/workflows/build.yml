@@ -102,15 +102,11 @@ jobs:
             <Import Project="__TARGETS__" />
           </Project>
           '@
-          foreach ($pair in @(
-            @('__PUBLISH__', $publishDir),
-            @('__CLI__', $cli),
-            @('__MANIFEST__', $manifest),
-            @('__OUTPUT__', $output),
-            @('__TARGETS__', $targetFile)
-          )) {
-            $xml = $xml.Replace($pair[0], [System.Security.SecurityElement]::Escape($pair[1]))
-          }
+          $xml = $xml.Replace('__PUBLISH__', [System.Security.SecurityElement]::Escape($publishDir))
+          $xml = $xml.Replace('__CLI__', [System.Security.SecurityElement]::Escape($cli))
+          $xml = $xml.Replace('__MANIFEST__', [System.Security.SecurityElement]::Escape($manifest))
+          $xml = $xml.Replace('__OUTPUT__', [System.Security.SecurityElement]::Escape($output))
+          $xml = $xml.Replace('__TARGETS__', [System.Security.SecurityElement]::Escape($targetFile))
           [IO.File]::WriteAllText($project, $xml, [Text.UTF8Encoding]::new($false))
           dotnet msbuild $project -target:Publish -nologo -verbosity:minimal
           if ($LASTEXITCODE -ne 0) { throw "MSBuild target failed with exit code $LASTEXITCODE" }
