@@ -40,6 +40,10 @@ jobs:
         shell: bash
         run: cargo test --lib authenticode --target ${{ matrix.target }}
 
+      - name: Test SPDX SBOM generation
+        shell: bash
+        run: cargo test --lib sbom --target ${{ matrix.target }}
+
       - name: Test high-contrast palette roles
         shell: bash
         run: cargo test --lib high_contrast_fill_roles --target ${{ matrix.target }}
