@@ -2,7 +2,7 @@ use crate::hash::{sha256_digest, sha256_file_hex, sha256_hex};
 use crate::manifest::{jobj, jstr, JsonValue};
 use crate::overlay::OverlayReader;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -252,9 +252,9 @@ fn write_new_file_atomically(path: &Path, contents: &[u8]) -> Result<(), String>
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| "SBOM output path has no file name".to_string())?;
+    if path.file_name().is_none() {
+        return Err("SBOM output path has no file name".to_string());
+    }
     fs::create_dir_all(parent)
         .map_err(|e| format!("cannot create output directory {}: {e}", parent.display()))?;
 
@@ -383,7 +383,7 @@ mod tests {
         value.get(key).and_then(JsonValue::as_str).unwrap()
     }
 
-    fn array_field(value: &JsonValue, key: &str) -> &[JsonValue] {
+    fn array_field<'a>(value: &'a JsonValue, key: &str) -> &'a [JsonValue] {
         match value.get(key).unwrap() {
             JsonValue::Array(items) => items,
             other => panic!("expected array, got {other:?}"),
