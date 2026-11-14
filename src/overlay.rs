@@ -2539,6 +2539,85 @@ mod tests {
     }
 
     #[test]
+    fn version_six_packages_read_without_integrity_table() {
+        let root = unique_temp("v6pkg");
+        let payload = b"v6 payload bytes";
+        let header_size = std::mem::size_of::<OverlayManifestHeader>();
+        let record_size = std::mem::size_of::<FileRecordHeader>();
+        let mut bytes = vec![0u8; SECTOR_ALIGNMENT as usize];
+        let mut manifest = OverlayManifestHeader {
+            magic: *OVERLAY_MAGIC,
+            version: 6,
+            file_count: 1,
+            primary_exe_index: 0,
+            total_uncompressed_bytes: payload.len() as u64,
+            app_name_utf8: [0u8; 128],
+            app_version_utf8: [0u8; 32],
+            publisher_utf8: [0u8; 128],
+        };
+        copy_str_to_fixed(&mut manifest.app_name_utf8, "V6 App");
+        let power_json = PowerSpec::default().to_json_value().render();
+        let metadata_size = header_size
+            + record_size
+            + OPTIONS_BASE_DISK_SIZE
+            + OPTIONS_EXT_DISK_SIZE
+            + 4
+            + power_json.len();
+        let mut record = FileRecordHeader {
+            file_size: payload.len() as u64,
+            payload_offset: SECTOR_ALIGNMENT + metadata_size as u64,
+            ..Default::default()
+        };
+        copy_str_to_fixed(&mut record.relative_path_utf8, "v6.txt");
+
+        let manifest_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &manifest as *const OverlayManifestHeader as *const u8,
+                header_size,
+            )
+        };
+        bytes.extend_from_slice(manifest_bytes);
+        let record_bytes = unsafe {
+            std::slice::from_raw_parts(&record as *const FileRecordHeader as *const u8, record_size)
+        };
+        bytes.extend_from_slice(record_bytes);
+        let options = InstallOptions::defaults_for("V6 App");
+        let base = options.disk_base();
+        let base_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &base as *const OptionsDiskBase as *const u8,
+                OPTIONS_BASE_DISK_SIZE,
+            )
+        };
+        bytes.extend_from_slice(base_bytes);
+        let ext = options.disk_ext();
+        let ext_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ext as *const OptionsDiskExt as *const u8,
+                OPTIONS_EXT_DISK_SIZE,
+            )
+        };
+        bytes.extend_from_slice(ext_bytes);
+        bytes.extend_from_slice(&(power_json.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(power_json.as_bytes());
+        bytes.extend_from_slice(payload);
+
+        let (read_back, records, _, power, digests) =
+            OverlayReader::read_package_with_integrity(Cursor::new(bytes.clone()))
+                .unwrap()
+                .expect("v6 overlay must be discoverable");
+        assert_eq!(read_back.version, 6);
+        assert_eq!(records.len(), 1);
+        assert!(power.is_empty());
+        assert!(digests.is_none());
+
+        let dest = root.join("dest");
+        OverlayReader::extract(Cursor::new(bytes), &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("v6.txt")).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn selection_resolution_rules() {
         let power = sample_power();
         let records = vec![
