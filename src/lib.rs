@@ -13,6 +13,7 @@ pub mod modify;
 pub mod native_dialog;
 pub mod overlay;
 pub mod pack;
+pub mod sbom;
 pub mod receipt;
 pub mod restart_manager;
 pub mod rollback;

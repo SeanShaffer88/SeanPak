@@ -79,6 +79,9 @@ fn print_usage() {
          \x20                                      Build the release set from a JSON manifest:\n\
          \x20                                      <App>-v<ver>-x64-Setup.exe + -Portable.zip\n\
          \x20                                      + SHA256SUMS.txt, named from the manifest\n\
+         \x20 seanpak.exe sbom <Setup.exe> [--out <file>] [--json]\n\
+         \x20                                      Write an SPDX 2.3 sidecar without changing\n\
+         \x20                                      the default three-file release set\n\
          \x20 seanpak.exe verify <Setup.exe> [--sandbox] [--json]\n\
          \x20                                      Prove a built installer: overlay readable,\n\
          \x20                                      embedded manifest sane, payloads present.\n\
@@ -2535,6 +2538,101 @@ fn pack_report_json(manifest: &AppManifest, outcome: &PackOutcome) -> JsonValue 
     ])
 }
 
+fn run_sbom(args: &[String]) -> i32 {
+    let mut setup: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                let Some(path) = args.get(i) else {
+                    return fail(args, "sbom", EXIT_USAGE, "--out requires a file path");
+                };
+                if output.replace(PathBuf::from(path)).is_some() {
+                    return fail(args, "sbom", EXIT_USAGE, "--out may only be specified once");
+                }
+            }
+            "--json" | "--quiet" | "--silent" => {}
+            flag if flag.starts_with('-') => {
+                return fail(
+                    args,
+                    "sbom",
+                    EXIT_USAGE,
+                    &format!("unknown option: {flag}"),
+                )
+            }
+            path if setup.is_none() => setup = Some(PathBuf::from(path)),
+            _ => {
+                return fail(
+                    args,
+                    "sbom",
+                    EXIT_USAGE,
+                    "usage: seanpak sbom <Setup.exe> [--out <file>] [--json]",
+                )
+            }
+        }
+        i += 1;
+    }
+
+    let Some(setup) = setup else {
+        return fail(
+            args,
+            "sbom",
+            EXIT_USAGE,
+            "usage: seanpak sbom <Setup.exe> [--out <file>] [--json]",
+        );
+    };
+    let output = output.unwrap_or_else(|| {
+        let stem = setup
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Setup".to_string());
+        setup
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{stem}.spdx.json"))
+    });
+
+    match seanpak::sbom::generate_spdx(&setup, &output) {
+        Ok(report) => {
+            diag::record(
+                "sbom",
+                vec![
+                    ("path", jpath(&report.path)),
+                    ("app", jstr(report.app_name.clone())),
+                    ("version", jstr(report.app_version.clone())),
+                    ("fileCount", jnum(report.file_count as u64)),
+                    ("setupSha256", jstr(report.setup_sha256.clone())),
+                ],
+            );
+            if json_mode(args) {
+                print_json(&jobj(vec![
+                    ("command", jstr("sbom")),
+                    ("status", jstr("ok")),
+                    ("format", jstr("SPDX-2.3")),
+                    ("path", jpath(&report.path)),
+                    ("appName", jstr(report.app_name)),
+                    ("version", jstr(report.app_version)),
+                    ("fileCount", jnum(report.file_count as u64)),
+                    ("setupSha256", jstr(report.setup_sha256)),
+                ]));
+            } else if !quiet_mode(args) {
+                println!(
+                    "SPDX 2.3 SBOM written: {} ({} {}, {} payload files; Setup SHA-256 {})",
+                    report.path.display(),
+                    report.app_name,
+                    report.app_version,
+                    report.file_count,
+                    report.setup_sha256
+                );
+            }
+            EXIT_OK
+        }
+        Err(message) => fail(args, "sbom", EXIT_IO, &message),
+    }
+}
+
 fn run_verify(args: &[String]) -> i32 {
     let path = match args.get(1) {
         Some(p) if !p.starts_with('-') => PathBuf::from(p),
@@ -2753,11 +2851,12 @@ fn main() {
     }
 
     // Word subcommands (the AI-control surface): schema / validate /
-    // pack / verify / init / inspect / diff / answers-template.
+    // pack / sbom / verify / init / inspect / diff / answers-template.
     match args.first().map(|a| a.as_str()) {
         Some("schema") => std::process::exit(run_schema(&args)),
         Some("validate") => std::process::exit(run_validate(&args)),
         Some("pack") => std::process::exit(run_pack(&args)),
+        Some("sbom") => std::process::exit(run_sbom(&args)),
         Some("verify") => std::process::exit(run_verify(&args)),
         Some("init") => std::process::exit(run_init(&args)),
         Some("inspect") => std::process::exit(run_inspect(&args)),
