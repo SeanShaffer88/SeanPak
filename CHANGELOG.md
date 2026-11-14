@@ -4,7 +4,7 @@ All notable changes to the SeanPak utility are documented in this file. (3.0.0 w
 
 ## [Unreleased]
 ### Added
-- New packages use overlay format v7, with a 32-byte SHA-256 digest per original payload. The installer validates all payloads before repair/install side effects; extraction validates each payload before writing it. Legacy packages remain readable. Digests detect corruption, not malicious modification; Authenticode remains the authenticity check.
+- New packages use overlay format v7, with a 32-byte SHA-256 digest per original payload. `verify`, `diff`, install, and Modify validate the payloads they trust; extraction checks each selected file before writing it. Legacy packages remain readable. Digests detect corruption, not malicious modification; Authenticode remains the authenticity check.
 
 ### Known limitations
 - Windows 11 desktop runtime behavior remains **Unverified**; the Windows Actions job builds and tests the x64 MSVC target on its hosted Windows runner.
