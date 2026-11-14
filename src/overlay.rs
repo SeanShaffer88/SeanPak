@@ -1631,7 +1631,9 @@ impl OverlayReader {
     }
 
     /// Reads and decompresses one record's payload, returning the
-    /// original file bytes (exactly `record.file_size` of them).
+    /// original file bytes (exactly `record.file_size` of them). This
+    /// low-level read does not verify the optional v7 SHA-256 digest;
+    /// callers that trust or write payload bytes must check that digest.
     pub fn read_payload<R: Read + Seek>(
         reader: &mut R,
         records: &[FileRecordHeader],

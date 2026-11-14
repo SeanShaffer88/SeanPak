@@ -9,7 +9,7 @@
 //!
 //! [`verify_package`] proves a built Setup.exe before publishing: the
 //! overlay must be readable, the embedded manifest sane, and every
-//! recorded payload present, in bounds, and readable.
+//! recorded payload present, in bounds, readable, and digest-matched in v7.
 //!
 //! The ZIP writer is hand-rolled (stored, no compression) for the same
 //! dependency reason as everything else in this crate.
@@ -577,7 +577,7 @@ pub struct VerifyReport {
 }
 
 /// Verifies a built Setup.exe: overlay readable, embedded manifest sane,
-/// and the recorded file list matching the payloads actually present.
+/// and the recorded file list matching payloads that are present and readable.
 pub fn verify_package(path: &Path) -> std::io::Result<VerifyReport> {
     verify_package_with(path, None, None)
 }
